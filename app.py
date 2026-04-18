@@ -10,6 +10,32 @@ from src.sheets.column_map import resolve_column, get_column_map_json
 
 
 
+# ── Core orchestration (async, called via asyncio.run) ───────────────────────
+
+def _dispatch_tool(name: str, args: dict, executor: SheetsExecutor) -> dict:
+    try:
+        if name == "get_row":
+            return executor.get_row(**args)
+
+        if name == "update_cell":
+            results = []
+            for upd in args.get("updates", []):
+                col = resolve_column(upd["field"]) or upd["field"]
+                results.append(executor.update_cell(args["ricefw_id"], col, upd["value"]))
+            return {"updates": results}
+
+        if name == "format_row":
+            return executor.format_row(**args)
+
+        if name == "add_row":
+            next_id = executor.next_ricefw_id(args["module"])
+            return executor.add_row(next_id, **args)
+
+        return {"ok": False, "error": f"Unknown tool: {name}"}
+
+    except Exception as ex:
+        return {"ok": False, "error": str(ex)}
+
 async def _handle(messages: list, executor: SheetsExecutor) -> str:
     client = get_deepseek_client()
 
@@ -130,29 +156,3 @@ if user_input := st.chat_input("Ask about any WRICEF object…"):
     st.session_state.messages.append({"role": "user",      "content": user_input})
     st.session_state.messages.append({"role": "assistant", "content": reply})
 
-
-# ── Core orchestration (async, called via asyncio.run) ───────────────────────
-
-def _dispatch_tool(name: str, args: dict, executor: SheetsExecutor) -> dict:
-    try:
-        if name == "get_row":
-            return executor.get_row(**args)
-
-        if name == "update_cell":
-            results = []
-            for upd in args.get("updates", []):
-                col = resolve_column(upd["field"]) or upd["field"]
-                results.append(executor.update_cell(args["ricefw_id"], col, upd["value"]))
-            return {"updates": results}
-
-        if name == "format_row":
-            return executor.format_row(**args)
-
-        if name == "add_row":
-            next_id = executor.next_ricefw_id(args["module"])
-            return executor.add_row(next_id, **args)
-
-        return {"ok": False, "error": f"Unknown tool: {name}"}
-
-    except Exception as ex:
-        return {"ok": False, "error": str(ex)}
