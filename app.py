@@ -21,79 +21,24 @@ from src.sheets.sheet_registry import (
     fetch_sheet_name, parse_sheet_id, is_admin, get_default_sheet,
 )
 from streamlit_cookies_controller import CookieController
+
+
 # ── OAuth2 component (must be defined before any use) ────────────────────────
-oauth2 = OAuth2Component(
-    client_id=st.secrets["auth"]["client_id"],
-    client_secret=st.secrets["auth"]["client_secret"],
-    authorize_endpoint="https://accounts.google.com/o/oauth2/v2/auth",
-    token_endpoint="https://oauth2.googleapis.com/token",
-)
-
-# ── Cookie manager ────────────────────────────────────────────────────────────
-cookie_manager = CookieController()
-
-# ── Restore session from cookie (survives page refreshes) ────────────────────
-# CookieController is async under the hood — on the very first render it
-# returns None even when the cookie exists. The st.rerun() on the line below
-# gives it a second pass to actually read the value.
-if "token_dict" not in st.session_state:
-    saved_token = cookie_manager.get("google_auth_token")
-    if saved_token:
-        st.session_state.token_dict = saved_token
-        st.rerun()
-        
-# ── Auth gate ─────────────────────────────────────────────────────────────────
-if "token_dict" not in st.session_state:
-    st.set_page_config(page_title="MigrationBot", page_icon="🤖", layout="centered")
-    st.title("🤖 MigrationBot")
-    st.markdown(
-        "Your AI assistant for the **S/4HANA WRICEF Migration Control Sheet**. "
-        "Read, update, search, and report — all in plain English."
-    )
-    result = oauth2.authorize_button(
-        name="🔑 Sign in with Google",
-        icon="https://www.google.com/favicon.ico",
-        redirect_uri="http://localhost:8501/",
-        scope="openid email profile https://www.googleapis.com/auth/spreadsheets",
-        key="google_auth",
-        extras_params={"prompt": "consent", "access_type": "offline"}
-    )
-    if result and "token" in result:
-        st.session_state.token_dict = result["token"]
-        cookie_manager.set("google_auth_token", result["token"])
-        st.rerun()
-    else:
-        st.stop()
-# ── Page config (must be first Streamlit call) ───────────────────────────────
-
+# ── 1. Page config MUST BE FIRST ─────────────────────────────────────────────
 st.set_page_config(
     page_title="MigrationBot",
     page_icon="🤖",
     layout="centered",
 )
 
-# ── Logo ──────────────────────────────────────────────────────────────────────
-# Drop your logo file into the repo root and set the filename below.
-# st.logo() pins it to the top of the sidebar (Streamlit ≥ 1.36).
-# Recommended: PNG or SVG, ~200 × 60 px, transparent background.
 try:
     st.logo("logo.png", size="large")
 except Exception:
-    pass  # logo file not present yet — no crash, no noise
+    pass
 
-# ── Auth gate ────────────────────────────────────────────────────────────────
+# ── 2. Initialize Controllers ────────────────────────────────────────────────
+cookie_manager = CookieController()
 
-# if not st.user.is_logged_in:
-#     st.title("🤖 MigrationBot")
-#     st.markdown(
-#         "Your AI assistant for the **S/4HANA WRICEF Migration Control Sheet**. "
-#         "Read, update, search, and report — all in plain English."
-#     )
-#     st.button("🔑 Sign in with Google", on_click=st.login, type="primary")
-#     st.stop()
-
-
-# Setup the OAuth component
 oauth2 = OAuth2Component(
     client_id=st.secrets["auth"]["client_id"],
     client_secret=st.secrets["auth"]["client_secret"],
@@ -101,32 +46,66 @@ oauth2 = OAuth2Component(
     token_endpoint="https://oauth2.googleapis.com/token",
 )
 
-# Auth gate
+# ── 3. Auth Gate & Cookie Restoration ────────────────────────────────────────
 if "token_dict" not in st.session_state:
-    st.title("🤖 MigrationBot")
-    st.markdown(
-        "Your AI assistant for the **S/4HANA WRICEF Migration Control Sheet**. "
-        "Read, update, search, and report — all in plain English."
-    )
-    
-    # This generates the login button
-    result = oauth2.authorize_button(
-        name="🔑 Sign in with Google",
-        icon="https://www.google.com/favicon.ico",
-        redirect_uri="http://localhost:8501/", # Update if deployed
-        #oauth2callback
-        scope="openid email profile https://www.googleapis.com/auth/spreadsheets",
-        key="google_auth",
-        # access_type="offline" is the magic word that forces Google to give you a refresh_token!
-        extras_params={"prompt": "consent", "access_type": "offline"} 
-    )
-    
-    if result and "token" in result:
-        st.session_state.token_dict = result["token"]
+    # Give the browser a split-second to mount and send the cookie data back to Python
+    time.sleep(0.2) 
+    saved_token = cookie_manager.get("google_auth_token")
+
+    if saved_token:
+        # We found the cookie! Load it and reload the page.
+        st.session_state.token_dict = saved_token
         st.rerun()
     else:
-        st.stop()
+        # No cookie found. Show the login screen.
+        st.title("🤖 MigrationBot")
+        st.markdown(
+            "Your AI assistant for the **S/4HANA WRICEF Migration Control Sheet**. "
+            "Read, update, search, and report — all in plain English."
+        )
 
+        result = oauth2.authorize_button(
+            name="🔑 Sign in with Google",
+            icon="https://www.google.com/favicon.ico",
+            redirect_uri="https://your-app-name.streamlit.app/",
+            scope="openid email profile https://www.googleapis.com/auth/spreadsheets",
+            key="google_auth",
+            extras_params={"prompt": "consent", "access_type": "offline"}
+        )
+
+        if result and "token" in result:
+            raw_token = result["token"]
+            
+            # 1. Extract name and email NOW while we have the massive id_token
+            try:
+                import base64
+                payload = raw_token.get("id_token", "").split(".")[1]
+                payload += "=" * ((4 - len(payload) % 4) % 4)
+                decoded = json.loads(base64.urlsafe_b64decode(payload).decode("utf-8"))
+                extracted_email = decoded.get("email", "Unknown User")
+                extracted_name = decoded.get("given_name", "there")
+            except Exception:
+                extracted_email = "Unknown User"
+                extracted_name = "there"
+
+            # 2. Build a "Diet Token" that easily fits in the 4KB browser limit
+            diet_token = {
+                "access_token": raw_token.get("access_token"),
+                "refresh_token": raw_token.get("refresh_token"),
+                "token_type": raw_token.get("token_type"),
+                "expires_at": raw_token.get("expires_at"),
+                "user_email": extracted_email,
+                "first_name": extracted_name
+            }
+            
+            st.session_state.token_dict = diet_token
+            cookie_manager.set("google_auth_token", diet_token)
+            st.rerun()
+        else:
+            st.stop() # Halt the script here until they click the button
+
+# If we made it here, the user is logged in!
+token_dict = st.session_state.token_dict
 # ── Token expiry guard ───────────────────────────────────────────────────────
 # Google access tokens live ~3600 s. We log the user out after 55 min
 # (5 min buffer) so the token never silently starts returning 401s mid-session.
@@ -414,22 +393,8 @@ if "messages" not in st.session_state:
 import base64
 
 # --- Helper to decode the email from Google's ID token ---
-def get_email_from_token(token_dict):
-    try:
-        id_token = token_dict.get("id_token", "")
-        if not id_token: return "Unknown User"
-        
-        # JWTs are split by dots; the data is in the middle section
-        payload = id_token.split(".")[1]
-        # Fix padding for base64 decoding
-        payload += "=" * ((4 - len(payload) % 4) % 4)
-        
-        decoded = base64.urlsafe_b64decode(payload).decode("utf-8")
-        return json.loads(decoded).get("email", "Unknown User")
-    except Exception:
-        return "Unknown User"
+user_email = st.session_state.token_dict.get("user_email", "Unknown User")
 
-user_email = get_email_from_token(st.session_state.token_dict)
 
 if "session_id" not in st.session_state:
     st.session_state.session_id = str(uuid.uuid4())
@@ -588,16 +553,7 @@ EXAMPLE_PROMPTS = [
 if not st.session_state.messages:
     #first_name = (st.user.name or "").split()[0] or "there"
     # Extract first name securely from the Google token
-    try:
-        id_token = st.session_state.token_dict.get("id_token", "")
-        payload = id_token.split(".")[1]
-        payload += "=" * ((4 - len(payload) % 4) % 4)
-        import base64
-        decoded = json.loads(base64.urlsafe_b64decode(payload).decode("utf-8"))
-        # Google provides 'given_name' (first name) by default
-        first_name = decoded.get("given_name", "there")
-    except Exception:
-        first_name = "there"
+    first_name = st.session_state.token_dict.get("first_name", "there")
     st.markdown(f"### Welcome back, {first_name} 👋")
     st.markdown(
         "Ask me anything about the migration tracker in plain English — "
