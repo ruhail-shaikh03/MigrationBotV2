@@ -7,3 +7,4 @@ structlog
 pandas
 authlib>=1.3.2
 streamlit_oauth
+streamlit_cookies_controller
