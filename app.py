@@ -67,7 +67,7 @@ if "token_dict" not in st.session_state:
         result = oauth2.authorize_button(
             name="🔑 Sign in with Google",
             icon="https://www.google.com/favicon.ico",
-            redirect_uri="https://your-app-name.streamlit.app/",
+            redirect_uri="https://ff-wricef-migration-bot-v1.streamlit.app/",
             scope="openid email profile https://www.googleapis.com/auth/spreadsheets",
             key="google_auth",
             extras_params={"prompt": "consent", "access_type": "offline"}
