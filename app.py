@@ -2,11 +2,185 @@ import json
 import time
 import pandas as pd
 import streamlit as st
+import sys
+import streamlit as st
 from googleapiclient.errors import HttpError
+from google.auth.exceptions import RefreshError
 from src.llm.deepseek_client import get_deepseek_client
 from src.llm.tools import TOOLS, SYSTEM_PROMPT, VALID_MODULES
+# ADD these two lines after your existing imports
+import uuid
+from src.permissions import ensure_permissions, get_checker
+from streamlit_oauth import OAuth2Component
 from src.sheets.executor import SheetsExecutor
 from src.sheets.column_map import resolve_column, get_column_map_json
+from src.sheets.dynamic_column_mapper import ensure_column_map
+from src.sheets.sheet_registry import (
+    get_active_sheet, set_active_sheet, reset_to_default_sheet,
+    get_allowed_sheets, register_sheet, fetch_sheet_tabs,
+    fetch_sheet_name, parse_sheet_id, is_admin, get_default_sheet,
+)
+from streamlit_cookies_controller import CookieController
+# ── OAuth2 component (must be defined before any use) ────────────────────────
+oauth2 = OAuth2Component(
+    client_id=st.secrets["auth"]["client_id"],
+    client_secret=st.secrets["auth"]["client_secret"],
+    authorize_endpoint="https://accounts.google.com/o/oauth2/v2/auth",
+    token_endpoint="https://oauth2.googleapis.com/token",
+)
+
+# ── Cookie manager ────────────────────────────────────────────────────────────
+cookie_manager = CookieController()
+
+# ── Restore session from cookie (survives page refreshes) ────────────────────
+# CookieController is async under the hood — on the very first render it
+# returns None even when the cookie exists. The st.rerun() on the line below
+# gives it a second pass to actually read the value.
+if "token_dict" not in st.session_state:
+    saved_token = cookie_manager.get("google_auth_token")
+    if saved_token:
+        st.session_state.token_dict = saved_token
+        st.rerun()
+        
+# ── Auth gate ─────────────────────────────────────────────────────────────────
+if "token_dict" not in st.session_state:
+    st.set_page_config(page_title="MigrationBot", page_icon="🤖", layout="centered")
+    st.title("🤖 MigrationBot")
+    st.markdown(
+        "Your AI assistant for the **S/4HANA WRICEF Migration Control Sheet**. "
+        "Read, update, search, and report — all in plain English."
+    )
+    result = oauth2.authorize_button(
+        name="🔑 Sign in with Google",
+        icon="https://www.google.com/favicon.ico",
+        redirect_uri="http://localhost:8501/",
+        scope="openid email profile https://www.googleapis.com/auth/spreadsheets",
+        key="google_auth",
+        extras_params={"prompt": "consent", "access_type": "offline"}
+    )
+    if result and "token" in result:
+        st.session_state.token_dict = result["token"]
+        cookie_manager.set("google_auth_token", result["token"])
+        st.rerun()
+    else:
+        st.stop()
+# ── Page config (must be first Streamlit call) ───────────────────────────────
+
+st.set_page_config(
+    page_title="MigrationBot",
+    page_icon="🤖",
+    layout="centered",
+)
+
+# ── Logo ──────────────────────────────────────────────────────────────────────
+# Drop your logo file into the repo root and set the filename below.
+# st.logo() pins it to the top of the sidebar (Streamlit ≥ 1.36).
+# Recommended: PNG or SVG, ~200 × 60 px, transparent background.
+try:
+    st.logo("logo.png", size="large")
+except Exception:
+    pass  # logo file not present yet — no crash, no noise
+
+# ── Auth gate ────────────────────────────────────────────────────────────────
+
+# if not st.user.is_logged_in:
+#     st.title("🤖 MigrationBot")
+#     st.markdown(
+#         "Your AI assistant for the **S/4HANA WRICEF Migration Control Sheet**. "
+#         "Read, update, search, and report — all in plain English."
+#     )
+#     st.button("🔑 Sign in with Google", on_click=st.login, type="primary")
+#     st.stop()
+
+
+# Setup the OAuth component
+oauth2 = OAuth2Component(
+    client_id=st.secrets["auth"]["client_id"],
+    client_secret=st.secrets["auth"]["client_secret"],
+    authorize_endpoint="https://accounts.google.com/o/oauth2/v2/auth",
+    token_endpoint="https://oauth2.googleapis.com/token",
+)
+
+# Auth gate
+if "token_dict" not in st.session_state:
+    st.title("🤖 MigrationBot")
+    st.markdown(
+        "Your AI assistant for the **S/4HANA WRICEF Migration Control Sheet**. "
+        "Read, update, search, and report — all in plain English."
+    )
+    
+    # This generates the login button
+    result = oauth2.authorize_button(
+        name="🔑 Sign in with Google",
+        icon="https://www.google.com/favicon.ico",
+        redirect_uri="http://localhost:8501/", # Update if deployed
+        #oauth2callback
+        scope="openid email profile https://www.googleapis.com/auth/spreadsheets",
+        key="google_auth",
+        # access_type="offline" is the magic word that forces Google to give you a refresh_token!
+        extras_params={"prompt": "consent", "access_type": "offline"} 
+    )
+    
+    if result and "token" in result:
+        st.session_state.token_dict = result["token"]
+        st.rerun()
+    else:
+        st.stop()
+
+# ── Token expiry guard ───────────────────────────────────────────────────────
+# Google access tokens live ~3600 s. We log the user out after 55 min
+# (5 min buffer) so the token never silently starts returning 401s mid-session.
+
+TOKEN_LIFETIME_SECS = 55 * 60
+
+if "token_issued_at" not in st.session_state:
+    st.session_state.token_issued_at = time.time()
+
+if time.time() - st.session_state.token_issued_at > TOKEN_LIFETIME_SECS:
+    st.warning("Your session has expired. Please sign in again.")
+    st.session_state.clear()
+    st.logout()
+    st.stop()
+
+#token_dict = st.user.tokens["access"]
+# ADD THIS LINE:
+token_dict = st.session_state.token_dict
+
+# ── Active sheet ─────────────────────────────────────────────────────────────
+# F12: the active sheet is stored in session_state["active_sheet"].
+# Defaults to the sheet in secrets.toml. Admins can switch at runtime.
+
+active_sheet = get_active_sheet()
+
+# ── Executor — cached so header/row caches survive reruns ────────────────────
+# Rebuilt when the access token OR the active sheet changes.
+
+_executor_key = (token_dict, active_sheet["spreadsheet_id"], active_sheet["sheet_tab_name"])
+
+if st.session_state.get("executor_key") != _executor_key:
+    st.session_state.executor     = SheetsExecutor(
+        # access_token,
+        token_dict, # <-- Pass the whole dictionary
+        spreadsheet_id = active_sheet["spreadsheet_id"],
+        sheet_tab_name = active_sheet["sheet_tab_name"],
+    )
+    st.session_state.executor_key = _executor_key
+
+executor: SheetsExecutor = st.session_state.executor
+
+# ── F11: Dynamic column map ──────────────────────────────────────────────────
+# Build (or reuse) the LLM-generated alias map for the active sheet.
+# Runs the two-pass DeepSeek analysis once per session per sheet,
+# showing a spinner. Subsequent reruns are instant (cache hit).
+# ── F11: Dynamic column map ──────────────────────────────────────────────────
+# Build (or reuse) the LLM-generated alias map for the active sheet.
+try:
+    ensure_column_map(executor)
+except (HttpError, RefreshError):
+    st.warning("Your session has expired or lacks permissions. Please sign in again.")
+    st.session_state.clear()
+    st.logout()
+    st.stop()
 
 
 
@@ -86,6 +260,11 @@ def _handle(messages: list, executor: SheetsExecutor) -> str:
 
 
 def _dispatch_tool(name: str, args: dict, executor: SheetsExecutor) -> dict:
+    checker = get_checker()
+    if checker:
+        allowed, reason = checker.can_execute(name, args)
+        if not allowed:
+            return {"ok": False, "error": reason}
     try:
         if name == "get_row":
             return executor.get_row(**args)
@@ -221,64 +400,6 @@ def _render_overdue_report(data: dict) -> None:
         )
 
 
-
-# ── Page config (must be first Streamlit call) ───────────────────────────────
-
-st.set_page_config(
-    page_title="MigrationBot",
-    page_icon="🤖",
-    layout="centered",
-)
-
-# ── Logo ──────────────────────────────────────────────────────────────────────
-# Drop your logo file into the repo root and set the filename below.
-# st.logo() pins it to the top of the sidebar (Streamlit ≥ 1.36).
-# Recommended: PNG or SVG, ~200 × 60 px, transparent background.
-try:
-    st.logo("logo.png", size="large")
-except Exception:
-    pass  # logo file not present yet — no crash, no noise
-
-# ── Auth gate ────────────────────────────────────────────────────────────────
-
-if not st.user.is_logged_in:
-    st.title("🤖 MigrationBot")
-    st.markdown(
-        "Your AI assistant for the **S/4HANA WRICEF Migration Control Sheet**. "
-        "Read, update, search, and report — all in plain English."
-    )
-    st.button("🔑 Sign in with Google", on_click=st.login, type="primary")
-    st.stop()
-
-# ── Token expiry guard ───────────────────────────────────────────────────────
-# Google access tokens live ~3600 s. We log the user out after 55 min
-# (5 min buffer) so the token never silently starts returning 401s mid-session.
-
-TOKEN_LIFETIME_SECS = 55 * 60
-
-if "token_issued_at" not in st.session_state:
-    st.session_state.token_issued_at = time.time()
-
-if time.time() - st.session_state.token_issued_at > TOKEN_LIFETIME_SECS:
-    st.warning("Your session has expired. Please sign in again.")
-    st.session_state.clear()
-    st.logout()
-    st.stop()
-
-access_token = st.user.tokens["access"]
-
-# ── Executor — cached so header/row caches survive reruns ────────────────────
-# Rebuilt only when the access token changes.
-
-if (
-    "executor" not in st.session_state
-    or st.session_state.get("executor_token") != access_token
-):
-    st.session_state.executor       = SheetsExecutor(access_token)
-    st.session_state.executor_token = access_token
-
-executor: SheetsExecutor = st.session_state.executor
-
 # ── Chat history ─────────────────────────────────────────────────────────────
 
 if "messages" not in st.session_state:
@@ -286,10 +407,128 @@ if "messages" not in st.session_state:
 
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 
+# with st.sidebar:
+#     st.success("✅ Authenticated")
+#     st.markdown(f"**Connected as:**  \n{st.user.email}")
+#     st.button("Sign out", on_click=st.logout)
+import base64
+
+# --- Helper to decode the email from Google's ID token ---
+def get_email_from_token(token_dict):
+    try:
+        id_token = token_dict.get("id_token", "")
+        if not id_token: return "Unknown User"
+        
+        # JWTs are split by dots; the data is in the middle section
+        payload = id_token.split(".")[1]
+        # Fix padding for base64 decoding
+        payload += "=" * ((4 - len(payload) % 4) % 4)
+        
+        decoded = base64.urlsafe_b64decode(payload).decode("utf-8")
+        return json.loads(decoded).get("email", "Unknown User")
+    except Exception:
+        return "Unknown User"
+
+user_email = get_email_from_token(st.session_state.token_dict)
+
+if "session_id" not in st.session_state:
+    st.session_state.session_id = str(uuid.uuid4())
+
+ensure_permissions(token_dict, user_email)
+
 with st.sidebar:
     st.success("✅ Authenticated")
-    st.markdown(f"**Connected as:**  \n{st.user.email}")
-    st.button("Sign out", on_click=st.logout)
+    st.markdown(f"**Connected as:**  \n{user_email}")
+    
+    def do_logout():
+        st.session_state.clear()
+        
+    st.button("Sign out", on_click=do_logout)
+
+    # ── F12: Sheet selector ───────────────────────────────────────────────────
+    st.divider()
+    st.subheader("📋 Active Sheet")
+
+    allowed = get_allowed_sheets()
+    default = get_default_sheet()
+    sheet_names = [s["name"] for s in allowed] if allowed else [default["sheet_label"]]
+
+    # Find which sheet is currently active
+    current_id = active_sheet["spreadsheet_id"]
+    current_idx = next(
+        (i for i, s in enumerate(allowed) if s["spreadsheet_id"] == current_id), 0
+    ) if allowed else 0
+
+    if allowed and len(allowed) > 1:
+        selected_name = st.selectbox(
+            "Sheet", options=sheet_names, index=current_idx,
+            label_visibility="collapsed"
+        )
+        selected = next(s for s in allowed if s["name"] == selected_name)
+
+        # Fetch tabs for the selected sheet
+        if st.button("Switch Sheet", use_container_width=True):
+            with st.spinner("Connecting to sheet…"):
+                try:
+                    tabs = fetch_sheet_tabs(token_dict, selected["spreadsheet_id"])
+                    st.session_state["pending_sheet"] = {
+                        "spreadsheet_id": selected["spreadsheet_id"],
+                        "name": selected["name"],
+                        "tabs": [t["title"] for t in tabs],
+                    }
+                except PermissionError as e:
+                    st.error(str(e))
+                except Exception as e:
+                    st.error(f"Could not connect: {e}")
+
+    # Tab picker — shown after "Switch Sheet" is clicked
+    if "pending_sheet" in st.session_state:
+        pending = st.session_state["pending_sheet"]
+        tab_choice = st.selectbox(
+            "Select tab", options=pending["tabs"], key="tab_picker"
+        )
+        col1, col2 = st.columns(2)
+        if col1.button("✅ Confirm", use_container_width=True):
+            set_active_sheet(
+                pending["spreadsheet_id"], tab_choice, pending["name"]
+            )
+            st.session_state.pop("pending_sheet", None)
+            st.session_state.messages = []   # clear chat for new sheet context
+            st.rerun()
+        if col2.button("Cancel", use_container_width=True):
+            st.session_state.pop("pending_sheet", None)
+            st.rerun()
+
+    # Admin: register a new sheet by URL
+    if is_admin(user_email):
+        with st.expander("➕ Register new sheet (Admin)"):
+            new_url = st.text_input("Google Sheet URL", placeholder="https://docs.google.com/spreadsheets/d/…")
+            reg_name = st.text_input("Display name", placeholder="e.g. Q2 Tracker")
+            if st.button("Register", use_container_width=True):
+                sid = parse_sheet_id(new_url)
+                if not sid:
+                    st.error("Could not parse a spreadsheet ID from that URL.")
+                elif not reg_name.strip():
+                    st.error("Please provide a display name.")
+                else:
+                    with st.spinner("Verifying access…"):
+                        try:
+                            fetch_sheet_tabs(token_dict, sid)   # access check
+                            register_sheet(reg_name.strip(), sid)
+                            st.success(f"Registered: {reg_name}")
+                            st.rerun()
+                        except PermissionError as e:
+                            st.error(str(e))
+                        except Exception as e:
+                            st.error(f"Registration failed: {e}")
+
+    # Show current active sheet label
+    st.caption(f"Active: **{active_sheet.get('sheet_label', active_sheet['sheet_tab_name'])}**")
+    if active_sheet["spreadsheet_id"] != default["spreadsheet_id"]:
+        if st.button("↩ Back to default sheet", use_container_width=True):
+            reset_to_default_sheet()
+            st.session_state.messages = []
+            st.rerun()
 
     st.divider()
     st.subheader("📊 Quick Reports")
@@ -336,18 +575,29 @@ st.caption("S/4HANA WRICEF Migration Tracker · powered by DeepSeek")
 # ── Welcome screen (shown only before the first message) ─────────────────────
 
 EXAMPLE_PROMPTS = [
-    "What's the dev status of MM-001?",
-    "Set IM-001 status to Ready for Dev",
+    "What's the dev status of SD-045?",
+    "Set FI-012 status to Ready for Dev",
     "Show me all MM objects with no dev status",
-    "Highlight MM-005 red",
+    "Highlight PM-023 red",
     "How many items are in each dev status?",
-    "Which MM items are past their go-live date?",
-    "Mark MM-001 and MM-002 as migrated",
+    "Which SD items are past their go-live date?",
+    "Mark SD-010 and SD-011 as migrated",
     "What's our completion rate for Migrate? = Yes?",
 ]
 
 if not st.session_state.messages:
-    first_name = (st.user.name or "").split()[0] or "there"
+    #first_name = (st.user.name or "").split()[0] or "there"
+    # Extract first name securely from the Google token
+    try:
+        id_token = st.session_state.token_dict.get("id_token", "")
+        payload = id_token.split(".")[1]
+        payload += "=" * ((4 - len(payload) % 4) % 4)
+        import base64
+        decoded = json.loads(base64.urlsafe_b64decode(payload).decode("utf-8"))
+        # Google provides 'given_name' (first name) by default
+        first_name = decoded.get("given_name", "there")
+    except Exception:
+        first_name = "there"
     st.markdown(f"### Welcome back, {first_name} 👋")
     st.markdown(
         "Ask me anything about the migration tracker in plain English — "

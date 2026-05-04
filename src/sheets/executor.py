@@ -17,10 +17,23 @@ class SheetsExecutor:
     }
 
         # AFTER — add _header_cache and _id_index_cache
-    def __init__(self, access_token: str):
-        self.service        = build_sheets_service(access_token)
-        self.spreadsheet_id = st.secrets["app"]["spreadsheet_id"]
-        self.SHEET_NAME     = st.secrets["app"]["sheet_tab_name"]
+    # def __init__(self, access_token: str):
+    #     self.service        = build_sheets_service(access_token)
+    #     self.spreadsheet_id = st.secrets["app"]["spreadsheet_id"]
+    #     self.SHEET_NAME     = st.secrets["app"]["sheet_tab_name"]
+    #     self._sheet_id_cache:   int | None       = None
+    #     self._header_cache:     list[str] | None = None   # ← new
+    #     self._col_idx_cache:    dict[str, int]   = {}     # ← new
+    #     self._id_row_cache:     dict[str, int]   = {}     # ← new (ricefw_id → row number)
+    
+    # def __init__(self, access_token: str, spreadsheet_id: str, sheet_tab_name: str):
+    def __init__(self, token_dict: dict, spreadsheet_id: str, sheet_tab_name: str):
+        self.service        = build_sheets_service(token_dict)
+        #self.service        = build_sheets_service(access_token)
+        # Use the arguments passed in instead of hardcoding from secrets
+        self.spreadsheet_id = spreadsheet_id 
+        self.SHEET_NAME     = sheet_tab_name 
+        
         self._sheet_id_cache:   int | None       = None
         self._header_cache:     list[str] | None = None   # ← new
         self._col_idx_cache:    dict[str, int]   = {}     # ← new
@@ -48,7 +61,6 @@ class SheetsExecutor:
             idx = idx // 26 - 1
         return result
 
-        # AFTER — cached for the lifetime of the session
     def _get_header_row(self) -> list[str]:
         if self._header_cache is not None:
             return self._header_cache
@@ -59,7 +71,6 @@ class SheetsExecutor:
         self._header_cache = result.get("values", [[]])[0]
         return self._header_cache
 
-    # AFTER — uses a pre-built dict, O(1) lookup
     def _resolve_col_index(self, field: str) -> int | None:
         if not self._col_idx_cache:
             headers = self._get_header_row()
@@ -68,7 +79,6 @@ class SheetsExecutor:
 
     # ── Public API ──────────────────────────────────────────────────
 
-    # AFTER — cache hit avoids the API call on repeated lookups in the same session
     def find_row(self, ricefw_id: str) -> int | None:
         key = ricefw_id.strip().upper()
         if key in self._id_row_cache:
