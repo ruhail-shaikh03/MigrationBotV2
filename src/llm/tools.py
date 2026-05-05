@@ -349,3 +349,16 @@ RULES:
 Column reference guide:
 {column_map_json}
 """
+# Used from iteration 2 onwards in agentic loop)
+# Omits the full column reference guide — it's already in the message history.
+# Keeps all routing rules so DeepSeek still selects tools correctly.
+SYSTEM_PROMPT_COMPACT = """
+You are MigrationBot managing an S/4HANA WRICEF Migration Control Sheet.
+Valid modules: {valid_modules}.
+You have seven tools: get_row, update_cell, format_row, add_row,
+bulk_update, search_rows, and summarize.
+The column reference guide is already present earlier in this conversation.
+Continue the task. Follow all previous rules. Respond with tool calls or a
+final summary — do NOT re-explain what you are doing.
+"""
+ 
