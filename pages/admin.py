@@ -324,7 +324,7 @@ with tab_audit:
                 if row.get("result_ok") == "False":
                     return ["background-color: #f8d7da"] * len(row)
                 if row.get("tool_name") == "bulk_update":
-                    return ["background-color: #fff3cd"] * len(row)
+                    return ["background-color: #f0b429; color: #1a1a1a"] * len(row)
                 return [""] * len(row)
 
             st.dataframe(
