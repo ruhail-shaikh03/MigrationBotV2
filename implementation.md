@@ -784,44 +784,67 @@ DEFAULT_SHEET_LABEL=FF Migration Tracker
 
 ---
 
-## 5. Verification Plan
+## 5. Phase-by-Phase Testing Strategy
 
-### Automated Tests
+To ensure stability and prevent regressions as we migrate to the Event-Driven Architecture, testing will be executed strictly per-phase before moving to the next.
 
-```bash
-# Backend unit tests (pytest + httpx for FastAPI TestClient)
-cd backend && pytest tests/ -v
+### Phase 1: Database Foundation Tests
+*Location: `backend/tests/test_db.py`*
 
-# Frontend tests (Vitest + React Testing Library)  
-cd frontend && npm test
+**Automated Tests:**
+- `test_db_connection`: Verifies async SQLAlchemy engine connects to PostgreSQL successfully.
+- `test_project_schema_config_default`: Asserts that creating a project without schema config defaults to `'{}'::jsonb`.
+- `test_user_creation`: Verifies NextAuth/Google OAuth subject ID correctly inserts or finds users.
+- `test_rbac_cascading_deletes`: Asserts that deleting a project or user successfully cascades to wipe `permissions` table rows.
 
-# Integration tests (docker-compose up + API calls)
-docker-compose up -d
-pytest tests/integration/ -v
-```
+**Manual Gate:** Run Alembic migrations up to head and down to base to ensure no schema lockups.
 
-### Key Test Cases
+### Phase 2: FastAPI Backend & Core Engine Tests
+*Location: `backend/tests/test_core/`*
 
-| Test | Validates |
-|------|----------|
-| RBAC enforcement on write tools | Viewer cannot `update_cell`, Editor field restrictions work |
-| Audit log captures old_value | `update_cell` pre-reads before writing |
-| Queue-backed write completes | Write job flows through Redis → worker → Sheets API |
-| WebSocket message delivery | Chat messages stream correctly |
-| Column mapper fallback | Falls back to static aliases on LLM failure |
-| Agentic loop max iterations | Loop respects 8-iteration limit |
-| Conditional logic routing | `deepseek-reasoner` used for "if X then Y" queries |
-| Data quality checks | Blank fields, stale items, consistency all produce correct reports |
-| MCP server retry | 429 errors trigger exponential backoff |
-| Cross-module switch | `switch_module` changes active tab and triggers column map rebuild |
+**Automated Tests:**
+- `test_jwt_verification`: Pass a mock NextAuth JWT and ensure FastAPI decodes and extracts user email/roles successfully.
+- `test_agentic_loop_max_iterations`: Mock DeepSeek to endlessly return tool calls; assert the loop forcefully breaks at 8 iterations.
+- `test_llm_routing`: Mock a message with "if / else" and verify it routes to `deepseek-reasoner`. Mock a standard query and verify `deepseek-chat`.
+- `test_rbac_interception`: Mock an `update_cell` tool call for a "Viewer" role user; assert the permission checker returns `False` and blocks execution.
+- `test_audit_logger_nonblocking`: Force the DB to throw an error during audit write; assert the main tool execution still returns successfully.
 
-### Manual Verification
+**Manual Gate:** Use Postman/Swagger UI to hit the WebSocket `/ws/chat` endpoint and verify echo responses.
 
-1. **End-to-end chat flow:** Log in → select project → ask "show me all SD items" → verify results
-2. **Write operation:** Ask "set SD-045 status to Done" → verify queue processes → verify Sheets updated
-3. **Admin dashboard:** View audit logs, manage permissions, add/remove projects
-4. **Concurrent users:** Load test with 10+ simultaneous WebSocket connections
-5. **Google API throttling:** Verify no 429 errors under sustained load with queue-backed writes
+### Phase 3: Embedded Sheets Layer Tests
+*Location: `backend/tests/test_sheets/`*
+
+**Automated Tests:**
+- `test_read_find_row`: Mock Google API response; assert it correctly maps RICEFW ID using the `schema_config` column index.
+- `test_write_job_enqueuing`: Trigger a write function; assert it places a valid `WriteJob` payload into the Redis Bull queue.
+- `test_worker_throttling`: Spin up the worker, enqueue 5 jobs; assert they are processed with exactly 1-second delays (rate limiting).
+- `test_api_retry_backoff`: Mock the Google API returning a 429 error; assert the `_with_retry` wrapper catches it, waits, and retries.
+- `test_column_mapper`: Pass a mock header list and target alias; assert the fuzzy matcher resolves the correct canonical name.
+
+**Manual Gate:** Create a test Google Sheet, run the worker locally, and verify an enqueue operation successfully modifies a cell in the live sheet.
+
+### Phase 4: Next.js Frontend Tests
+*Location: `frontend/__tests__/`*
+
+**Automated Tests (Vitest + React Testing Library):**
+- `test_chat_rendering`: Assert that streaming tokens from the WebSocket append sequentially to the chat bubble.
+- `test_tool_call_ui`: Assert that when a `tool_start` message is received, the UI renders the animated loading spinner and tool name.
+- `test_auth_guard`: Assert that navigating to `/chat` without a NextAuth session redirects to `/`.
+- `test_admin_schema_editor`: Assert that the schema config JSON editor prevents saving invalid JSON syntax.
+
+**Manual Gate:** Run `npm run dev`, login with Google, navigate to the chat, and ensure the UI connects to the local FastAPI WebSocket.
+
+### Phase 5: Integration & Load Testing
+*Location: `tests/integration/`*
+
+**Automated Tests:**
+- `test_e2e_write_flow`: Spin up `docker-compose`. Hit FastAPI directly to queue an update. Assert the Postgres audit log updates and Redis queue empties.
+- `test_e2e_read_flow`: Hit the chat API; assert the entire loop completes and returns a text summary.
+
+**Load Testing (Locust / Artillery):**
+- Spawn 50 simulated WebSocket connections sending messages every 5 seconds.
+- Assert 0 Google Sheets API 429 errors (proving the worker throttle works).
+- Assert Redis memory stays within boundaries.
 
 ---
 
