@@ -5,30 +5,13 @@ F11 — Dynamic LLM-Driven Column Mapping
 
 Analyses a sheet's actual header row and builds a natural-language alias map
 using a two-pass DeepSeek call. The result is stored in
-st.session_state["column_map"] and used everywhere COLUMN_ALIASES was used.
-
-Two-pass design
-───────────────
-Pass 1 — generation
-    Send the exact header row to deepseek-chat.
-    Ask it to produce 3-6 natural language aliases per column.
-    Keys in the returned JSON MUST be the exact header strings.
-
-Pass 2 — verification
-    Send the generated map back for review.
-    DeepSeek checks for: headers with no entry, dangerously generic aliases
-    that could match multiple columns, and missing SAP domain terms.
-    Returns the corrected map (or the original if nothing needs changing).
-
-Fallback
-────────
-If either LLM call fails, or the JSON cannot be parsed, the static
-COLUMN_ALIASES from column_map.py is used instead. The user sees a warning
-but the app continues working.
+st.session_state["column_map"] and st.session_state["column_maps"] and used
+everywhere COLUMN_ALIASES was used.
 """
 
 import json
 import streamlit as st
+from typing import Dict, List, Any, Optional
 from src.llm.deepseek_client import get_deepseek_client
 from src.sheets.column_map import COLUMN_ALIASES
 
@@ -86,7 +69,7 @@ Return ONLY valid JSON, no explanation, no markdown code blocks.\
 
 # ── Core analysis ─────────────────────────────────────────────────────────────
 
-def build_column_map(header_row: list[str]) -> dict:
+def build_column_map(header_row: List[str]) -> dict:
     """
     Run the two-pass LLM analysis on a header row and return the alias dict.
     Keys are exact header strings; values are lists of lowercase alias strings.
@@ -106,7 +89,7 @@ def build_column_map(header_row: list[str]) -> dict:
             messages=[{"role": "user",
                         "content": _PASS1_PROMPT.format(headers_json=headers_json)}],
             max_tokens=4096,
-            temperature=0.2,   # low temperature = more consistent JSON output
+            temperature=0.2,
         )
         raw1 = r1.choices[0].message.content.strip()
         map1 = _parse_json_safely(raw1)
@@ -153,16 +136,14 @@ def build_column_map(header_row: list[str]) -> dict:
     return final_map
 
 
-def _parse_json_safely(raw: str) -> dict | None:
+def _parse_json_safely(raw: str) -> Optional[dict]:
     """
     Parse a JSON string that may have stray markdown fences.
     Returns None on any parse failure.
     """
-    # Strip markdown code fences DeepSeek sometimes adds despite instructions
     cleaned = raw.strip()
     if cleaned.startswith("```"):
         lines = cleaned.splitlines()
-        # Drop first line (```json or ```) and last line (```)
         cleaned = "\n".join(lines[1:-1]).strip()
     try:
         result = json.loads(cleaned)
@@ -185,33 +166,37 @@ def get_active_column_map() -> dict:
 def invalidate_column_map() -> None:
     """
     Remove the cached column map from session state.
-    Called by sheet_registry.set_active_sheet() when the user switches sheets,
-    so the next render triggers a fresh analysis for the new sheet.
+    Called when the user switches sheets or tabs, so the next render
+    triggers a fresh analysis.
     """
     st.session_state.pop("column_map", None)
-    st.session_state.pop("column_map_sheet_id", None)
+    st.session_state.pop("column_map_sheet_key", None)
+    st.session_state.pop("column_maps", None)
 
 
-def ensure_column_map(executor) -> None:
+def ensure_column_map(executor: Any) -> None:
     """
-    Build the column map for the current sheet if it hasn't been built yet,
-    or if the active sheet has changed since it was last built.
+    Build the column map for the current sheet and tab if it hasn't been built yet,
+    or if the active sheet/tab has changed since it was last built.
 
     Call this once per render cycle, after the executor is initialised.
     Shows a spinner during the ~3-6 second LLM analysis.
     """
-    current_sheet_id = executor.spreadsheet_id
+    current_key = f"{executor.spreadsheet_id}:{executor.SHEET_NAME}"
 
-    # Already built for this sheet — nothing to do
-    if (
-        "column_map" in st.session_state
-        and st.session_state.get("column_map_sheet_id") == current_sheet_id
-    ):
+    if "column_maps" not in st.session_state:
+        st.session_state["column_maps"] = {}
+
+    # Check multi-tab column map cache first
+    if current_key in st.session_state["column_maps"]:
+        st.session_state["column_map"] = st.session_state["column_maps"][current_key]
+        st.session_state["column_map_sheet_key"] = current_key
         return
 
     with st.spinner("Analysing sheet columns… (first load only)"):
         header_row = executor._get_header_row()
         column_map = build_column_map(header_row)
 
-    st.session_state["column_map"]          = column_map
-    st.session_state["column_map_sheet_id"] = current_sheet_id
+    st.session_state["column_maps"][current_key] = column_map
+    st.session_state["column_map"] = column_map
+    st.session_state["column_map_sheet_key"] = current_key

@@ -19,6 +19,7 @@ values, which clears all caches and triggers a fresh column map analysis
 """
 
 import re
+import warnings
 import streamlit as st
 from googleapiclient.errors import HttpError
 from src.sheets_auth import build_sheets_service
@@ -126,21 +127,25 @@ def set_active_sheet(spreadsheet_id: str, sheet_tab_name: str,
         "sheet_tab_name": sheet_tab_name,
         "sheet_label":    sheet_label or sheet_tab_name,
     }
-    # Clear executor and column map — both will be rebuilt by app.py
+    # Clear executor, column map, and audit logger — all will be rebuilt
     # on the next rerun with the new sheet context.
-    st.session_state.pop("executor",          None)
-    st.session_state.pop("executor_key",       None)
-    st.session_state.pop("column_map",         None)
-    st.session_state.pop("column_map_sheet_id",None)
+    st.session_state.pop("executor",            None)
+    st.session_state.pop("executor_key",        None)
+    st.session_state.pop("column_map",          None)
+    st.session_state.pop("column_map_sheet_id", None)
+    st.session_state.pop("audit_logger",        None)
+    st.session_state.pop("audit_logger_key",    None)
 
 
 def reset_to_default_sheet() -> None:
     """Switch back to the default sheet from secrets."""
     st.session_state.pop("active_sheet",        None)
-    st.session_state.pop("executor",             None)
-    st.session_state.pop("executor_key",          None)
-    st.session_state.pop("column_map",            None)
-    st.session_state.pop("column_map_sheet_id",   None)
+    st.session_state.pop("executor",            None)
+    st.session_state.pop("executor_key",        None)
+    st.session_state.pop("column_map",          None)
+    st.session_state.pop("column_map_sheet_id", None)
+    st.session_state.pop("audit_logger",        None)
+    st.session_state.pop("audit_logger_key",    None)
 
 
 # ── Admin helpers ─────────────────────────────────────────────────────────────
@@ -149,61 +154,14 @@ def is_admin(email: str) -> bool:
     """
     Check if the given email is in the admin list from secrets.
 
-    secrets.toml:
-        [app]
-        admins = ["sara@tmcltd.ai", "ahmed@tmcltd.ai"]
-
-    NOTE: This is a placeholder until F13 (RBAC) is implemented. Once RBAC
-    is live, this function will delegate to the PermissionChecker instead.
+    .. deprecated:: 1.0.0
+       Use PermissionChecker.is_admin instead.
     """
+    warnings.warn(
+        "is_admin() in sheet_registry is deprecated and will be removed in a future version. "
+        "Use PermissionChecker().is_admin instead.",
+        DeprecationWarning,
+        stacklevel=2
+    )
     admins = st.secrets.get("app", {}).get("admins", [])
     return email.lower() in [a.lower() for a in admins]
-
-
-# ── Allowed sheets list ───────────────────────────────────────────────────────
-
-def get_allowed_sheets() -> list[dict]:
-    """
-    Return the pre-approved list of sheets from secrets, plus any that have
-    been registered this session by an admin.
-
-    secrets.toml:
-        [[app.allowed_sheets]]
-        name = "FF Migration Tracker v1"
-        id   = "abc123..."
-
-        [[app.allowed_sheets]]
-        name = "FF Migration Tracker v2 (Live)"
-        id   = "def456..."
-    """
-    # Sheets defined in secrets (always available)
-    from_secrets = [
-        {"name": s["name"], "spreadsheet_id": s["id"]}
-        for s in st.secrets.get("app", {}).get("allowed_sheets", [])
-    ]
-
-    # Sheets registered this session by an admin (runtime additions)
-    session_sheets = st.session_state.get("registered_sheets", [])
-
-    # Deduplicate by spreadsheet_id
-    seen = set()
-    result = []
-    for s in from_secrets + session_sheets:
-        if s["spreadsheet_id"] not in seen:
-            seen.add(s["spreadsheet_id"])
-            result.append(s)
-
-    return result
-
-
-def register_sheet(name: str, spreadsheet_id: str) -> None:
-    """Add a sheet to the session-level registry (admin only)."""
-    if "registered_sheets" not in st.session_state:
-        st.session_state["registered_sheets"] = []
-    # Avoid duplicates
-    existing_ids = [s["spreadsheet_id"] for s in st.session_state["registered_sheets"]]
-    if spreadsheet_id not in existing_ids:
-        st.session_state["registered_sheets"].append({
-            "name": name,
-            "spreadsheet_id": spreadsheet_id,
-        })

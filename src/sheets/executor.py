@@ -1,13 +1,59 @@
-import asyncio
+"""
+src/sheets/executor.py
+──────────────────────
+F12 — Sheets Executor
+
+Implements low-level Google Sheets operations such as cell read/write, formatting,
+sequencing, bulk updates, searching, and analytics generation. Uses cached values
+for sheets metadata and header layouts.
+"""
+
+import time
 import streamlit as st
+from typing import List, Dict, Any, Optional, Set, Tuple
 from googleapiclient.errors import HttpError
 from src.sheets_auth import build_sheets_service
 
-class SheetsExecutor:
-    SHEET_NAME     = None   # loaded from secrets at runtime
-    DATA_START_ROW = 3      # Row 1 = section headers, Row 2 = column headers
-    COLOR_INDEX    = 50     # 0-based index of your Color column — adjust if needed
 
+# ── Retry helper ─────────────────────────────────────────────────────────────
+
+def _with_retry(fn, max_attempts: int = 4, base_delay: float = 1.0):
+    """
+    Execute ``fn()`` with exponential backoff on transient Google Sheets API
+    errors (HTTP 429 Too Many Requests, 500, 503 Service Unavailable).
+
+    Non-transient errors (400, 401, 403, 404, …) are re-raised immediately.
+    After ``max_attempts`` retries the last exception is re-raised.
+
+    Args:
+        fn:           Zero-argument callable that performs the API call.
+        max_attempts: Maximum number of attempts (default 4: 1 original + 3 retries).
+        base_delay:   Initial wait in seconds; doubles each retry (1 s, 2 s, 4 s …).
+    """
+    _TRANSIENT_CODES = {429, 500, 503}
+    delay = base_delay
+    last_exc: Exception | None = None
+
+    for attempt in range(max_attempts):
+        try:
+            return fn()
+        except HttpError as exc:
+            if exc.status_code not in _TRANSIENT_CODES:
+                raise
+            last_exc = exc
+            if attempt < max_attempts - 1:
+                time.sleep(delay)
+                delay *= 2
+        except Exception as exc:
+            raise
+
+    raise last_exc  # type: ignore[misc]
+
+class SheetsExecutor:
+    SHEET_NAME     = None   # loaded from secrets or registry at runtime
+    DATA_START_ROW = 2      # Default data start row (Row 1 = headers, Row 2 = data)
+    COLOR_INDEX    = 50     # 0-based index of your Color column
+    
     COLOR_MAP = {
         "red":   {"red": 0.96, "green": 0.80, "blue": 0.80},
         "green": {"red": 0.78, "green": 0.93, "blue": 0.78},
@@ -16,30 +62,51 @@ class SheetsExecutor:
         "white": {"red": 1.0,  "green": 1.0,  "blue": 1.0 },
     }
 
-        # AFTER — add _header_cache and _id_index_cache
-    # def __init__(self, access_token: str):
-    #     self.service        = build_sheets_service(access_token)
-    #     self.spreadsheet_id = st.secrets["app"]["spreadsheet_id"]
-    #     self.SHEET_NAME     = st.secrets["app"]["sheet_tab_name"]
-    #     self._sheet_id_cache:   int | None       = None
-    #     self._header_cache:     list[str] | None = None   # ← new
-    #     self._col_idx_cache:    dict[str, int]   = {}     # ← new
-    #     self._id_row_cache:     dict[str, int]   = {}     # ← new (ricefw_id → row number)
-    
-    # def __init__(self, access_token: str, spreadsheet_id: str, sheet_tab_name: str):
     def __init__(self, token_dict: dict, spreadsheet_id: str, sheet_tab_name: str):
         self.service        = build_sheets_service(token_dict)
-        #self.service        = build_sheets_service(access_token)
-        # Use the arguments passed in instead of hardcoding from secrets
         self.spreadsheet_id = spreadsheet_id 
         self.SHEET_NAME     = sheet_tab_name 
         
-        self._sheet_id_cache:   int | None       = None
-        self._header_cache:     list[str] | None = None   # ← new
-        self._col_idx_cache:    dict[str, int]   = {}     # ← new
-        self._id_row_cache:     dict[str, int]   = {}     # ← new (ricefw_id → row number)
+        self._sheet_id_cache:   Optional[int]       = None
+        self._header_cache:     Optional[List[str]] = None
+        self._col_idx_cache:    Dict[str, int]      = {}
+        self._id_row_cache:     Dict[str, int]      = {}
+        
+        # Detect the header row and dynamically set data start row
+        self._header_row_num = self._detect_header_row()
+        self.DATA_START_ROW  = self._header_row_num + 1
 
-    # ── Internal helpers ────────────────────────────────────────────
+    # ── Internal Helpers ────────────────────────────────────────────
+
+    def _detect_header_row(self) -> int:
+        """
+        Scan the first 5 rows of the active tab to detect the header row.
+        Looks for canonical markers like 'RICEFW ID', 'Module', 'Description', 'Type'.
+        Requires >= 2 matches. Returns the 1-indexed row number.
+        Falls back to 1 if detection fails.
+        """
+        try:
+            # Fetch the first 5 rows in one call
+            result = self.service.spreadsheets().values().get(
+                spreadsheetId=self.spreadsheet_id,
+                range=f"{self.SHEET_NAME}!A1:Z5"
+            ).execute()
+            rows = result.get("values", [])
+            
+            canonical_markers = {"ricefw id", "module", "description", "type"}
+            
+            for i, row in enumerate(rows):
+                # Normalize cells in the row
+                normalized_row = {cell.strip().lower() for cell in row if isinstance(cell, str)}
+                # Count matches
+                matches = len(canonical_markers.intersection(normalized_row))
+                if matches >= 2:
+                    return i + 1  # 1-indexed row number
+            
+            return 1
+        except Exception as e:
+            # Fall back to row 1 on failure
+            return 1
 
     def _get_sheet_id(self) -> int:
         if self._sheet_id_cache is not None:
@@ -51,8 +118,7 @@ class SheetsExecutor:
             if sheet["properties"]["title"] == self.SHEET_NAME:
                 self._sheet_id_cache = sheet["properties"]["sheetId"]
                 return self._sheet_id_cache
-        raise ValueError(f"Sheet tab '{self.SHEET_NAME}' not found. "
-                         f"Check sheet_tab_name in secrets.toml.")
+        raise ValueError(f"Sheet tab '{self.SHEET_NAME}' not found.")
 
     def _idx_to_col_letter(self, idx: int) -> str:
         result = ""
@@ -61,17 +127,17 @@ class SheetsExecutor:
             idx = idx // 26 - 1
         return result
 
-    def _get_header_row(self) -> list[str]:
+    def _get_header_row(self) -> List[str]:
         if self._header_cache is not None:
             return self._header_cache
         result = self.service.spreadsheets().values().get(
             spreadsheetId=self.spreadsheet_id,
-            range=f"{self.SHEET_NAME}!2:2"
+            range=f"{self.SHEET_NAME}!{self._header_row_num}:{self._header_row_num}"
         ).execute()
         self._header_cache = result.get("values", [[]])[0]
         return self._header_cache
 
-    def _resolve_col_index(self, field: str) -> int | None:
+    def _resolve_col_index(self, field: str) -> Optional[int]:
         if not self._col_idx_cache:
             headers = self._get_header_row()
             self._col_idx_cache = {h.lower().strip(): i for i, h in enumerate(headers)}
@@ -79,7 +145,23 @@ class SheetsExecutor:
 
     # ── Public API ──────────────────────────────────────────────────
 
-    def find_row(self, ricefw_id: str) -> int | None:
+    def detect_prefix(self) -> str:
+        """
+        Scan the first 10 RICEFW IDs to extract the company prefix.
+        Looks for 3-part hyphenated strings (e.g. "FFC-SD-001").
+        Returns the prefix (e.g., "FFC") or "" if no prefix detected.
+        """
+        try:
+            ids = self.get_all_ids()[:10]
+            for rid in ids:
+                parts = rid.strip().split("-")
+                if len(parts) >= 3 and parts[0] and not parts[0][0].isdigit():
+                    return parts[0]
+            return ""
+        except Exception:
+            return ""
+
+    def find_row(self, ricefw_id: str) -> Optional[int]:
         key = ricefw_id.strip().upper()
         if key in self._id_row_cache:
             return self._id_row_cache[key]
@@ -88,7 +170,7 @@ class SheetsExecutor:
             spreadsheetId=self.spreadsheet_id,
             range=f"{self.SHEET_NAME}!B{self.DATA_START_ROW}:B"
         ).execute()
-        # Populate the full cache while we have the data — avoids future misses
+        
         for i, row in enumerate(result.get("values", [])):
             if row and row[0].strip():
                 cached_key = row[0].strip().upper()
@@ -96,14 +178,14 @@ class SheetsExecutor:
 
         return self._id_row_cache.get(key)
 
-    def get_all_ids(self) -> list[str]:
+    def get_all_ids(self) -> List[str]:
         result = self.service.spreadsheets().values().get(
             spreadsheetId=self.spreadsheet_id,
             range=f"{self.SHEET_NAME}!B{self.DATA_START_ROW}:B"
         ).execute()
         return [r[0] for r in result.get("values", []) if r]
 
-    def get_row(self, ricefw_id: str, fields: list[str] | None = None) -> dict:
+    def get_row(self, ricefw_id: str, fields: Optional[List[str]] = None) -> dict:
         row_num = self.find_row(ricefw_id)
         if row_num is None:
             return {"ok": False, "error": f"{ricefw_id} not found in sheet"}
@@ -127,12 +209,12 @@ class SheetsExecutor:
             return {"ok": False, "error": f"Column '{field}' not found in header row"}
         col_letter = self._idx_to_col_letter(col_idx)
         cell_range = f"{self.SHEET_NAME}!{col_letter}{row_num}"
-        self.service.spreadsheets().values().update(
+        _with_retry(lambda: self.service.spreadsheets().values().update(
             spreadsheetId=self.spreadsheet_id,
             range=cell_range,
             valueInputOption="USER_ENTERED",
             body={"values": [[value]]}
-        ).execute()
+        ).execute())
         return {"ok": True, "updated_range": cell_range, "value": value}
 
     def format_row(self, ricefw_id: str, color: str,
@@ -156,21 +238,51 @@ class SheetsExecutor:
                 "fields": "userEnteredFormat.backgroundColor"
             }
         }]}
-        self.service.spreadsheets().batchUpdate(
+        _with_retry(lambda: self.service.spreadsheets().batchUpdate(
             spreadsheetId=self.spreadsheet_id, body=body
-        ).execute()
+        ).execute())
         return {"ok": True, "formatted": ricefw_id, "color": color, "scope": scope}
 
-    def next_ricefw_id(self, module: str) -> str:
+    def next_ricefw_id(self, module: str, prefix: Optional[str] = None) -> str:
+        """
+        Generate the next RICEFW ID in sequence for the given module.
+        Securely handles both MODULE-NNN and PREFIX-MODULE-NNN formats.
+        """
+        if prefix is None:
+            prefix = self.detect_prefix()
+
         all_ids = self.get_all_ids()
         nums = []
-        for i in all_ids:
-            parts = i.split("-")
-            if len(parts) == 2 and parts[0] == module and parts[1].isdigit():
-                nums.append(int(parts[1]))
-        return f"{module}-{(max(nums) + 1) if nums else 1:03d}"
+        
+        module_upper = module.strip().upper()
+        prefix_upper = prefix.strip().upper() if prefix else ""
+
+        for rid in all_ids:
+            parts = [p.strip() for p in rid.split("-") if p.strip()]
+            
+            # Case 1: PREFIX-MODULE-NNN format (e.g. FFC-SD-001)
+            if len(parts) >= 3:
+                curr_prefix = parts[0].upper()
+                curr_module = parts[1].upper()
+                curr_num_str = parts[-1]
+                if (not prefix_upper or curr_prefix == prefix_upper) and curr_module == module_upper and curr_num_str.isdigit():
+                    nums.append(int(curr_num_str))
+            
+            # Case 2: MODULE-NNN format (e.g. SD-001)
+            elif len(parts) == 2:
+                curr_module = parts[0].upper()
+                curr_num_str = parts[1]
+                if curr_module == module_upper and curr_num_str.isdigit():
+                    nums.append(int(curr_num_str))
+
+        next_num = (max(nums) + 1) if nums else 1
+        
+        if prefix_upper:
+            return f"{prefix_upper}-{module_upper}-{next_num:03d}"
+        else:
+            return f"{module_upper}-{next_num:03d}"
     
-    def _invalidate_row_cache(self, ricefw_id: str | None = None) -> None:
+    def _invalidate_row_cache(self, ricefw_id: Optional[str] = None) -> None:
         """
         Call after any write that changes row positions or adds new IDs.
         Pass ricefw_id to evict just one entry, or None to clear entirely.
@@ -182,7 +294,7 @@ class SheetsExecutor:
 
     def add_row(self, ricefw_id: str, module: str, type: str,
                 description: str, assigned_to: str = "",
-                fields: dict | None = None) -> dict:
+                fields: Optional[dict] = None) -> dict:
         headers = self._get_header_row()
         row = [""] * len(headers)
         field_map = {
@@ -197,33 +309,29 @@ class SheetsExecutor:
         for col_name, val in field_map.items():
             if col_name in headers:
                 row[headers.index(col_name)] = val
-        self.service.spreadsheets().values().append(
+        _with_retry(lambda: self.service.spreadsheets().values().append(
             spreadsheetId=self.spreadsheet_id,
             range=f"{self.SHEET_NAME}!A:A",
             valueInputOption="USER_ENTERED",
             insertDataOption="INSERT_ROWS",
             body={"values": [row]}
-        ).execute()
+        ).execute())
         self._invalidate_row_cache()
         return {"ok": True, "added": ricefw_id}
-    # ── New: search_rows ─────────────────────────────────────────────────────
 
     def search_rows(
         self,
-        filters: list[dict],
-        return_fields: list[str] | None = None,
+        filters: List[dict],
+        return_fields: Optional[List[str]] = None,
         limit: int = 20,
     ) -> dict:
         """
         Return all rows that match ALL supplied filter criteria (AND logic).
-
-        Each filter is: {"field": str, "value": str, "match_type": "exact"|"contains"|"blank"}
         """
         from src.sheets.column_map import resolve_column
 
         headers = self._get_header_row()
 
-        # Default return fields if caller didn't specify
         default_fields = [
             "RICEFW ID", "Module", "Type",
             "Description", "Dev Status", "Assigned To"
@@ -232,7 +340,6 @@ class SheetsExecutor:
             f for f in default_fields if f in headers
         ]
 
-        # Resolve semantic field names in the filters to canonical header names
         resolved_filters = []
         for f in filters:
             canonical = resolve_column(f["field"]) or f["field"]
@@ -242,7 +349,6 @@ class SheetsExecutor:
                 "match_type": f.get("match_type", "exact"),
             })
 
-        # Verify all filter columns exist
         for rf in resolved_filters:
             if rf["field"] not in headers:
                 return {
@@ -250,26 +356,22 @@ class SheetsExecutor:
                     "error": f"Column '{rf['field']}' not found in sheet headers."
                 }
 
-        # Fetch all data rows in one API call
         result = self.service.spreadsheets().values().get(
             spreadsheetId=self.spreadsheet_id,
             range=f"{self.SHEET_NAME}!{self.DATA_START_ROW}:"
-                  f"{self.DATA_START_ROW + 2000}"   # generous upper bound
+                  f"{self.DATA_START_ROW + 2000}"
         ).execute()
         all_rows = result.get("values", [])
 
-        # Build column-index lookup
         col_idx = {h: i for i, h in enumerate(headers)}
 
         matches = []
         for row in all_rows:
-            # Pad short rows with empty strings
             padded = row + [""] * (len(headers) - len(row))
 
             if not _row_matches(padded, resolved_filters, col_idx):
                 continue
 
-            # Build result dict for this row
             row_dict = {
                 field: padded[col_idx[field]]
                 for field in return_fields
@@ -287,38 +389,30 @@ class SheetsExecutor:
             "capped": len(matches) == limit,
         }
 
-
-    # ── New: bulk_update ─────────────────────────────────────────────────────
-
     def bulk_update(
         self,
         set_field: str,
         set_value: str,
-        ricefw_ids: list[str] | None = None,
-        filter_by:  dict | None = None,
+        ricefw_ids: Optional[List[str]] = None,
+        filter_by:  Optional[dict] = None,
     ) -> dict:
         """
         Update set_field = set_value on every row in ricefw_ids,
         OR on every row that matches filter_by criteria.
-
-        filter_by shape: {"module": str, "field": str, "value": str}
         """
         from src.sheets.column_map import resolve_column
 
         headers = self._get_header_row()
         col_idx = {h: i for i, h in enumerate(headers)}
 
-        # Resolve the target column name
         resolved_set_field = resolve_column(set_field) or set_field
         if resolved_set_field not in col_idx:
             return {"ok": False, "error": f"Column '{set_field}' not found."}
 
-        # --- Determine the list of target IDs ---
         if ricefw_ids:
             target_ids = [r.strip().upper() for r in ricefw_ids]
 
         elif filter_by:
-            # Resolve the filter column
             filter_col = resolve_column(filter_by["field"]) or filter_by["field"]
             if filter_col not in col_idx:
                 return {
@@ -326,7 +420,6 @@ class SheetsExecutor:
                     "error": f"Filter column '{filter_by['field']}' not found."
                 }
 
-            # Fetch all rows and find matches
             result = self.service.spreadsheets().values().get(
                 spreadsheetId=self.spreadsheet_id,
                 range=f"{self.SHEET_NAME}!{self.DATA_START_ROW}:{self.DATA_START_ROW + 2000}"
@@ -360,14 +453,56 @@ class SheetsExecutor:
         if not target_ids:
             return {"ok": True, "updated": 0, "message": "No matching rows found."}
 
-        # --- Execute individual updates ---
-        succeeded, failed = [], []
+        # ── Batch write: resolve all row numbers first (O(1) cache hits after
+        # the first find_row scan), then submit a single values.batchUpdate call
+        # instead of N individual values.update calls.
+        data_items = []
+        not_found  = []
+
         for rid in target_ids:
-            result = self.update_cell(rid, resolved_set_field, set_value)
-            if result.get("ok"):
-                succeeded.append(rid)
-            else:
-                failed.append({"id": rid, "error": result.get("error")})
+            row_num = self.find_row(rid)
+            if row_num is None:
+                not_found.append({"id": rid, "error": f"{rid} not found in sheet"})
+                continue
+            col_idx_val = self._resolve_col_index(resolved_set_field)
+            if col_idx_val is None:
+                # Should have been caught earlier, but guard defensively
+                not_found.append({"id": rid, "error": f"Column '{resolved_set_field}' not found"})
+                continue
+            col_letter = self._idx_to_col_letter(col_idx_val)
+            data_items.append({
+                "range":  f"{self.SHEET_NAME}!{col_letter}{row_num}",
+                "values": [[set_value]],
+            })
+
+        succeeded = []
+        failed    = list(not_found)
+
+        if data_items:
+            try:
+                _with_retry(lambda: self.service.spreadsheets().values().batchUpdate(
+                    spreadsheetId=self.spreadsheet_id,
+                    body={
+                        "valueInputOption": "USER_ENTERED",
+                        "data": data_items,
+                    },
+                ).execute())
+                # All items in data_items succeeded
+                succeeded = [
+                    rid for rid in target_ids
+                    if rid not in {f["id"] for f in not_found}
+                ]
+            except Exception as exc:
+                # Batch failed — fall back to individual writes so partial success
+                # is still possible
+                for rid in target_ids:
+                    if rid in {f["id"] for f in not_found}:
+                        continue
+                    r = self.update_cell(rid, resolved_set_field, set_value)
+                    if r.get("ok"):
+                        succeeded.append(rid)
+                    else:
+                        failed.append({"id": rid, "error": r.get("error", str(exc))})
 
         return {
             "ok":        len(failed) == 0,
@@ -376,27 +511,18 @@ class SheetsExecutor:
             "failed":    failed,
         }
 
-
-    # ── New: summarize ───────────────────────────────────────────────────────
-
     def summarize(
         self,
         report_type: str,
-        group_by_field:             str | None = None,
-        scope_module:               str | None = None,
-        completion_field:           str | None = None,
-        completion_value:           str | None = None,
-        blank_field:                str | None = None,
-        overdue_status_exclusions: list[str] | None = None,
+        group_by_field:             Optional[str] = None,
+        scope_module:               Optional[str] = None,
+        completion_field:           Optional[str] = None,
+        completion_value:           Optional[str] = None,
+        blank_field:                Optional[str] = None,
+        overdue_status_exclusions:  Optional[List[str]] = None,
     ) -> dict:
         """
         Produce aggregated statistics from the sheet.
-
-        report_type options:
-          count_by_field  — group rows by a column's values, count each group
-          completion_rate — % of rows where completion_field == completion_value
-          blank_fields    — count rows where blank_field is empty
-          overdue         — rows past Go-Live Date and not in a done status
         """
         from datetime import datetime
         from src.sheets.column_map import resolve_column
@@ -404,14 +530,12 @@ class SheetsExecutor:
         headers = self._get_header_row()
         col_idx = {h: i for i, h in enumerate(headers)}
 
-        # Fetch all data rows once
         result = self.service.spreadsheets().values().get(
             spreadsheetId=self.spreadsheet_id,
             range=f"{self.SHEET_NAME}!{self.DATA_START_ROW}:{self.DATA_START_ROW + 2000}"
         ).execute()
         all_rows = result.get("values", [])
 
-        # Scope to one module if requested
         mod_col = col_idx.get("Module")
         def in_scope(padded_row):
             if not scope_module or mod_col is None:
@@ -426,7 +550,6 @@ class SheetsExecutor:
 
         total = len(rows)
 
-        # ── count_by_field ──────────────────────────────────────────────────
         if report_type == "count_by_field":
             if not group_by_field:
                 return {"ok": False, "error": "group_by_field is required."}
@@ -435,12 +558,11 @@ class SheetsExecutor:
                 return {"ok": False, "error": f"Column '{group_by_field}' not found."}
 
             idx = col_idx[canonical]
-            counts: dict[str, int] = {}
+            counts: Dict[str, int] = {}
             for row in rows:
                 val = row[idx].strip() or "(blank)"
                 counts[val] = counts.get(val, 0) + 1
 
-            # Sort by count descending
             sorted_counts = sorted(counts.items(), key=lambda x: -x[1])
 
             return {
@@ -452,7 +574,6 @@ class SheetsExecutor:
                 "breakdown": [{"value": v, "count": c} for v, c in sorted_counts],
             }
 
-        # ── completion_rate ─────────────────────────────────────────────────
         elif report_type == "completion_rate":
             if not completion_field or not completion_value:
                 return {
@@ -484,7 +605,6 @@ class SheetsExecutor:
                 "completion_pct":   pct,
             }
 
-        # ── blank_fields ────────────────────────────────────────────────────
         elif report_type == "blank_fields":
             if not blank_field:
                 return {"ok": False, "error": "blank_field is required."}
@@ -507,10 +627,9 @@ class SheetsExecutor:
                 "total_rows":  total,
                 "blank_count": len(blanks),
                 "blank_pct":   round(len(blanks) / total * 100, 1) if total else 0,
-                "ids":         blanks[:50],  # cap list at 50 for readability
+                "ids":         blanks[:50],
             }
 
-        # ── overdue ─────────────────────────────────────────────────────────
         elif report_type == "overdue":
             done_statuses = set(
                 s.lower() for s in
@@ -538,7 +657,7 @@ class SheetsExecutor:
                 raw_date = row[date_col].strip()
                 if not raw_date:
                     continue
-                # Try common date formats
+                
                 for fmt in ("%d/%m/%Y", "%m/%d/%Y", "%Y-%m-%d", "%d-%m-%Y"):
                     try:
                         go_live = datetime.strptime(raw_date, fmt).date()
@@ -561,13 +680,13 @@ class SheetsExecutor:
                 "scope":       scope_module or "all modules",
                 "total_rows":  total,
                 "overdue_count": len(overdue),
-                "items":       overdue[:30],  # cap at 30
+                "items":       overdue[:30],
             }
 
         return {"ok": False, "error": f"Unknown report_type: {report_type}"}
 
 
-# ── Helper (module-level, not a class method) ─────────────────────────────────
+# ── Helper ────────────────────────────────────────────────────────────────────
 
 def _row_matches(padded_row: list, filters: list[dict], col_idx: dict) -> bool:
     """Return True if the row satisfies all filter conditions (AND logic)."""
