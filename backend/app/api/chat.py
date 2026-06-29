@@ -211,3 +211,19 @@ async def websocket_chat_endpoint(
             await websocket.send_json({"type": "error", "message": f"Server error: {str(e)}"})
         except Exception:
             pass
+
+
+@router.get("/projects", response_model=List[Dict[str, Any]])
+async def list_user_projects(db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user)):
+    """List active projects in the system for the current authenticated user."""
+    result = await db.execute(select(Project).where(Project.is_active == True))
+    projects = result.scalars().all()
+    return [{
+        "id": p.id,
+        "project_name": p.project_name,
+        "spreadsheet_id": p.spreadsheet_id,
+        "default_tab": p.default_tab,
+        "company_prefix": p.company_prefix,
+        "schema_config": p.schema_config
+    } for p in projects]
+
