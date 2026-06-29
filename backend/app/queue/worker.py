@@ -255,8 +255,11 @@ async def start_worker():
     try:
         while True:
             # BLPOP blocks asynchronously until a job is pushed into the queue list
-            pop_res = await redis_client.blpop(queue_key, timeout=10)
-            if not pop_res:
+            try:
+                pop_res = await redis_client.blpop(queue_key, timeout=10)
+                if not pop_res:
+                    continue
+            except (TimeoutError, aioredis.exceptions.TimeoutError):
                 continue
 
             _, raw_data = pop_res
