@@ -4,6 +4,11 @@ migrationbot.duckdns.org {
         reverse_proxy frontend:3000
     }
 
+    # NextAuth endpoints (MUST go to frontend)
+    handle /api/auth/* {
+        reverse_proxy frontend:3000
+    }
+
     # Backend API (REST)
     handle /api/* {
         reverse_proxy backend:8000

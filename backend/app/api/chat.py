@@ -213,7 +213,7 @@ async def websocket_chat_endpoint(
             pass
 
 
-@router.get("/projects", response_model=List[Dict[str, Any]])
+@router.get("/api/projects", response_model=List[Dict[str, Any]])
 async def list_user_projects(db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user)):
     """List active projects in the system for the current authenticated user."""
     result = await db.execute(select(Project).where(Project.is_active == True))

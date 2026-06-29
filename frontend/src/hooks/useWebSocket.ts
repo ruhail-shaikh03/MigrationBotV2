@@ -18,7 +18,9 @@ export function useWebSocket(apiToken: string | null, projectId: number | null) 
       }
     }
 
-    const wsBaseUrl = process.env.NEXT_PUBLIC_WS_URL || "ws://localhost:8000/ws"
+    const protocol = typeof window !== 'undefined' && window.location.protocol === "https:" ? "wss:" : "ws:"
+    const host = typeof window !== 'undefined' ? window.location.host : "localhost:3000"
+    const wsBaseUrl = process.env.NEXT_PUBLIC_WS_URL || `${protocol}//${host}/ws`
     const url = `${wsBaseUrl}?token=${encodeURIComponent(apiToken)}${projectId ? `&project_id=${projectId}` : ""}`
     
     console.log("Connecting to WebSocket:", wsBaseUrl)
