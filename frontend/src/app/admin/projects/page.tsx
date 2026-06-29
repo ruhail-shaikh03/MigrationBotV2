@@ -41,7 +41,7 @@ export default function AdminProjects() {
   const fetchProjects = async () => {
     try {
       setIsLoading(true)
-      const res = await fetch(`${process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000"}/api/admin/projects`, {
+      const res = await fetch(`${""}/api/admin/projects`, {
         headers: { "Authorization": `Bearer ${apiToken}` }
       })
       if (res.ok) {
@@ -112,7 +112,7 @@ export default function AdminProjects() {
       return
     }
 
-    const baseUrl = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000"
+    const baseUrl = ""
     const headers = {
       "Content-Type": "application/json",
       "Authorization": `Bearer ${apiToken}`
@@ -182,7 +182,7 @@ export default function AdminProjects() {
     if (!confirm("Are you sure you want to delete this project? This will also cascade delete all user permission mappings.")) return
     
     try {
-      const res = await fetch(`${process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000"}/api/admin/projects/${id}`, {
+      const res = await fetch(`${""}/api/admin/projects/${id}`, {
         method: "DELETE",
         headers: { "Authorization": `Bearer ${apiToken}` }
       })

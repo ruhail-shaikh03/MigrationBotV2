@@ -47,7 +47,7 @@ export default function AdminUsers() {
     try {
       setIsLoading(true)
       const headers = { "Authorization": `Bearer ${apiToken}` }
-      const baseUrl = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000"
+      const baseUrl = ""
 
       const [permRes, projRes] = await Promise.all([
         fetch(`${baseUrl}/api/admin/permissions`, { headers }),
@@ -126,7 +126,7 @@ export default function AdminUsers() {
     }
 
     try {
-      const res = await fetch(`${process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000"}/api/admin/permissions`, {
+      const res = await fetch(`${""}/api/admin/permissions`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -153,7 +153,7 @@ export default function AdminUsers() {
     if (!confirm("Are you sure you want to remove this permission assignment?")) return
     
     try {
-      const res = await fetch(`${process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000"}/api/admin/permissions/${id}`, {
+      const res = await fetch(`${""}/api/admin/permissions/${id}`, {
         method: "DELETE",
         headers: { "Authorization": `Bearer ${apiToken}` }
       })

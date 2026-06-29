@@ -38,7 +38,7 @@ export default function AdminDashboard() {
     const fetchMetrics = async () => {
       try {
         const headers = { "Authorization": `Bearer ${apiToken}` }
-        const baseUrl = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000"
+        const baseUrl = ""
         
         const [projRes, permRes, auditRes] = await Promise.all([
           fetch(`${baseUrl}/api/admin/projects`, { headers }),

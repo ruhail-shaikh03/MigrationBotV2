@@ -39,7 +39,7 @@ export default function AdminAudit() {
   const fetchAudits = async () => {
     try {
       setIsLoading(true)
-      const baseUrl = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000"
+      const baseUrl = ""
       const headers = { "Authorization": `Bearer ${apiToken}` }
       
       // Construct query string params
@@ -80,7 +80,7 @@ export default function AdminAudit() {
     setRicefwId("")
     // Let state update and then fetch, or call it directly with blanks
     setIsLoading(true)
-    const baseUrl = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000"
+    const baseUrl = ""
     fetch(`${baseUrl}/api/admin/audits?limit=100`, {
       headers: { "Authorization": `Bearer ${apiToken}` }
     })
