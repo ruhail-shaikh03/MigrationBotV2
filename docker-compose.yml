@@ -26,6 +26,9 @@ services:
     container_name: migrationbot-backend
     env_file:
       - .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://migrationbot:${DB_PASSWORD}@postgres:5432/migrationbot
+      REDIS_URL: redis://redis:6379
     ports:
       - "8000:8000"
     depends_on:
@@ -37,6 +40,8 @@ services:
     build: ./backend
     container_name: migrationbot-worker
     command: python -m app.queue.worker
+    env_file:
+      - .env
     environment:
       DATABASE_URL: postgresql+asyncpg://migrationbot:${DB_PASSWORD}@postgres:5432/migrationbot
       REDIS_URL: redis://redis:6379

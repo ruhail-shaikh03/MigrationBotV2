@@ -1,3 +1,4 @@
+from typing import Optional
 from fastapi import APIRouter, Depends
 from app.deps import get_current_user
 from app.models.user import User
@@ -9,10 +10,10 @@ router = APIRouter(prefix="/auth", tags=["Auth"])
 class UserProfileResponse(BaseModel):
     id: int
     email: str
-    display_name: Optional = None
-    avatar_url: Optional = None
+    display_name: Optional[str] = None
+    avatar_url: Optional[str] = None
     created_at: datetime
-    last_login: Optional = None
+    last_login: Optional[datetime] = None
 
     class Config:
         from_attributes = True

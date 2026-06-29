@@ -10,7 +10,7 @@ migrationbot.duckdns.org {
     }
 
     # WebSocket endpoint (chat)
-    handle /ws/* {
+    handle /ws* {
         reverse_proxy backend:8000
     }
 }
