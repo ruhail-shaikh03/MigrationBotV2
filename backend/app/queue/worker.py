@@ -2,6 +2,7 @@ import json
 import asyncio
 import logging
 from typing import Dict, Any, Optional
+import redis
 import redis.asyncio as aioredis
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
@@ -259,7 +260,7 @@ async def start_worker():
                 pop_res = await redis_client.blpop(queue_key, timeout=10)
                 if not pop_res:
                     continue
-            except (TimeoutError, aioredis.exceptions.TimeoutError):
+            except (TimeoutError, redis.exceptions.TimeoutError):
                 continue
 
             _, raw_data = pop_res
