@@ -1,9 +1,10 @@
+# Ignore only environment/sensitive json files
+# Allow package.json, package-lock.json, tsconfig.json
 .streamlit/secrets.toml
 __pycache__/
 *.pyc
 .venv/
-*.json
 TDD.md
 .env
 implementation.md
-tests/
+tests/
