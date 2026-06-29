@@ -1,21 +1,15 @@
 migrationbot.duckdns.org {
-    # Frontend (Next.js)
-    handle /* {
-        reverse_proxy frontend:3000
-    }
-
-    # NextAuth endpoints (MUST go to frontend)
-    handle /api/auth/* {
-        reverse_proxy frontend:3000
-    }
-
-    # Backend API (REST)
-    handle /api/* {
-        reverse_proxy backend:8000
-    }
-
-    # WebSocket endpoint (chat)
-    handle /ws* {
-        reverse_proxy backend:8000
+    route {
+        # 1. NextAuth endpoints (Highest Priority)
+        reverse_proxy /api/auth/* frontend:3000
+        
+        # 2. Backend REST API
+        reverse_proxy /api/* backend:8000
+        
+        # 3. WebSockets
+        reverse_proxy /ws* backend:8000
+        
+        # 4. Frontend Web App (Catch-All)
+        reverse_proxy * frontend:3000
     }
 }
