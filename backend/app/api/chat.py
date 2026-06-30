@@ -1,6 +1,6 @@
 import json
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional, List, Dict, Any
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Query, Depends
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -180,8 +180,12 @@ async def websocket_chat_endpoint(
                 # Load permission controls
                 checker = await get_user_permissions(fresh_db, user.email, current_project.id)
 
-                # Fetch or map dynamic columns (in Phase 2 we use fallback aliases, to be fully cache-backed in Phase 3)
-                column_map = current_project.schema_config.get("column_map") or COLUMN_ALIASES
+                # Resolve tab-specific schema if using the new multi-tab format
+                proj_schema = current_project.schema_config
+                active_tab_schema = proj_schema.get("tabs", {}).get(current_sess.active_tab, {}) if "tabs" in proj_schema else proj_schema
+                
+                # Fetch or map dynamic columns
+                column_map = active_tab_schema.get("column_map") or proj_schema.get("column_map") or COLUMN_ALIASES
 
                 # Execute the agentic loop
                 message_history = await run_agentic_loop(
@@ -201,7 +205,7 @@ async def websocket_chat_endpoint(
                 )
 
                 # Update session activity timestamp
-                current_sess.last_active = datetime.utcnow()
+                current_sess.last_active = datetime.now(timezone.utc)
                 await fresh_db.commit()
 
     except WebSocketDisconnect:

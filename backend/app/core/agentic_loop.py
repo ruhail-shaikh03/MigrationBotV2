@@ -29,7 +29,10 @@ async def run_agentic_loop(
     Executes the multi-turn agentic loop. Receives user queries, interacts with DeepSeek,
     enforces RBAC permissions, routes tool requests to the dispatcher, and streams replies.
     """
-    valid_modules = schema_config.get("valid_modules", [])
+    if "tabs" in schema_config:
+        valid_modules = schema_config.get("global", {}).get("valid_modules") or list(schema_config.get("tabs", {}).keys())
+    else:
+        valid_modules = schema_config.get("valid_modules", [])
     column_map_json = json.dumps(column_map, ensure_ascii=False)
     
     # Generate initial full system prompt

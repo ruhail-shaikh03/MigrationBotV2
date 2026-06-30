@@ -5,7 +5,7 @@ from app.config import settings
 from app.models.user import User
 from app.models.permission import Permission
 
-READ_ONLY_TOOLS: Set[str] = {"get_row", "search_rows", "summarize", "switch_module"}
+READ_ONLY_TOOLS: Set[str] = {"get_row", "search_rows", "summarize", "switch_module", "data_quality"}
 WRITE_TOOLS: Set[str] = {"update_cell", "bulk_update", "format_row", "add_row"}
 
 class PermissionChecker:

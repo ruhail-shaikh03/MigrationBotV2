@@ -19,15 +19,18 @@ async def update_cell(
     Updates one or more fields for a specific RICEFW ID.
     Groups updates into a single batchUpdate operation to minimize API latency and quota consumption.
     """
-    data_start_row = schema_config.get("data_start_row", 3)
+    # Resolve tab-specific schema if using the new multi-tab format
+    tab_schema = schema_config.get("tabs", {}).get(sheet_tab, {}) if "tabs" in schema_config else schema_config
+    data_start_row = tab_schema.get("data_start_row", 3)
     header_row_num = data_start_row - 1
-    primary_id_pos = schema_config.get("primary_id_position", "B")
+    primary_id_pos = tab_schema.get("primary_id_position", "B")
+    column_map = tab_schema.get("column_map") or schema_config.get("column_map")
 
-    row_num = find_row_num(service, spreadsheet_id, sheet_tab, ricefw_id, data_start_row, primary_id_pos)
+    row_num = await find_row_num(service, spreadsheet_id, sheet_tab, ricefw_id, data_start_row, primary_id_pos)
     if row_num is None:
         return {"ok": False, "error": f"RICEFW ID '{ricefw_id}' not found in active tab."}
 
-    headers = get_header_row(service, spreadsheet_id, sheet_tab, header_row_num)
+    headers = await get_header_row(service, spreadsheet_id, sheet_tab, header_row_num)
     col_idx = {h.lower().strip(): i for i, h in enumerate(headers)}
 
     data_items = []
@@ -36,7 +39,7 @@ async def update_cell(
         value = item.get("value", "")
         
         # Resolve column header
-        canonical = resolve_column(field) or field
+        canonical = resolve_column(field, column_map) or field
         c_idx = col_idx.get(canonical.lower().strip())
         if c_idx is None:
             return {"ok": False, "error": f"Column '{field}' not found in sheet headers."}
@@ -48,7 +51,7 @@ async def update_cell(
         })
 
     # Batch execute updates
-    _with_retry(lambda: service.spreadsheets().values().batchUpdate(
+    await _with_retry(lambda: service.spreadsheets().values().batchUpdate(
         spreadsheetId=spreadsheet_id,
         body={
             "valueInputOption": "USER_ENTERED",
@@ -75,18 +78,21 @@ async def bulk_update(
     Update a single field/value on multiple RICEFW items in a single API roundtrip.
     Targets items either by direct list of IDs or via filtering matching rows.
     """
-    data_start_row = schema_config.get("data_start_row", 3)
+    # Resolve tab-specific schema if using the new multi-tab format
+    tab_schema = schema_config.get("tabs", {}).get(sheet_tab, {}) if "tabs" in schema_config else schema_config
+    data_start_row = tab_schema.get("data_start_row", 3)
     header_row_num = data_start_row - 1
-    primary_id_pos = schema_config.get("primary_id_position", "B")
-    primary_id_col = schema_config.get("primary_id_column", "RICEFW ID")
+    primary_id_pos = tab_schema.get("primary_id_position", "B")
+    primary_id_col = tab_schema.get("primary_id_column", "RICEFW ID")
+    column_map = tab_schema.get("column_map") or schema_config.get("column_map")
 
-    headers = get_header_row(service, spreadsheet_id, sheet_tab, header_row_num)
+    headers = await get_header_row(service, spreadsheet_id, sheet_tab, header_row_num)
     col_idx = {h.lower().strip(): i for i, h in enumerate(headers)}
 
     set_field = args.get("set_field", "")
     set_value = args.get("set_value", "")
 
-    canonical_set_field = resolve_column(set_field) or set_field
+    canonical_set_field = resolve_column(set_field, column_map) or set_field
     set_col_idx = col_idx.get(canonical_set_field.lower().strip())
     if set_col_idx is None:
         return {"ok": False, "error": f"Target column '{set_field}' not found."}
@@ -118,7 +124,7 @@ async def bulk_update(
     col_letter = idx_to_col_letter(set_col_idx)
 
     for rid in target_ids:
-        row_num = find_row_num(service, spreadsheet_id, sheet_tab, rid, data_start_row, primary_id_pos)
+        row_num = await find_row_num(service, spreadsheet_id, sheet_tab, rid, data_start_row, primary_id_pos)
         if row_num is None:
             not_found.append({"id": rid, "error": "Not found in sheet"})
             continue
@@ -133,7 +139,7 @@ async def bulk_update(
     if data_items:
         try:
             # Batch execute updates in one roundtrip
-            _with_retry(lambda: service.spreadsheets().values().batchUpdate(
+            await _with_retry(lambda: service.spreadsheets().values().batchUpdate(
                 spreadsheetId=spreadsheet_id,
                 body={
                     "valueInputOption": "USER_ENTERED",
@@ -182,11 +188,13 @@ async def add_row(
     schema_config: dict = None,
 ) -> dict:
     """Appends a new WRICEF tracker object to the sheet under the correct columns."""
-    schema = schema_config or {}
+    raw_schema = schema_config or {}
+    # Resolve tab-specific schema if using the new multi-tab format
+    schema = raw_schema.get("tabs", {}).get(sheet_tab, {}) if "tabs" in raw_schema else raw_schema
     data_start_row = schema.get("data_start_row", 3)
     header_row_num = data_start_row - 1
 
-    headers = get_header_row(service, spreadsheet_id, sheet_tab, header_row_num)
+    headers = await get_header_row(service, spreadsheet_id, sheet_tab, header_row_num)
     row_values = [""] * len(headers)
 
     primary_id_col = schema.get("primary_id_column", "RICEFW ID")
@@ -214,7 +222,7 @@ async def add_row(
             row_values[headers.index(col_name)] = str(val)
 
     # Append call using insertDataOption=INSERT_ROWS
-    _with_retry(lambda: service.spreadsheets().values().append(
+    await _with_retry(lambda: service.spreadsheets().values().append(
         spreadsheetId=spreadsheet_id,
         range=f"{sheet_tab}!A:A",
         valueInputOption="USER_ENTERED",

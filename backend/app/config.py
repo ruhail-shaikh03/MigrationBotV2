@@ -19,6 +19,7 @@ class Settings(BaseSettings):
 
     # Admin access configuration
     ADMIN_EMAILS: str = "ruhail.rizwan@tmcltd.com"
+    CORS_ORIGINS: str = "*"
 
     @property
     def admin_emails_list(self) -> List[str]:

@@ -7,14 +7,14 @@ from app.sheets.retry import _with_retry
 
 logger = logging.getLogger("sheets_meta")
 
-def _detect_header_row(service: Any, spreadsheet_id: str, sheet_name: str) -> int:
+async def _detect_header_row(service: Any, spreadsheet_id: str, sheet_name: str) -> int:
     """
     Scan the first 5 rows of the active tab to detect the header row.
     Looks for canonical markers like 'RICEFW ID', 'Module', 'Description', 'Type'.
     Requires >= 2 matches. Returns the 1-indexed row number.
     """
     try:
-        result = _with_retry(lambda: service.spreadsheets().values().get(
+        result = await _with_retry(lambda: service.spreadsheets().values().get(
             spreadsheetId=spreadsheet_id,
             range=f"{sheet_name}!A1:Z5"
         ).execute())
@@ -31,9 +31,9 @@ def _detect_header_row(service: Any, spreadsheet_id: str, sheet_name: str) -> in
         return 1
 
 
-def get_sheet_id(service: Any, spreadsheet_id: str, sheet_name: str) -> int:
+async def get_sheet_id(service: Any, spreadsheet_id: str, sheet_name: str) -> int:
     """Get the internal sheetId integer for formatting operations."""
-    meta = _with_retry(lambda: service.spreadsheets().get(
+    meta = await _with_retry(lambda: service.spreadsheets().get(
         spreadsheetId=spreadsheet_id
     ).execute())
     for sheet in meta.get("sheets", []):
@@ -42,9 +42,9 @@ def get_sheet_id(service: Any, spreadsheet_id: str, sheet_name: str) -> int:
     raise ValueError(f"Sheet tab '{sheet_name}' not found.")
 
 
-def get_header_row(service: Any, spreadsheet_id: str, sheet_name: str, header_row_num: int) -> List[str]:
+async def get_header_row(service: Any, spreadsheet_id: str, sheet_name: str, header_row_num: int) -> List[str]:
     """Fetch the exact header row cell values."""
-    result = _with_retry(lambda: service.spreadsheets().values().get(
+    result = await _with_retry(lambda: service.spreadsheets().values().get(
         spreadsheetId=spreadsheet_id,
         range=f"{sheet_name}!{header_row_num}:{header_row_num}"
     ).execute())
@@ -52,20 +52,21 @@ def get_header_row(service: Any, spreadsheet_id: str, sheet_name: str, header_ro
     return [str(cell).strip() for cell in values[0]] if values else []
 
 
-def get_all_ids(service: Any, spreadsheet_id: str, sheet_name: str, data_start_row: int) -> List[str]:
-    """Read column B (usually contains RICEFW IDs) starting from the data start row."""
-    # Assuming Column B hosts RICEFW IDs as standard design convention
-    result = _with_retry(lambda: service.spreadsheets().values().get(
+async def get_all_ids(service: Any, spreadsheet_id: str, sheet_name: str, data_start_row: int, primary_id_pos: str = "B") -> List[str]:
+    """Read the unique ID column starting from the data start row."""
+    col = primary_id_pos or "B"
+    result = await _with_retry(lambda: service.spreadsheets().values().get(
         spreadsheetId=spreadsheet_id,
-        range=f"{sheet_name}!B{data_start_row}:B"
+        range=f"{sheet_name}!{col}{data_start_row}:{col}"
     ).execute())
     return [str(r[0]).strip() for r in result.get("values", []) if r and str(r[0]).strip()]
 
 
-def detect_prefix(service: Any, spreadsheet_id: str, sheet_name: str, data_start_row: int) -> str:
+async def detect_prefix(service: Any, spreadsheet_id: str, sheet_name: str, data_start_row: int, primary_id_pos: str = "B") -> str:
     """Detect company prefix by reading up to 10 active object IDs."""
     try:
-        ids = get_all_ids(service, spreadsheet_id, sheet_name, data_start_row)[:10]
+        ids = await get_all_ids(service, spreadsheet_id, sheet_name, data_start_row, primary_id_pos)
+        ids = ids[:10]
         for rid in ids:
             parts = rid.split("-")
             if len(parts) >= 3 and parts[0] and not parts[0][0].isdigit():
@@ -75,10 +76,18 @@ def detect_prefix(service: Any, spreadsheet_id: str, sheet_name: str, data_start
         return ""
 
 
-def next_ricefw_id(service: Any, spreadsheet_id: str, sheet_name: str, module: str, prefix: Optional[str], data_start_row: int) -> str:
+async def next_ricefw_id(
+    service: Any, 
+    spreadsheet_id: str, 
+    sheet_name: str, 
+    module: str, 
+    prefix: Optional[str], 
+    data_start_row: int, 
+    primary_id_pos: str = "B"
+) -> str:
     """Generate the next sequentially incremented RICEFW ID for a module."""
-    actual_prefix = prefix if prefix is not None else detect_prefix(service, spreadsheet_id, sheet_name, data_start_row)
-    all_ids = get_all_ids(service, spreadsheet_id, sheet_name, data_start_row)
+    actual_prefix = prefix if prefix is not None else await detect_prefix(service, spreadsheet_id, sheet_name, data_start_row, primary_id_pos)
+    all_ids = await get_all_ids(service, spreadsheet_id, sheet_name, data_start_row, primary_id_pos)
     
     nums = []
     module_upper = module.strip().upper()
@@ -122,7 +131,7 @@ async def switch_module(
     # Optional tab existence check
     if service:
         try:
-            meta = _with_retry(lambda: service.spreadsheets().get(spreadsheetId=spreadsheet_id).execute())
+            meta = await _with_retry(lambda: service.spreadsheets().get(spreadsheetId=spreadsheet_id).execute())
             tabs = [sheet["properties"]["title"] for sheet in meta.get("sheets", [])]
             if tab_name_clean not in tabs:
                 return {"ok": False, "error": f"Tab '{tab_name_clean}' does not exist in spreadsheet."}

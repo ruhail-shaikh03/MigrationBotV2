@@ -1,7 +1,7 @@
-import time
+import asyncio
 from googleapiclient.errors import HttpError
 
-def _with_retry(fn, max_attempts: int = 4, base_delay: float = 1.0):
+async def _with_retry(fn, max_attempts: int = 4, base_delay: float = 1.0):
     """
     Execute fn() with exponential backoff on transient Google Sheets API
     errors (HTTP 429 Too Many Requests, 500, 503 Service Unavailable).
@@ -18,7 +18,7 @@ def _with_retry(fn, max_attempts: int = 4, base_delay: float = 1.0):
                 raise
             last_exc = exc
             if attempt < max_attempts - 1:
-                time.sleep(delay)
+                await asyncio.sleep(delay)
                 delay *= 2
         except Exception:
             raise

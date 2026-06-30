@@ -11,6 +11,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 logger = logging.getLogger("sheets_read")
 
+def _get_tab_schema(schema_config: dict, active_tab: str) -> dict:
+    if "tabs" in schema_config:
+        return schema_config.get("tabs", {}).get(active_tab, {})
+    return schema_config
+
 def idx_to_col_letter(idx: int) -> str:
     """Helper to convert a 0-based column index to an A-Z sheet column letter."""
     result = ""
@@ -20,7 +25,7 @@ def idx_to_col_letter(idx: int) -> str:
     return result
 
 
-def find_row_num(
+async def find_row_num(
     service: Any, 
     spreadsheet_id: str, 
     sheet_name: str, 
@@ -31,7 +36,7 @@ def find_row_num(
     """Scans the ID column to map a RICEFW ID string to its spreadsheet row index."""
     key = ricefw_id.strip().upper()
     col = primary_id_pos or "B"
-    result = _with_retry(lambda: service.spreadsheets().values().get(
+    result = await _with_retry(lambda: service.spreadsheets().values().get(
         spreadsheetId=spreadsheet_id,
         range=f"{sheet_name}!{col}{data_start_row}:{col}"
     ).execute())
@@ -51,20 +56,21 @@ async def get_row_raw(
     service: Any
 ) -> Dict[str, str]:
     """Helper to fetch a single row's current values for auditing."""
+    schema_config = _get_tab_schema(schema_config, active_tab)
     data_start_row = schema_config.get("data_start_row", 3)
     header_row_num = data_start_row - 1
     primary_id_pos = schema_config.get("primary_id_position", "B")
 
-    row_num = find_row_num(service, spreadsheet_id, active_tab, ricefw_id, data_start_row, primary_id_pos)
+    row_num = await find_row_num(service, spreadsheet_id, active_tab, ricefw_id, data_start_row, primary_id_pos)
     if row_num is None:
         return {}
 
-    result = _with_retry(lambda: service.spreadsheets().values().get(
+    result = await _with_retry(lambda: service.spreadsheets().values().get(
         spreadsheetId=spreadsheet_id,
         range=f"{active_tab}!{row_num}:{row_num}"
     ).execute())
     
-    headers = get_header_row(service, spreadsheet_id, active_tab, header_row_num)
+    headers = await get_header_row(service, spreadsheet_id, active_tab, header_row_num)
     values = result.get("values", [[]])[0]
     
     row_data = {h: (values[i] if i < len(values) else "") for i, h in enumerate(headers)}
@@ -79,6 +85,7 @@ async def get_bulk_rows_raw(
     service: Any
 ) -> Dict[str, Dict[str, str]]:
     """Helper to fetch multiple rows' current values for auditing in bulk updates."""
+    schema_config = _get_tab_schema(schema_config, active_tab)
     data_start_row = schema_config.get("data_start_row", 3)
     header_row_num = data_start_row - 1
     primary_id_pos = schema_config.get("primary_id_position", "B")
@@ -119,20 +126,21 @@ async def get_row(
     service: Any
 ) -> dict:
     """Fetch all values mapped to headers for a single RICEFW object ID."""
+    schema_config = _get_tab_schema(schema_config, active_tab)
     data_start_row = schema_config.get("data_start_row", 3)
     header_row_num = data_start_row - 1
     primary_id_pos = schema_config.get("primary_id_position", "B")
 
-    row_num = find_row_num(service, spreadsheet_id, active_tab, ricefw_id, data_start_row, primary_id_pos)
+    row_num = await find_row_num(service, spreadsheet_id, active_tab, ricefw_id, data_start_row, primary_id_pos)
     if row_num is None:
         return {"ok": False, "error": f"RICEFW ID '{ricefw_id}' not found in active tab."}
 
-    result = _with_retry(lambda: service.spreadsheets().values().get(
+    result = await _with_retry(lambda: service.spreadsheets().values().get(
         spreadsheetId=spreadsheet_id,
         range=f"{active_tab}!{row_num}:{row_num}"
     ).execute())
     
-    headers = get_header_row(service, spreadsheet_id, active_tab, header_row_num)
+    headers = await get_header_row(service, spreadsheet_id, active_tab, header_row_num)
     values = result.get("values", [[]])[0]
     
     row_data = {h: (values[i] if i < len(values) else "") for i, h in enumerate(headers)}
@@ -150,9 +158,10 @@ async def search_rows(
     service: Any
 ) -> dict:
     """Scans the spreadsheet and filters rows based on a set of criteria (AND matching)."""
+    schema_config = _get_tab_schema(schema_config, active_tab)
     data_start_row = schema_config.get("data_start_row", 3)
     header_row_num = data_start_row - 1
-    headers = get_header_row(service, spreadsheet_id, active_tab, header_row_num)
+    headers = await get_header_row(service, spreadsheet_id, active_tab, header_row_num)
 
     # Defaults fields to return if none specified
     critical_fields = schema_config.get("critical_fields", [])
@@ -177,7 +186,7 @@ async def search_rows(
         })
 
     # Read up to 2000 rows in one bulk get
-    result = _with_retry(lambda: service.spreadsheets().values().get(
+    result = await _with_retry(lambda: service.spreadsheets().values().get(
         spreadsheetId=spreadsheet_id,
         range=f"{active_tab}!{data_start_row}:{data_start_row + 2000}"
     ).execute())
@@ -235,14 +244,15 @@ async def summarize(
     service: Any
 ) -> dict:
     """Calculates report figures, counts, and completion metrics across a sheet."""
+    schema_config = _get_tab_schema(schema_config, active_tab)
     report_type = args.get("report_type")
     data_start_row = schema_config.get("data_start_row", 3)
     header_row_num = data_start_row - 1
     
-    headers = get_header_row(service, spreadsheet_id, active_tab, header_row_num)
+    headers = await get_header_row(service, spreadsheet_id, active_tab, header_row_num)
     col_idx = {h: i for i, h in enumerate(headers)}
 
-    result = _with_retry(lambda: service.spreadsheets().values().get(
+    result = await _with_retry(lambda: service.spreadsheets().values().get(
         spreadsheetId=spreadsheet_id,
         range=f"{active_tab}!{data_start_row}:{data_start_row + 2000}"
     ).execute())
@@ -395,12 +405,13 @@ async def run_data_quality_check(
     service: Any
 ) -> dict:
     """Executes the DataQualityChecker rules engine against spreadsheet data."""
+    schema_config = _get_tab_schema(schema_config, active_tab)
     data_start_row = schema_config.get("data_start_row", 3)
     header_row_num = data_start_row - 1
     
-    headers = get_header_row(service, spreadsheet_id, active_tab, header_row_num)
+    headers = await get_header_row(service, spreadsheet_id, active_tab, header_row_num)
     
-    result = _with_retry(lambda: service.spreadsheets().values().get(
+    result = await _with_retry(lambda: service.spreadsheets().values().get(
         spreadsheetId=spreadsheet_id,
         range=f"{active_tab}!{data_start_row}:{data_start_row + 2000}"
     ).execute())

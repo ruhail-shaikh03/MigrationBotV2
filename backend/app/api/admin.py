@@ -1,14 +1,20 @@
 from typing import List, Dict, Any, Optional
+import logging
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, update, delete, desc
-from app.deps import get_current_user, get_db
+from app.deps import get_current_user, get_db, get_google_token
 from app.models.user import User
 from app.models.project import Project
 from app.models.permission import Permission
 from app.models.audit_log import AuditLog
 from app.config import settings
 from pydantic import BaseModel, HttpUrl
+from app.sheets.client import build_sheets_service
+from app.core.schema_detect import parse_spreadsheet_url, detect_all_tabs
+from app.api.chat import llm_client
+
+logger = logging.getLogger("admin_api")
 
 router = APIRouter(prefix="/admin", tags=["Admin"])
 
@@ -35,6 +41,9 @@ class ProjectUpdate(BaseModel):
     company_prefix: Optional[str] = None
     is_active: Optional[bool] = None
     schema_config: Optional[dict] = None
+
+class ProjectDetectRequest(BaseModel):
+    spreadsheet_url: str
 
 class PermissionUpsert(BaseModel):
     user_email: str
@@ -63,21 +72,54 @@ async def list_projects(db: AsyncSession = Depends(get_db)):
     } for p in projects]
 
 
+@router.post("/projects/detect-metadata", dependencies=[Depends(require_admin)])
+async def detect_project_metadata(
+    payload: ProjectDetectRequest,
+    google_token: str = Depends(get_google_token)
+):
+    """
+    Extracts the spreadsheet ID, connects to Sheets API to retrieve all tabs,
+    and runs LLM-based schema auto-detection on each tracker tab.
+    """
+    try:
+        spreadsheet_id = parse_spreadsheet_url(payload.spreadsheet_url)
+    except ValueError as ve:
+        raise HTTPException(status_code=400, detail=str(ve))
+
+    try:
+        service = build_sheets_service(google_token)
+        detect_result = await detect_all_tabs(service, spreadsheet_id, llm_client)
+        return {
+            "spreadsheet_id": spreadsheet_id,
+            "detected_config": detect_result
+        }
+    except Exception as e:
+        logger.error(f"Metadata auto-detection failed: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Auto-detection failed: {str(e)}"
+        )
+
+
 @router.post("/projects", response_model=Dict[str, Any], dependencies=[Depends(require_admin)])
 async def create_project(payload: ProjectCreate, db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user)):
     """
-    Registers a new spreadsheet project. In a real integration, this triggers
-    Pass 1 & Pass 2 LLM column schema auto-detection.
+    Registers a new spreadsheet project. Parses URL to spreadsheet ID if a full URL is provided.
     """
+    try:
+        spreadsheet_id = parse_spreadsheet_url(payload.spreadsheet_id)
+    except ValueError as ve:
+        raise HTTPException(status_code=400, detail=str(ve))
+
     # Check for unique spreadsheet_id
-    existing = await db.execute(select(Project).where(Project.spreadsheet_id == payload.spreadsheet_id))
+    existing = await db.execute(select(Project).where(Project.spreadsheet_id == spreadsheet_id))
     if existing.scalar():
         raise HTTPException(status_code=400, detail="Spreadsheet ID is already registered.")
 
     # Initialize empty schema config by default (to be overwritten by detect pipeline)
     new_project = Project(
         project_name=payload.project_name,
-        spreadsheet_id=payload.spreadsheet_id,
+        spreadsheet_id=spreadsheet_id,
         default_tab=payload.default_tab,
         company_prefix=payload.company_prefix,
         schema_config={},

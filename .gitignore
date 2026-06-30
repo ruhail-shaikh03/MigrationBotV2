@@ -4,7 +4,5 @@
 __pycache__/
 *.pyc
 .venv/
-TDD.md
 .env
-implementation.md
-tests/
+implementation.md
