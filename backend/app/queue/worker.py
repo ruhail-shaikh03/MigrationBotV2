@@ -181,17 +181,20 @@ async def process_job(job_id: str, payload_dict: dict) -> None:
             fields = args.get("fields", {})
 
             # 1. Dynamically compute the next RICEFW ID sequentially
-            data_start_row = schema_config.get("data_start_row", 3)
+            tab_schema = schema_config.get("tabs", {}).get(payload.sheet_tab, {}) if "tabs" in schema_config else schema_config
+            data_start_row = tab_schema.get("data_start_row", 3)
+            primary_id_pos = tab_schema.get("primary_id_position", "B")
             # In add_row, we auto-assign ID if not supplied
             ricefw_id = args.get("ricefw_id")
             if not ricefw_id:
-                ricefw_id = next_ricefw_id(
+                ricefw_id = await next_ricefw_id(
                     service=service,
                     spreadsheet_id=payload.spreadsheet_id,
                     sheet_name=payload.sheet_tab,
                     module=module,
                     prefix=prefix,
-                    data_start_row=data_start_row
+                    data_start_row=data_start_row,
+                    primary_id_pos=primary_id_pos
                 )
 
             res = await add_row(

@@ -40,10 +40,10 @@ app = FastAPI(
 )
 
 # Configure CORS Middleware
-# Next.js frontend runs on localhost:3000 by default, so we allow origin access
+origins = [origin.strip() for origin in settings.CORS_ORIGINS.split(",") if origin.strip()]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Adjust to specific domains in production (e.g. settings.NEXTAUTH_URL)
+    allow_origins=origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

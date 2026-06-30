@@ -2,7 +2,7 @@ import { useEffect, useRef, useCallback } from "react"
 import { useChatStore } from "@/store/useChatStore"
 
 export function useWebSocket(apiToken: string | null, projectId: number | null) {
-  const { isConnected, setIsConnected, addMessage, updateLastMessage, setWs, ws } = useChatStore()
+  const { isConnected, setIsConnected, addMessage, updateLastMessage, setWs, ws, setActiveTab } = useChatStore()
   const reconnectTimeoutRef = useRef<NodeJS.Timeout | null>(null)
   const pingIntervalRef = useRef<NodeJS.Timeout | null>(null)
 
@@ -124,6 +124,12 @@ export function useWebSocket(apiToken: string | null, projectId: number | null) 
               content: `Error: ${data.message}`,
               timestamp: new Date()
             })
+            break
+          }
+          case "connection_ok": {
+            if (data.active_tab) {
+              setActiveTab(data.active_tab)
+            }
             break
           }
           case "pong":

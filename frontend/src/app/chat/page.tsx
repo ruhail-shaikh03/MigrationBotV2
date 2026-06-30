@@ -24,6 +24,7 @@ export default function ChatPage() {
   // Local UI States
   const [input, setInput] = useState("")
   const [toasts, setToasts] = useState<Toast[]>([])
+  const [isAdminState, setIsAdminState] = useState(false)
   const messagesEndRef = useRef<HTMLDivElement | null>(null)
   
   // Zustand Store
@@ -40,6 +41,22 @@ export default function ChatPage() {
 
   // Instantiate WebSocket
   const { sendMessage } = useWebSocket(apiToken, activeProject?.id || null)
+
+  // Fetch user profile to check admin status dynamically
+  useEffect(() => {
+    if (status === "authenticated" && apiToken) {
+      fetch(`/api/auth/me`, {
+        headers: { "Authorization": `Bearer ${apiToken}` }
+      })
+        .then(res => res.json())
+        .then(data => {
+          if (data && data.is_admin) {
+            setIsAdminState(true)
+          }
+        })
+        .catch(err => console.error("Error fetching user profile:", err))
+    }
+  }, [status, apiToken])
 
   // Redirect if not authenticated
   useEffect(() => {
@@ -141,7 +158,7 @@ export default function ChatPage() {
   }
 
   const email = session?.user?.email
-  const isAdmin = email ? ["rohai", "ruhail", "admin"].some(adminKey => email.includes(adminKey)) : false
+  const isAdmin = isAdminState || (email ? ["rohai", "ruhail", "admin"].some(adminKey => email.includes(adminKey)) : false)
 
   return (
     <div className="flex h-screen bg-[#030014] text-zinc-100 overflow-hidden font-sans relative">
@@ -186,7 +203,10 @@ export default function ChatPage() {
 
           {/* Module Tabs (SD, MM, FI, etc.) */}
           <div className="hidden md:flex items-center gap-1.5 bg-[#120e2e]/60 p-1 rounded-xl border border-white/5">
-            {["SD", "MM", "FI", "CO", "PP", "QM"].map((tab) => (
+            {(activeProject?.schema_config?.tabs 
+              ? Object.keys(activeProject.schema_config.tabs) 
+              : (activeProject?.schema_config?.global?.valid_modules || ["SD", "MM", "FI", "CO", "PP", "QM"])
+            ).map((tab: string) => (
               <button
                 key={tab}
                 onClick={() => handleTabChange(tab)}

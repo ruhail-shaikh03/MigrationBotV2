@@ -1,9 +1,100 @@
 import json
 import logging
+import re
 from typing import List, Dict, Any, Optional
 from openai import AsyncOpenAI
 
 logger = logging.getLogger("schema_detect")
+
+def parse_spreadsheet_url(url: str) -> str:
+    """Extract spreadsheet_id from a Google Sheets URL or raw ID."""
+    match = re.search(r"/spreadsheets/d/([a-zA-Z0-9-_]+)", url)
+    if match:
+        return match.group(1)
+    cleaned = url.strip()
+    if cleaned and "/" not in cleaned:
+        return cleaned
+    raise ValueError("Invalid Google Sheets URL or Spreadsheet ID")
+
+async def detect_all_tabs(
+    service: Any,
+    spreadsheet_id: str,
+    client: AsyncOpenAI
+) -> Dict[str, Any]:
+    """
+    Fetch all tabs in the spreadsheet, determine which ones are WRICEF trackers,
+    and build their schema_configs.
+    """
+    try:
+        from app.sheets.retry import _with_retry
+        meta = _with_retry(lambda: service.spreadsheets().get(spreadsheetId=spreadsheet_id).execute())
+        tab_names = [sheet["properties"]["title"] for sheet in meta.get("sheets", [])]
+    except Exception as e:
+        logger.error(f"Failed to fetch spreadsheet metadata: {e}")
+        raise ValueError(f"Could not access spreadsheet: {e}")
+
+    consolidated_config = {}
+    valid_modules = []
+    
+    for tab in tab_names:
+        try:
+            # Range: read A1:Z5
+            result = _with_retry(lambda: service.spreadsheets().values().get(
+                spreadsheetId=spreadsheet_id,
+                range=f"'{tab}'!A1:Z5"
+            ).execute())
+            rows = result.get("values", [])
+            if not rows:
+                continue
+            
+            canonical_markers = {"ricefw id", "module", "description", "type"}
+            is_tracker = False
+            header_row_idx = 0
+            
+            for i, row in enumerate(rows):
+                normalized_row = {str(cell).strip().lower() for cell in row if cell}
+                if len(canonical_markers.intersection(normalized_row)) >= 2:
+                    is_tracker = True
+                    header_row_idx = i
+                    break
+                    
+            if not is_tracker:
+                logger.info(f"Tab '{tab}' does not appear to be a WRICEF tracker (missing headers). Skipping.")
+                continue
+
+            headers = [str(c).strip() for c in rows[header_row_idx] if c]
+            sample_rows = []
+            for row in rows[header_row_idx + 1:]:
+                sample_rows.append([str(c).strip() for c in row])
+                if len(sample_rows) >= 3:
+                    break
+
+            if len(headers) < 2:
+                continue
+
+            tab_schema = await detect_schema_config(
+                headers=headers,
+                sample_rows=sample_rows,
+                tab_names=tab_names,
+                client=client
+            )
+            
+            tab_schema["data_start_row"] = header_row_idx + 2
+            consolidated_config[tab] = tab_schema
+            if tab not in valid_modules:
+                valid_modules.append(tab)
+                
+        except Exception as te:
+            logger.warning(f"Error auto-detecting schema for tab '{tab}': {te}")
+            continue
+            
+    return {
+        "tabs": consolidated_config,
+        "global": {
+            "valid_modules": valid_modules,
+            "company_prefix": ""
+        }
+    }
 
 SCHEMA_DETECTION_PROMPT = """
 You are analyzing a Google Sheet header row for a migration/project tracker.

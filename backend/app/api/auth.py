@@ -24,11 +24,14 @@ async def get_current_profile(current_user: User = Depends(get_current_user)):
     Returns the currently logged-in user profile, triggering auto-registration
     if this is their first visit.
     """
+    from app.config import settings
+    is_admin = current_user.email.lower().strip() in settings.admin_emails_list
     return {
         "id": current_user.id,
         "email": current_user.email,
         "display_name": current_user.display_name,
         "avatar_url": current_user.avatar_url,
         "created_at": current_user.created_at,
-        "last_login": current_user.last_login
+        "last_login": current_user.last_login,
+        "is_admin": is_admin
     }

@@ -28,18 +28,21 @@ async def format_row(
     Applies background color highlight to a spreadsheet row or color cell.
     Uses batchUpdate to execute coloring on Google Sheets cells.
     """
-    data_start_row = schema_config.get("data_start_row", 3)
+    # Resolve tab-specific schema if using the new multi-tab format
+    tab_schema = schema_config.get("tabs", {}).get(sheet_tab, {}) if "tabs" in schema_config else schema_config
+    data_start_row = tab_schema.get("data_start_row", 3)
     header_row_num = data_start_row - 1
-    primary_id_pos = schema_config.get("primary_id_position", "B")
+    primary_id_pos = tab_schema.get("primary_id_position", "B")
+    column_map = tab_schema.get("column_map") or schema_config.get("column_map")
 
-    row_num = find_row_num(service, spreadsheet_id, sheet_tab, ricefw_id, data_start_row, primary_id_pos)
+    row_num = await find_row_num(service, spreadsheet_id, sheet_tab, ricefw_id, data_start_row, primary_id_pos)
     if row_num is None:
         return {"ok": False, "error": f"RICEFW ID '{ricefw_id}' not found."}
 
     rgb = COLOR_MAP.get(color.lower().strip(), COLOR_MAP["white"])
-    sheet_id = get_sheet_id(service, spreadsheet_id, sheet_tab)
+    sheet_id = await get_sheet_id(service, spreadsheet_id, sheet_tab)
 
-    headers = get_header_row(service, spreadsheet_id, sheet_tab, header_row_num)
+    headers = await get_header_row(service, spreadsheet_id, sheet_tab, header_row_num)
     col_idx = {h.lower().strip(): i for i, h in enumerate(headers)}
 
     if scope == "entire_row":
@@ -47,7 +50,7 @@ async def format_row(
         end_col = len(headers) if headers else 50
     else: # color_column_only
         # Resolve Color column location
-        color_col = resolve_column("Color") or "Color "
+        color_col = resolve_column("Color", column_map) or "Color "
         c_idx = col_idx.get(color_col.lower().strip())
         if c_idx is None:
             # Try plain "color"
@@ -77,7 +80,7 @@ async def format_row(
         }]
     }
 
-    _with_retry(lambda: service.spreadsheets().batchUpdate(
+    await _with_retry(lambda: service.spreadsheets().batchUpdate(
         spreadsheetId=spreadsheet_id,
         body=body
     ).execute())
