@@ -2,7 +2,7 @@
 
 import { useSession } from "next-auth/react"
 import { useEffect, useState } from "react"
-import { 
+import {
   FolderKanban, Plus, Edit2, Trash2, X, Check, AlertTriangle
 } from "lucide-react"
 
@@ -20,7 +20,7 @@ interface Project {
 export default function AdminProjects() {
   const { data: session } = useSession()
   const apiToken = (session as any)?.apiToken || ""
-  
+
   // Data lists state
   const [projects, setProjects] = useState<Project[]>([])
   const [isLoading, setIsLoading] = useState(true)
@@ -29,7 +29,7 @@ export default function AdminProjects() {
   // Form Modal states
   const [isModalOpen, setIsModalOpen] = useState(false)
   const [editingProject, setEditingProject] = useState<Project | null>(null)
-  
+
   // Form input fields
   const [projectName, setProjectName] = useState("")
   const [spreadsheetId, setSpreadsheetId] = useState("")
@@ -152,10 +152,10 @@ export default function AdminProjects() {
         const data = await res.json()
         const config = data.detected_config
         const sheetsMap = config.tabs || {}
-        
+
         setSpreadsheetId(data.spreadsheet_id)
         setDetectedTabsMap(sheetsMap)
-        
+
         // Auto-select all tabs initially
         const sel: Record<string, boolean> = {}
         Object.keys(sheetsMap).forEach(t => {
@@ -186,7 +186,7 @@ export default function AdminProjects() {
     const nextSelected = { ...selectedTabs, [tabName]: !selectedTabs[tabName] }
     setSelectedTabs(nextSelected)
     rebuildSchemaConfig(detectedTabsMap, nextSelected, companyPrefix)
-    
+
     // Auto update default tab if current default is deselected
     if (defaultTab === tabName && !nextSelected[tabName]) {
       const activeKeys = Object.keys(detectedTabsMap).filter(t => nextSelected[t])
@@ -204,7 +204,7 @@ export default function AdminProjects() {
         parsed.global.company_prefix = val
         setSchemaConfigStr(JSON.stringify(parsed, null, 2))
       }
-    } catch (e) {}
+    } catch (e) { }
   }
 
   // Handle Create / Update Save
@@ -251,7 +251,8 @@ export default function AdminProjects() {
         }
       } else {
         // Create operation
-        const targetId = (spreadsheetId || spreadsheetUrl).strip ? (spreadsheetId || spreadsheetUrl).trim() : (spreadsheetId || spreadsheetUrl)
+        const rawTarget = spreadsheetId || spreadsheetUrl
+        const targetId = rawTarget.trim()
         if (!targetId) {
           setErrorMsg("Please enter a Google Sheets URL or Spreadsheet ID.")
           return
@@ -290,7 +291,7 @@ export default function AdminProjects() {
   // Handle Delete
   const handleDelete = async (id: number) => {
     if (!confirm("Are you sure you want to delete this project? This will also cascade delete all user permission mappings.")) return
-    
+
     try {
       const res = await fetch(`${""}/api/admin/projects/${id}`, {
         method: "DELETE",
@@ -420,28 +421,26 @@ export default function AdminProjects() {
             <h3 className="text-xl font-bold text-zinc-100 mb-2">
               {editingProject ? "Modify Project Configs" : "Register New Spreadsheet Project"}
             </h3>
-            
+
             {!editingProject && (
               <div className="flex gap-4 border-b border-white/5 pb-3 mb-4">
                 <button
                   type="button"
                   onClick={() => setIsAutoDetectMode(true)}
-                  className={`text-xs font-semibold uppercase pb-1 tracking-wider border-b-2 transition ${
-                    isAutoDetectMode 
-                      ? "border-indigo-500 text-indigo-400" 
-                      : "border-transparent text-zinc-500 hover:text-zinc-300"
-                  }`}
+                  className={`text-xs font-semibold uppercase pb-1 tracking-wider border-b-2 transition ${isAutoDetectMode
+                    ? "border-indigo-500 text-indigo-400"
+                    : "border-transparent text-zinc-500 hover:text-zinc-300"
+                    }`}
                 >
                   Auto-Detect Wizard
                 </button>
                 <button
                   type="button"
                   onClick={() => setIsAutoDetectMode(false)}
-                  className={`text-xs font-semibold uppercase pb-1 tracking-wider border-b-2 transition ${
-                    !isAutoDetectMode 
-                      ? "border-indigo-500 text-indigo-400" 
-                      : "border-transparent text-zinc-500 hover:text-zinc-300"
-                  }`}
+                  className={`text-xs font-semibold uppercase pb-1 tracking-wider border-b-2 transition ${!isAutoDetectMode
+                    ? "border-indigo-500 text-indigo-400"
+                    : "border-transparent text-zinc-500 hover:text-zinc-300"
+                    }`}
                 >
                   Manual Mode
                 </button>
@@ -511,11 +510,10 @@ export default function AdminProjects() {
                             return (
                               <div
                                 key={tab}
-                                className={`rounded-xl border transition p-4 ${
-                                  isTabSelected
-                                    ? "bg-indigo-600/10 border-indigo-500/30"
-                                    : "bg-white/[0.01] border-white/5 opacity-60"
-                                }`}
+                                className={`rounded-xl border transition p-4 ${isTabSelected
+                                  ? "bg-indigo-600/10 border-indigo-500/30"
+                                  : "bg-white/[0.01] border-white/5 opacity-60"
+                                  }`}
                               >
                                 <div className="flex items-center justify-between">
                                   <label className="flex items-center gap-2.5 cursor-pointer select-none">
