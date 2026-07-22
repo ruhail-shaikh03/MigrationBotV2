@@ -2,6 +2,7 @@ import logging
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from app.config import settings
 from app.db.engine import init_db
 from app.api.health import router as health_router
 from app.api.auth import router as auth_router
