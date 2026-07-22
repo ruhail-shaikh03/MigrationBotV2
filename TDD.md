@@ -1,9 +1,9 @@
 # MigrationBot Enterprise Portal — Technical Design Document
 
-**Version:** 2.1 (Comprehensive Audit)  
+**Version:** 3.0 (Phases 6–9 Production Complete)  
 **Team:** FF Team  
-**Status:** Active Development (Phase 3 — Deployed with Critical Gaps)  
-**Stack:** Next.js 16 · FastAPI · PostgreSQL 16 · Redis 7 · DeepSeek · Google Sheets API v4 · Google OAuth 2.0  
+**Status:** Deployed & Production Ready (Phases 6–9 Complete)  
+**Stack:** Next.js 16 · FastAPI · PostgreSQL 16 · Redis 7 · DeepSeek (`deepseek-chat`, `deepseek-reasoner`) · Google Sheets API v4 · Google OAuth 2.0  
 **Deployment Target:** Hetzner CX22 VPS via Docker Compose + Caddy 2 reverse proxy  
 **Domain:** `migrationbot.duckdns.org`
 
@@ -939,7 +939,40 @@ Audit Logger (core/audit.py)
 
 ---
 
-## 19. Known Bugs, Discrepancies & Technical Debt
+## 19. Resolved Issues & Recent Architecture Enhancements (Phases 6–9)
+
+### Resolved Critical Issues (Phase 6–9 Implementation)
+
+1. **[FIXED] Hardcoded Admin Detection:**
+   - Removed hardcoded email checks (`["rohai", "ruhail", "admin"]`) in `chat/page.tsx` and `admin/layout.tsx`.
+   - Replaced with dynamic `/api/auth/me` queries returning case-insensitive `is_admin` flags.
+
+2. **[FIXED] Hardcoded Module Tabs Fallback:**
+   - Removed static fallback array `["SD", "MM", "FI", "CO", "PP", "QM"]` in `chat/page.tsx`. Module tabs now dynamically reflect the active project's discovered schema configuration (`schema_config.tabs`).
+
+3. **[FIXED] Non-Blocking Google API Retry Execution:**
+   - Refactored `_with_retry()` in `backend/app/sheets/retry.py` using `ThreadPoolExecutor` so Google API call retries do not block FastAPI's async event loop.
+
+4. **[FIXED] Dynamic Column Aliasing in Write & Format Operations:**
+   - Updated `write.py` and `format.py` to accept and pass `column_map` explicitly, ensuring natural language field aliases map correctly during data mutations.
+
+5. **[FIXED] Strict CORS Configuration:**
+   - Updated `backend/app/config.py` default `CORS_ORIGINS` to `https://migrationbot.duckdns.org,http://localhost:3000`.
+
+6. **[FIXED] Zero-Config Google Sheets Onboarding:**
+   - Added `ProjectDetectRequest` and `detect_all_tabs` endpoint in `backend/app/api/admin.py`.
+   - Added auto-detect tab wizard UI in `frontend/src/app/admin/projects/page.tsx`.
+
+7. **[FIXED] Admin Project Manager Modal Layout Overflow:**
+   - Updated modal container in `frontend/src/app/admin/projects/page.tsx` to handle flex positioning (`my-auto max-h-[85vh] overflow-y-auto`), ensuring fields and submit controls remain fully visible and centered on all viewports.
+
+8. **[ADDED] Multi-Step Agentic Planner & Session Context Memory:**
+   - Created `backend/app/core/planner.py` (`AgenticPlanner`) and `backend/app/core/memory.py` (`SessionMemory`).
+   - Integrated auto-recovery prompt hints in `backend/app/core/agentic_loop.py` on tool failure.
+
+---
+
+## 20. Known Bugs, Discrepancies & Technical Debt
 
 ### Critical (P0)
 
