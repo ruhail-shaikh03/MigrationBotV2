@@ -251,28 +251,29 @@ export default function AdminProjects() {
         }
       } else {
         // Create operation
-        const payload = {
-          project_name: projectName,
-          spreadsheet_id: spreadsheetId,
-          default_tab: defaultTab,
-          company_prefix: companyPrefix
+        const targetId = (spreadsheetId || spreadsheetUrl).strip ? (spreadsheetId || spreadsheetUrl).trim() : (spreadsheetId || spreadsheetUrl)
+        if (!targetId) {
+          setErrorMsg("Please enter a Google Sheets URL or Spreadsheet ID.")
+          return
         }
-        // Step 1: Create project entry
+        const payload = {
+          project_name: projectName || "S/4HANA Migration Project",
+          spreadsheet_id: targetId,
+          default_tab: defaultTab || "SD",
+          company_prefix: companyPrefix || "FFC",
+          schema_config: (parsedSchema && Object.keys(parsedSchema).length > 0) ? parsedSchema : null
+        }
+        const googleToken = (session as any)?.googleAccessToken || ""
         const res = await fetch(`${baseUrl}/api/admin/projects`, {
           method: "POST",
-          headers,
+          headers: {
+            ...headers,
+            "X-Google-Access-Token": googleToken
+          },
           body: JSON.stringify(payload)
         })
         if (res.ok) {
           const newProj = await res.json()
-          
-          // Step 2: Inject schema config immediately since create payload doesn't accept schema_config in DB setup
-          await fetch(`${baseUrl}/api/admin/projects/${newProj.id}`, {
-            method: "PUT",
-            headers,
-            body: JSON.stringify({ schema_config: parsedSchema })
-          })
-
           setIsModalOpen(false)
           fetchProjects()
         } else {
@@ -407,8 +408,8 @@ export default function AdminProjects() {
 
       {/* Edit / Create Project Modal */}
       {isModalOpen && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm p-4">
-          <div className="glass-panel w-full max-w-2xl rounded-2xl border border-white/10 shadow-2xl p-8 relative flex flex-col max-h-[90vh]">
+        <div className="fixed inset-0 z-50 overflow-y-auto bg-black/75 backdrop-blur-sm p-4 sm:p-6 flex items-center justify-center">
+          <div className="glass-panel w-full max-w-2xl rounded-2xl border border-white/10 shadow-2xl p-6 sm:p-8 relative flex flex-col my-auto max-h-[85vh] overflow-hidden">
             <button
               onClick={() => setIsModalOpen(false)}
               className="absolute top-6 right-6 p-1.5 rounded-lg text-zinc-400 hover:text-zinc-200 hover:bg-white/5 transition cursor-pointer"
