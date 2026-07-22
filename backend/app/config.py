@@ -23,7 +23,7 @@ class Settings(BaseSettings):
 
     @property
     def admin_emails_list(self) -> List[str]:
-        return [email.strip() for email in self.ADMIN_EMAILS.split(",") if email.strip()]
+        return [email.strip().lower() for email in self.ADMIN_EMAILS.split(",") if email.strip()]
 
     # Pydantic Configuration to read from environment variables or .env file
     model_config = SettingsConfigDict(
