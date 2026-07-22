@@ -500,26 +500,75 @@ export default function AdminProjects() {
                       </div>
 
                       <div className="space-y-2">
-                        <label className="text-xs font-semibold uppercase text-zinc-400 block">Select Tracker Tabs to Register</label>
-                        <div className="grid grid-cols-2 sm:grid-cols-3 gap-2.5">
-                          {Object.keys(detectedTabsMap).map(tab => (
-                            <label
-                              key={tab}
-                              className={`flex items-center gap-2.5 p-3 rounded-xl border transition cursor-pointer select-none ${
-                                selectedTabs[tab]
-                                  ? "bg-indigo-600/10 border-indigo-500/30 text-indigo-200"
-                                  : "bg-white/[0.01] border-white/5 text-zinc-400 hover:bg-white/[0.02]"
-                              }`}
-                            >
-                              <input
-                                type="checkbox"
-                                checked={!!selectedTabs[tab]}
-                                onChange={() => handleToggleTab(tab)}
-                                className="h-4 w-4 rounded border-white/10 text-indigo-600 focus:ring-0 focus:ring-offset-0 cursor-pointer"
-                              />
-                              <span className="text-sm font-semibold">{tab}</span>
-                            </label>
-                          ))}
+                        <label className="text-xs font-semibold uppercase text-zinc-400 block">Select Tracker Tabs & Configure Fields</label>
+                        <div className="space-y-3">
+                          {Object.keys(detectedTabsMap).map(tab => {
+                            const tabSchema = detectedTabsMap[tab] || {}
+                            const isTabSelected = !!selectedTabs[tab]
+                            const critFields = tabSchema.critical_fields || []
+
+                            return (
+                              <div
+                                key={tab}
+                                className={`rounded-xl border transition p-4 ${
+                                  isTabSelected
+                                    ? "bg-indigo-600/10 border-indigo-500/30"
+                                    : "bg-white/[0.01] border-white/5 opacity-60"
+                                }`}
+                              >
+                                <div className="flex items-center justify-between">
+                                  <label className="flex items-center gap-2.5 cursor-pointer select-none">
+                                    <input
+                                      type="checkbox"
+                                      checked={isTabSelected}
+                                      onChange={() => handleToggleTab(tab)}
+                                      className="h-4 w-4 rounded border-white/10 text-indigo-600 focus:ring-0 focus:ring-offset-0 cursor-pointer"
+                                    />
+                                    <span className="text-sm font-bold text-zinc-200">{tab} Tab</span>
+                                  </label>
+                                  {isTabSelected && (
+                                    <span className="text-[10px] uppercase font-bold text-emerald-400 bg-emerald-500/10 px-2 py-0.5 rounded border border-emerald-500/20">
+                                      Auto-Detected
+                                    </span>
+                                  )}
+                                </div>
+
+                                {isTabSelected && (
+                                  <div className="mt-3 pt-3 border-t border-white/5 grid grid-cols-2 gap-2 text-xs text-zinc-400">
+                                    <div>
+                                      <span className="text-zinc-500">ID Col:</span>{" "}
+                                      <span className="text-zinc-200 font-medium">{tabSchema.primary_id_column || "RICEFW ID"} ({tabSchema.primary_id_position || "B"})</span>
+                                    </div>
+                                    <div>
+                                      <span className="text-zinc-500">Status Col:</span>{" "}
+                                      <span className="text-zinc-200 font-medium">{tabSchema.status_column || "Dev Status"}</span>
+                                    </div>
+                                    <div>
+                                      <span className="text-zinc-500">Module Col:</span>{" "}
+                                      <span className="text-zinc-200 font-medium">{tabSchema.module_column || "Module"}</span>
+                                    </div>
+                                    <div>
+                                      <span className="text-zinc-500">Assignee Col:</span>{" "}
+                                      <span className="text-zinc-200 font-medium">{tabSchema.assignee_column || "Technical Resource"}</span>
+                                    </div>
+
+                                    {critFields.length > 0 && (
+                                      <div className="col-span-2 mt-2">
+                                        <span className="text-zinc-500 block mb-1">Critical Display Fields:</span>
+                                        <div className="flex flex-wrap gap-1.5">
+                                          {critFields.map((f: string) => (
+                                            <span key={f} className="px-2 py-0.5 bg-[#120e2e] border border-white/10 rounded text-[11px] text-indigo-300 font-mono">
+                                              {f}
+                                            </span>
+                                          ))}
+                                        </div>
+                                      </div>
+                                    )}
+                                  </div>
+                                )}
+                              </div>
+                            )
+                          })}
                         </div>
                       </div>
 

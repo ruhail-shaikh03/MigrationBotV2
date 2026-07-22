@@ -18,17 +18,27 @@ export default function AdminLayout({
   const router = useRouter()
   const pathname = usePathname()
 
-  // Admin Guard: check if admin_emails contains user's email
-  // Let's fallback to standard admin prefixes for local dev check
   useEffect(() => {
     if (status === "unauthenticated") {
       router.push("/")
-    } else if (status === "authenticated" && session?.user?.email) {
-      const email = session?.user?.email
-      const isAdmin = email ? ["rohai", "ruhail", "admin"].some(adminKey => email.includes(adminKey)) : false
-      if (!isAdmin) {
+    } else if (status === "authenticated") {
+      const apiToken = (session as any)?.apiToken
+      if (!apiToken) {
         router.push("/chat")
+        return
       }
+      fetch("/api/auth/me", {
+        headers: { Authorization: `Bearer ${apiToken}` }
+      })
+        .then((res) => res.json())
+        .then((data) => {
+          if (!data || !data.is_admin) {
+            router.push("/chat")
+          }
+        })
+        .catch(() => {
+          router.push("/chat")
+        })
     }
   }, [status, session, router])
 

@@ -46,7 +46,7 @@ interface ChatStore {
 export const useChatStore = create<ChatStore>((set) => ({
   projects: [],
   activeProject: null,
-  activeTab: "SD",
+  activeTab: "",
   isConnected: false,
   messages: [],
   ws: null,
@@ -54,7 +54,7 @@ export const useChatStore = create<ChatStore>((set) => ({
   setProjects: (projects) => set({ projects }),
   setActiveProject: (project) => set({
     activeProject: project,
-    activeTab: project ? project.default_tab : "SD"
+    activeTab: project ? (project.default_tab || "") : ""
   }),
   setActiveTab: (activeTab) => set({ activeTab }),
   setIsConnected: (connected) => set({ isConnected: connected }),

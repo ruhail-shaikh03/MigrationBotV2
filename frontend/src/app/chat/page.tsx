@@ -157,8 +157,7 @@ export default function ChatPage() {
     )
   }
 
-  const email = session?.user?.email
-  const isAdmin = isAdminState || (email ? ["rohai", "ruhail", "admin"].some(adminKey => email.includes(adminKey)) : false)
+  const isAdmin = isAdminState
 
   return (
     <div className="flex h-screen bg-[#030014] text-zinc-100 overflow-hidden font-sans relative">
@@ -205,7 +204,7 @@ export default function ChatPage() {
           <div className="hidden md:flex items-center gap-1.5 bg-[#120e2e]/60 p-1 rounded-xl border border-white/5">
             {(activeProject?.schema_config?.tabs 
               ? Object.keys(activeProject.schema_config.tabs) 
-              : (activeProject?.schema_config?.global?.valid_modules || ["SD", "MM", "FI", "CO", "PP", "QM"])
+              : (activeProject?.schema_config?.global?.valid_modules || [])
             ).map((tab: string) => (
               <button
                 key={tab}

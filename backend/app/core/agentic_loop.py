@@ -153,12 +153,21 @@ async def run_agentic_loop(
                     "tool": tool_name,
                     "result": tool_result
                 })
-                
+
+                # Format tool response content; inject auto-recovery prompt if tool call failed
+                content_str = json.dumps(tool_result, ensure_ascii=False)
+                if not tool_result.get("ok"):
+                    err_detail = tool_result.get("error", "Unknown error")
+                    content_str += (
+                        f"\n[System Recovery Note]: Tool '{tool_name}' failed with error: '{err_detail}'. "
+                        "If this was due to column alias or RICEFW ID mismatch, formulate a corrected tool call."
+                    )
+
                 messages.append({
                     "role": "tool",
                     "tool_call_id": tool_call.id,
                     "name": tool_name,
-                    "content": json.dumps(tool_result, ensure_ascii=False)
+                    "content": content_str
                 })
                 
         except Exception as e:
