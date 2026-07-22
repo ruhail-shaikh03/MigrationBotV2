@@ -24,7 +24,7 @@ async def update_cell(
     data_start_row = tab_schema.get("data_start_row", 3)
     header_row_num = data_start_row - 1
     primary_id_pos = tab_schema.get("primary_id_position", "B")
-    column_map = tab_schema.get("column_map") or schema_config.get("column_map")
+    column_map = tab_schema.get("column_map") or schema_config.get("column_map") or {}
 
     row_num = await find_row_num(service, spreadsheet_id, sheet_tab, ricefw_id, data_start_row, primary_id_pos)
     if row_num is None:
@@ -84,7 +84,7 @@ async def bulk_update(
     header_row_num = data_start_row - 1
     primary_id_pos = tab_schema.get("primary_id_position", "B")
     primary_id_col = tab_schema.get("primary_id_column", "RICEFW ID")
-    column_map = tab_schema.get("column_map") or schema_config.get("column_map")
+    column_map = tab_schema.get("column_map") or schema_config.get("column_map") or {}
 
     headers = await get_header_row(service, spreadsheet_id, sheet_tab, header_row_num)
     col_idx = {h.lower().strip(): i for i, h in enumerate(headers)}
@@ -109,7 +109,7 @@ async def bulk_update(
             return_fields=[primary_id_col],
             limit=500,
             schema_config=schema_config,
-            column_map={},
+            column_map=column_map,
             service=service
         )
         target_ids = [str(r.get(primary_id_col)) for r in search_res.get("rows", [])]

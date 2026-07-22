@@ -34,6 +34,12 @@ class ProjectCreate(BaseModel):
     spreadsheet_id: str
     default_tab: Optional[str] = "SD"
     company_prefix: Optional[str] = "FFC"
+    schema_config: Optional[dict] = None
+
+class FieldToggleRequest(BaseModel):
+    tab: str
+    field: str
+    enabled: bool
 
 class ProjectUpdate(BaseModel):
     project_name: Optional[str] = None
@@ -102,9 +108,15 @@ async def detect_project_metadata(
 
 
 @router.post("/projects", response_model=Dict[str, Any], dependencies=[Depends(require_admin)])
-async def create_project(payload: ProjectCreate, db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user)):
+async def create_project(
+    payload: ProjectCreate,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+    google_token: Optional[str] = Depends(get_google_token)
+):
     """
     Registers a new spreadsheet project. Parses URL to spreadsheet ID if a full URL is provided.
+    Auto-detects schema_config if not explicitly provided.
     """
     try:
         spreadsheet_id = parse_spreadsheet_url(payload.spreadsheet_id)
@@ -116,13 +128,22 @@ async def create_project(payload: ProjectCreate, db: AsyncSession = Depends(get_
     if existing.scalar():
         raise HTTPException(status_code=400, detail="Spreadsheet ID is already registered.")
 
-    # Initialize empty schema config by default (to be overwritten by detect pipeline)
+    schema_config = payload.schema_config or {}
+    if not schema_config and google_token:
+        try:
+            service = build_sheets_service(google_token)
+            detect_result = await detect_all_tabs(service, spreadsheet_id, llm_client)
+            if detect_result and "tabs" in detect_result:
+                schema_config = detect_result
+        except Exception as e:
+            logger.warning(f"Auto-detection during project creation failed: {e}")
+
     new_project = Project(
         project_name=payload.project_name,
         spreadsheet_id=spreadsheet_id,
         default_tab=payload.default_tab,
         company_prefix=payload.company_prefix,
-        schema_config={},
+        schema_config=schema_config,
         created_by=current_user.id
     )
     db.add(new_project)
@@ -172,6 +193,40 @@ async def delete_project(project_id: int, db: AsyncSession = Depends(get_db)):
     await db.delete(project)
     await db.commit()
     return {"id": project_id, "status": "deleted"}
+
+
+@router.patch("/projects/{project_id}/fields", dependencies=[Depends(require_admin)])
+async def toggle_project_field(
+    project_id: int,
+    payload: FieldToggleRequest,
+    db: AsyncSession = Depends(get_db)
+):
+    """Dynamically toggle critical fields on or off per tab in project schema_config."""
+    result = await db.execute(select(Project).where(Project.id == project_id))
+    project = result.scalar()
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found.")
+
+    config = dict(project.schema_config or {})
+    tabs = config.get("tabs", {})
+    if payload.tab not in tabs:
+        raise HTTPException(status_code=400, detail=f"Tab '{payload.tab}' not found in project schema.")
+
+    tab_config = dict(tabs[payload.tab])
+    critical_fields = list(tab_config.get("critical_fields", []))
+
+    if payload.enabled and payload.field not in critical_fields:
+        critical_fields.append(payload.field)
+    elif not payload.enabled and payload.field in critical_fields:
+        critical_fields.remove(payload.field)
+
+    tab_config["critical_fields"] = critical_fields
+    tabs[payload.tab] = tab_config
+    config["tabs"] = tabs
+    project.schema_config = config
+
+    await db.commit()
+    return {"id": project_id, "tab": payload.tab, "critical_fields": critical_fields, "status": "updated"}
 
 
 # --- RBAC / Permissions CRUD ---
@@ -294,3 +349,34 @@ async def list_audits(
         "result_ok": a.result_ok,
         "error": a.error
     } for a in audits]
+
+
+@router.get("/analytics/summary", dependencies=[Depends(require_admin)])
+async def get_analytics_summary(db: AsyncSession = Depends(get_db)):
+    """Compute high-level system analytics metrics."""
+    from datetime import datetime, timezone, timedelta
+    from sqlalchemy import func
+
+    proj_res = await db.execute(select(func.count(Project.id)))
+    projects_count = proj_res.scalar() or 0
+
+    user_res = await db.execute(select(func.count(User.id)))
+    users_count = user_res.scalar() or 0
+
+    audit_res = await db.execute(select(func.count(AuditLog.id)))
+    audits_total = audit_res.scalar() or 0
+
+    today_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+    audits_today_res = await db.execute(select(func.count(AuditLog.id)).where(AuditLog.timestamp >= today_start))
+    audits_today = audits_today_res.scalar() or 0
+
+    errors_res = await db.execute(select(func.count(AuditLog.id)).where(AuditLog.result_ok == False))
+    failed_operations = errors_res.scalar() or 0
+
+    return {
+        "projects_count": projects_count,
+        "users_count": users_count,
+        "audits_today": audits_today,
+        "audits_total": audits_total,
+        "failed_operations": failed_operations
+    }

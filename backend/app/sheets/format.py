@@ -33,7 +33,7 @@ async def format_row(
     data_start_row = tab_schema.get("data_start_row", 3)
     header_row_num = data_start_row - 1
     primary_id_pos = tab_schema.get("primary_id_position", "B")
-    column_map = tab_schema.get("column_map") or schema_config.get("column_map")
+    column_map = tab_schema.get("column_map") or schema_config.get("column_map") or {}
 
     row_num = await find_row_num(service, spreadsheet_id, sheet_tab, ricefw_id, data_start_row, primary_id_pos)
     if row_num is None:

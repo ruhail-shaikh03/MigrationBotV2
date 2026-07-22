@@ -40,28 +40,33 @@ export default function AdminDashboard() {
         const headers = { "Authorization": `Bearer ${apiToken}` }
         const baseUrl = ""
         
-        const [projRes, permRes, auditRes] = await Promise.all([
-          fetch(`${baseUrl}/api/admin/projects`, { headers }),
-          fetch(`${baseUrl}/api/admin/permissions`, { headers }),
-          fetch(`${baseUrl}/api/admin/audits?limit=500`, { headers })
+        const [summaryRes, projRes, permRes, auditRes] = await Promise.all([
+          fetch(`/api/admin/analytics/summary`, { headers }),
+          fetch(`/api/admin/projects`, { headers }),
+          fetch(`/api/admin/permissions`, { headers }),
+          fetch(`/api/admin/audits?limit=500`, { headers })
         ])
 
-        if (projRes.ok && permRes.ok && auditRes.ok) {
+        if (summaryRes.ok) {
+          const summary = await summaryRes.json()
+          setProjectsCount(summary.projects_count)
+          setUsersCount(summary.users_count)
+          setAuditsCount(summary.audits_total)
+          setErrorsCount(summary.failed_operations)
+        } else if (projRes.ok && permRes.ok && auditRes.ok) {
           const projs = await projRes.json()
           const perms = await permRes.json()
           const audits = await auditRes.json()
 
           setProjectsCount(projs.length)
-          
-          // Unique users count in permissions
           const uniqueUsers = new Set(perms.map((p: any) => p.user_email))
           setUsersCount(uniqueUsers.size)
-          
           setAuditsCount(audits.length)
+          setErrorsCount(audits.filter((a: any) => !a.result_ok).length)
+        }
 
-          // Errors count (failed audits)
-          const errors = audits.filter((a: any) => !a.result_ok).length
-          setErrorsCount(errors)
+        if (auditRes.ok) {
+          const audits = await auditRes.json()
 
           // Process audits over time for chart (grouped by date)
           const dateMap: { [key: string]: { success: number; failed: number } } = {}
