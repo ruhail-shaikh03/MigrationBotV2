@@ -27,7 +27,7 @@ async def detect_all_tabs(
     """
     try:
         from app.sheets.retry import _with_retry
-        meta = _with_retry(lambda: service.spreadsheets().get(spreadsheetId=spreadsheet_id).execute())
+        meta = await _with_retry(lambda: service.spreadsheets().get(spreadsheetId=spreadsheet_id).execute())
         tab_names = [sheet["properties"]["title"] for sheet in meta.get("sheets", [])]
     except Exception as e:
         logger.error(f"Failed to fetch spreadsheet metadata: {e}")
@@ -39,7 +39,7 @@ async def detect_all_tabs(
     for tab in tab_names:
         try:
             # Range: read A1:Z5
-            result = _with_retry(lambda: service.spreadsheets().values().get(
+            result = await _with_retry(lambda: service.spreadsheets().values().get(
                 spreadsheetId=spreadsheet_id,
                 range=f"'{tab}'!A1:Z5"
             ).execute())
