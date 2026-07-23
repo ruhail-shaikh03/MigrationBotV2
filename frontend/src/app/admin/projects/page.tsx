@@ -138,12 +138,14 @@ export default function AdminProjects() {
     setIsAnalyzing(true)
     try {
       const googleToken = (session as any)?.googleAccessToken || ""
+      const googleRefreshToken = (session as any)?.googleRefreshToken || ""
       const res = await fetch(`/api/admin/projects/detect-metadata`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
           "Authorization": `Bearer ${apiToken}`,
-          "X-Google-Access-Token": googleToken
+          "X-Google-Access-Token": googleToken,
+          "X-Google-Refresh-Token": googleRefreshToken
         },
         body: JSON.stringify({ spreadsheet_url: spreadsheetUrl })
       })

@@ -3,7 +3,7 @@ import logging
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, update, delete, desc
-from app.deps import get_current_user, get_db, get_google_token
+from app.deps import get_current_user, get_db, get_google_auth
 from app.models.user import User
 from app.models.project import Project
 from app.models.permission import Permission
@@ -81,7 +81,7 @@ async def list_projects(db: AsyncSession = Depends(get_db)):
 @router.post("/projects/detect-metadata", dependencies=[Depends(require_admin)])
 async def detect_project_metadata(
     payload: ProjectDetectRequest,
-    google_token: str = Depends(get_google_token)
+    google_auth: dict = Depends(get_google_auth)
 ):
     """
     Extracts the spreadsheet ID, connects to Sheets API to retrieve all tabs,
@@ -93,7 +93,10 @@ async def detect_project_metadata(
         raise HTTPException(status_code=400, detail=str(ve))
 
     try:
-        service = build_sheets_service(google_token)
+        service = build_sheets_service(
+            access_token=google_auth["access_token"],
+            refresh_token=google_auth["refresh_token"]
+        )
         detect_result = await detect_all_tabs(service, spreadsheet_id, llm_client)
         return {
             "spreadsheet_id": spreadsheet_id,
@@ -112,7 +115,7 @@ async def create_project(
     payload: ProjectCreate,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
-    google_token: Optional[str] = Depends(get_google_token)
+    google_auth: dict = Depends(get_google_auth)
 ):
     """
     Registers a new spreadsheet project. Parses URL to spreadsheet ID if a full URL is provided.
@@ -129,9 +132,12 @@ async def create_project(
         raise HTTPException(status_code=400, detail="Spreadsheet ID is already registered.")
 
     schema_config = payload.schema_config or {}
-    if not schema_config and google_token:
+    if not schema_config and google_auth.get("access_token"):
         try:
-            service = build_sheets_service(google_token)
+            service = build_sheets_service(
+                access_token=google_auth["access_token"],
+                refresh_token=google_auth["refresh_token"]
+            )
             detect_result = await detect_all_tabs(service, spreadsheet_id, llm_client)
             if detect_result and "tabs" in detect_result:
                 schema_config = detect_result

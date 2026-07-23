@@ -73,14 +73,18 @@ async def get_current_user(
     return user
 
 
-async def get_google_token(
-    x_google_access_token: Optional[str] = Header(None, alias="X-Google-Access-Token")
-) -> str:
+async def get_google_auth(
+    x_google_access_token: Optional[str] = Header(None, alias="X-Google-Access-Token"),
+    x_google_refresh_token: Optional[str] = Header(None, alias="X-Google-Refresh-Token")
+) -> dict:
     """
-    Retrieves the Google OAuth Access Token sent from the Next.js frontend.
-    If none is provided (development context), returns a mock string.
+    Retrieves the Google OAuth tokens sent from the Next.js frontend.
+    Returns a dict with access_token and refresh_token.
     """
     if not x_google_access_token:
         # Developer fallback
-        return "mock-google-access-token"
-    return x_google_access_token
+        return {"access_token": "mock-google-access-token", "refresh_token": None}
+    return {
+        "access_token": x_google_access_token,
+        "refresh_token": x_google_refresh_token
+    }

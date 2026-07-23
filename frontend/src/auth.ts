@@ -23,12 +23,16 @@ export const { handlers, signIn, signOut, auth } = NextAuth({
     async jwt({ token, account }) {
       if (account) {
         token.googleAccessToken = account.access_token
+        if (account.refresh_token) {
+          token.googleRefreshToken = account.refresh_token
+        }
       }
       return token
     },
     async session({ session, token }: any) {
       if (token) {
         session.googleAccessToken = token.googleAccessToken
+        session.googleRefreshToken = token.googleRefreshToken
         session.user.id = token.sub
         
         // Generate standard signed HS256 JWT for our FastAPI backend
