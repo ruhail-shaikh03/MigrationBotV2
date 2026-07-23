@@ -267,11 +267,13 @@ export default function AdminProjects() {
           schema_config: (parsedSchema && Object.keys(parsedSchema).length > 0) ? parsedSchema : null
         }
         const googleToken = (session as any)?.googleAccessToken || ""
+        const googleRefreshToken = (session as any)?.googleRefreshToken || ""
         const res = await fetch(`${baseUrl}/api/admin/projects`, {
           method: "POST",
           headers: {
             ...headers,
-            "X-Google-Access-Token": googleToken
+            "X-Google-Access-Token": googleToken,
+            "X-Google-Refresh-Token": googleRefreshToken
           },
           body: JSON.stringify(payload)
         })
