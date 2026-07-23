@@ -103,7 +103,7 @@ async def websocket_chat_endpoint(
             "type": "error", 
             "message": "No active projects found. Please contact an admin to register a project."
         })
-        await websocket.close(code=1011)
+        await websocket.close(code=1008)
         return
 
     # Load project details
@@ -111,7 +111,7 @@ async def websocket_chat_endpoint(
     project = proj_res.scalar()
     if not project:
         await websocket.send_json({"type": "error", "message": f"Project ID {active_project_id} not found."})
-        await websocket.close(code=1011)
+        await websocket.close(code=1008)
         return
 
     # Check / Load active User Session in database

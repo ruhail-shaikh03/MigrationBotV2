@@ -118,10 +118,16 @@ export function useWebSocket(apiToken: string | null, projectId: number | null) 
             break
           }
           case "error": {
+            const errorContent = `Error: ${data.message}`
+            const currentMessages = useChatStore.getState().messages
+            const lastMsg = currentMessages[currentMessages.length - 1]
+            if (lastMsg && lastMsg.content === errorContent) {
+              break
+            }
             addMessage({
               id: Math.random().toString(36).substring(7),
               role: "system",
-              content: `Error: ${data.message}`,
+              content: errorContent,
               timestamp: new Date()
             })
             break

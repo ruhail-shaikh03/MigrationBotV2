@@ -16,21 +16,22 @@ jobs:
           key: ${{ secrets.VPS_SSH_KEY }}
           port: 22
           script: |
-            echo "Starting deployment..."
-            if [ -d "~/migrationbot" ]; then
+            echo "Syncing latest code from origin/main..."
+            if [ -d "/root/migrationbot" ]; then
+              cd /root/migrationbot
+            elif [ -d "~/migrationbot" ]; then
               cd ~/migrationbot
-              git pull origin ${{ github.ref_name }}
             else
               git clone git@github.com:${{ github.repository }}.git ~/migrationbot
               cd ~/migrationbot
             fi
-            echo "Pulling latest code..."
-            git checkout main
+            git fetch origin main
+            git reset --hard origin/main
             echo "Stopping old containers..."
             docker compose down
-            echo "Rebuilding all containers (no cache)..."
+            echo "Rebuilding all containers from scratch..."
             docker compose build --no-cache
-            echo "Starting containers..."
+            echo "Starting fresh containers..."
             docker compose up -d
             echo "Pruning old images..."
             docker image prune -f

@@ -2,10 +2,10 @@
 
 import { useSession } from "next-auth/react"
 import { useRouter, usePathname } from "next/navigation"
-import { useEffect } from "react"
+import { useEffect, useState } from "react"
 import { 
   LayoutDashboard, FolderKanban, Users, ShieldAlert, 
-  MessageSquare, LogOut, ArrowLeft, Database
+  MessageSquare, LogOut, ArrowLeft, Database, ShieldX, RefreshCw
 } from "lucide-react"
 import Link from "next/link"
 
@@ -17,35 +17,96 @@ export default function AdminLayout({
   const { data: session, status } = useSession()
   const router = useRouter()
   const pathname = usePathname()
+  const [adminStatus, setAdminStatus] = useState<"loading" | "authorized" | "denied">("loading")
 
-  useEffect(() => {
+  const checkAdminStatus = () => {
     if (status === "unauthenticated") {
       router.push("/")
-    } else if (status === "authenticated") {
+      return
+    }
+    if (status === "authenticated") {
       const apiToken = (session as any)?.apiToken
       if (!apiToken) {
-        router.push("/chat")
+        setAdminStatus("loading")
         return
       }
       fetch("/api/auth/me", {
         headers: { Authorization: `Bearer ${apiToken}` }
       })
-        .then((res) => res.json())
+        .then((res) => {
+          if (!res.ok) throw new Error("Auth check failed")
+          return res.json()
+        })
         .then((data) => {
-          if (!data || !data.is_admin) {
-            router.push("/chat")
+          if (data && data.is_admin) {
+            setAdminStatus("authorized")
+          } else {
+            setAdminStatus("denied")
           }
         })
-        .catch(() => {
-          router.push("/chat")
+        .catch((err) => {
+          console.error("Admin verification error:", err)
+          setAdminStatus("denied")
         })
     }
-  }, [status, session, router])
+  }
 
-  if (status === "loading" || !session) {
+  useEffect(() => {
+    checkAdminStatus()
+  }, [status, session])
+
+  if (status === "loading" || adminStatus === "loading") {
     return (
       <div className="flex h-screen items-center justify-center bg-[#030014]">
-        <div className="animate-spin rounded-full h-12 w-12 border-t-2 border-indigo-500"></div>
+        <div className="flex flex-col items-center gap-3">
+          <div className="animate-spin rounded-full h-12 w-12 border-t-2 border-indigo-500"></div>
+          <span className="text-xs text-zinc-400 font-mono">Verifying admin privileges...</span>
+        </div>
+      </div>
+    )
+  }
+
+  if (adminStatus === "denied") {
+    const userEmail = session?.user?.email || "Unknown user"
+    return (
+      <div className="flex h-screen items-center justify-center bg-[#030014] text-zinc-100 p-6">
+        <div className="glass-panel max-w-md w-full p-8 rounded-2xl border border-rose-500/20 text-center space-y-6">
+          <div className="h-16 w-16 bg-rose-500/10 border border-rose-500/30 text-rose-400 rounded-2xl flex items-center justify-center mx-auto">
+            <ShieldX className="h-8 w-8" />
+          </div>
+          <div>
+            <h2 className="text-xl font-bold text-white mb-2">Admin Access Required</h2>
+            <p className="text-xs text-zinc-400 leading-relaxed">
+              Logged in as <code className="text-indigo-300 font-mono bg-white/5 px-2 py-0.5 rounded">{userEmail}</code>.
+              This email is not listed in the server's <code className="text-zinc-300">ADMIN_EMAILS</code> configuration.
+            </p>
+          </div>
+
+          <div className="bg-white/[0.02] border border-white/5 p-4 rounded-xl text-left text-[11px] text-zinc-400 space-y-1.5 font-mono">
+            <div className="font-semibold text-zinc-300">How to grant access:</div>
+            <div>Add <code className="text-indigo-300">{userEmail}</code> to <code className="text-indigo-300">ADMIN_EMAILS</code> in your VPS <code className="text-indigo-300">.env</code> file:</div>
+            <div className="text-zinc-500 bg-black/40 p-2 rounded overflow-x-auto text-[10px]">
+              ADMIN_EMAILS={userEmail}
+            </div>
+          </div>
+
+          <div className="flex items-center justify-center gap-3 pt-2">
+            <button
+              onClick={() => checkAdminStatus()}
+              className="flex items-center gap-2 px-4 py-2 bg-white/5 hover:bg-white/10 text-zinc-200 border border-white/10 rounded-xl text-xs font-semibold uppercase tracking-wider transition cursor-pointer"
+            >
+              <RefreshCw className="h-3.5 w-3.5" />
+              <span>Retry</span>
+            </button>
+            <Link
+              href="/chat"
+              className="flex items-center gap-2 px-4 py-2 bg-indigo-600 hover:bg-indigo-500 text-white rounded-xl text-xs font-semibold uppercase tracking-wider transition cursor-pointer"
+            >
+              <MessageSquare className="h-3.5 w-3.5" />
+              <span>Back to Chat</span>
+            </Link>
+          </div>
+        </div>
       </div>
     )
   }
