@@ -22,8 +22,8 @@ async def detect_all_tabs(
     client: AsyncOpenAI
 ) -> Dict[str, Any]:
     """
-    Fetch all tabs in the spreadsheet, determine which ones are WRICEF trackers,
-    and build their schema_configs.
+    Fetch all tabs in the spreadsheet, analyze their raw first 10 rows using LLM reasoning,
+    determine which tabs are trackers, locate their header rows, and build their schema_configs.
     """
     try:
         from app.sheets.retry import _with_retry
@@ -38,47 +38,29 @@ async def detect_all_tabs(
     
     for tab in tab_names:
         try:
-            # Range: read A1:Z5
+            # Range: read A1:Z10 (first 10 rows)
             result = await _with_retry(lambda: service.spreadsheets().values().get(
                 spreadsheetId=spreadsheet_id,
-                range=f"'{tab}'!A1:Z5"
+                range=f"'{tab}'!A1:Z10"
             ).execute())
             rows = result.get("values", [])
             if not rows:
-                continue
-            
-            canonical_markers = {"ricefw id", "module", "description", "type"}
-            is_tracker = False
-            header_row_idx = 0
-            
-            for i, row in enumerate(rows):
-                normalized_row = {str(cell).strip().lower() for cell in row if cell}
-                if len(canonical_markers.intersection(normalized_row)) >= 2:
-                    is_tracker = True
-                    header_row_idx = i
-                    break
-                    
-            if not is_tracker:
-                logger.info(f"Tab '{tab}' does not appear to be a WRICEF tracker (missing headers). Skipping.")
-                continue
-
-            headers = [str(c).strip() for c in rows[header_row_idx] if c]
-            sample_rows = []
-            for row in rows[header_row_idx + 1:]:
-                sample_rows.append([str(c).strip() for c in row])
-                if len(sample_rows) >= 3:
-                    break
-
-            if len(headers) < 2:
+                logger.info(f"Tab '{tab}' is empty. Skipping.")
                 continue
 
             tab_schema = await detect_schema_config(
-                headers=headers,
-                sample_rows=sample_rows,
+                tab_name=tab,
+                raw_rows=rows,
                 tab_names=tab_names,
                 client=client
             )
-            
+
+            if not tab_schema.get("is_tracker_sheet", False):
+                logger.info(f"LLM determined tab '{tab}' is not a tracker sheet. Skipping.")
+                continue
+
+            header_row_idx = tab_schema.get("header_row_index", 0)
+            # data_start_row is 1-based index of row right after header row
             tab_schema["data_start_row"] = header_row_idx + 2
             consolidated_config[tab] = tab_schema
             if tab not in valid_modules:
@@ -96,56 +78,67 @@ async def detect_all_tabs(
         }
     }
 
+
 SCHEMA_DETECTION_PROMPT = """
-You are analyzing a Google Sheet header row for a migration/project tracker.
+You are an expert data architect analyzing raw rows from a Google Sheet tab to determine if it is a project/migration tracking table and map its columns semantically.
 
-Headers (exact, verbatim):
-{headers_json}
+Tab Name: {tab_name}
+All Tab Names in Spreadsheet: {tab_names_json}
 
-Sample data (first 3 rows):
-{sample_rows_json}
+First 10 Raw Rows from this tab (each row is a list of cell values):
+{raw_rows_json}
 
-Tab names in this spreadsheet:
-{tab_names_json}
+Your goals:
+1. Determine if this tab is a data tracking sheet (contains a structured list of work items, tasks, RICEFW objects, deliverables, or requirements). If it is a summary cover page, dashboard, notes page, or empty sheet, set "is_tracker_sheet": false.
+2. Identify the 0-based row index that contains the column headers (e.g., 0 if headers are in row 1, 1 if in row 2, etc.).
+3. Semantically map the sheet's exact column header names to our system's roles based on MEANING (concept similarity), NOT literal word matching:
+   - "primary_id_column": Header for unique item ID (e.g., RICEFW ID, Task #, Object Code, Req ID, Item ID, ID). MUST NOT BE NULL if is_tracker_sheet is true.
+   - "primary_id_position": Column letter (e.g., "A", "B", "C") matching the 0-indexed position of primary_id_column in the header row.
+   - "status_column": Header tracking progress/status (e.g., Dev Status, State, Progress, Stage, Status). Set to null if missing.
+   - "module_column": Header for functional area/module/workstream (e.g., Module, Area, Functional Code, Track). Set to null if missing.
+   - "assignee_column": Header for responsible owner (e.g., Assignee, Technical Resource, Resource, Owner, Lead). Set to null if missing.
+   - "description_column": Header for details/description (e.g., Description, Task Name, Summary, Details). Set to null if missing.
+   - "type_column": Header for category/type (e.g., Type, RICEFW Type, Object Type, Category). Set to null if missing.
+   - "date_columns": Object mapping "go_live", "signoff", "start", "completion" to their respective headers, or null if missing.
 
-Identify the semantic role of each column. Return JSON:
+Return ONLY a valid JSON object matching this exact structure:
 {{
-  "primary_id_column": "<header containing the unique object ID, e.g. RICEFW ID>",
-  "primary_id_position": "<column letter, e.g. B, matching the 1-based index of primary_id_column>",
-  "status_column": "<header tracking dev/migration status, e.g. Dev Status>",
-  "module_column": "<header for functional area/module/workstream, e.g. Module>",
-  "assignee_column": "<header for person assigned, e.g. Technical Resource or Functional Resource>",
-  "description_column": "<header for object description, e.g. Description>",
-  "type_column": "<header for object type/category, e.g. Type>",
+  "is_tracker_sheet": true,
+  "header_row_index": 0,
+  "primary_id_column": "RICEFW ID",
+  "primary_id_position": "B",
+  "status_column": "Dev Status",
+  "module_column": "Module",
+  "assignee_column": "Technical Resource",
+  "description_column": "Description",
+  "type_column": "Type",
   "date_columns": {{
-    "go_live": "<header for target/go-live date, or null>",
-    "signoff": "<header for sign-off/approval date, or null>",
-    "start": "<header for start date, or null>",
-    "completion": "<header for completion date, or null>"
+    "go_live": "Go-Live Date",
+    "signoff": null,
+    "start": "Start Date",
+    "completion": null
   }},
-  "critical_fields": ["<top 5-6 essential headers for brief search displays>"],
-  "valid_modules": ["<modules or functional codes parsed from tabs or sample column values, e.g. FI, MM, SD>"],
-  "valid_types": ["<unique types parsed from the type column sample, e.g. R, I, C, E, F, W>"]
+  "critical_fields": ["RICEFW ID", "Module", "Type", "Description", "Dev Status"],
+  "valid_modules": ["FI", "MM", "SD"],
+  "valid_types": ["R", "I", "C", "E", "F", "W"]
 }}
-Return ONLY valid JSON.
 """
 
 
 async def detect_schema_config(
-    headers: List[str],
-    sample_rows: List[List[str]],
+    tab_name: str,
+    raw_rows: List[List[str]],
     tab_names: List[str],
     client: AsyncOpenAI
 ) -> Dict[str, Any]:
     """
-    Calls DeepSeek V3 to automatically analyze sheet headers and sample data
-    to produce the semantic role mapping required for sheets executor operations.
+    Calls DeepSeek V3 to automatically analyze raw sheet rows
+    to determine tracker validity, header location, and semantic role mapping.
     """
-    if not headers:
-        return {}
+    if not raw_rows:
+        return {"is_tracker_sheet": False}
 
-    headers_json = json.dumps(headers, ensure_ascii=False)
-    sample_rows_json = json.dumps(sample_rows, ensure_ascii=False)
+    raw_rows_json = json.dumps(raw_rows, ensure_ascii=False)
     tab_names_json = json.dumps(tab_names, ensure_ascii=False)
 
     try:
@@ -154,8 +147,8 @@ async def detect_schema_config(
             messages=[{
                 "role": "user",
                 "content": SCHEMA_DETECTION_PROMPT.format(
-                    headers_json=headers_json,
-                    sample_rows_json=sample_rows_json,
+                    tab_name=tab_name,
+                    raw_rows_json=raw_rows_json,
                     tab_names_json=tab_names_json
                 )
             }],
@@ -164,19 +157,17 @@ async def detect_schema_config(
         )
         content = response.choices[0].message.content.strip()
         
-        # Safely parse JSON from LLM response (handling potential markdown wrapper)
         result = _parse_json_safely(content)
         if result:
-            # Inject default data_start_row if not set
-            if "data_start_row" not in result:
-                result["data_start_row"] = 3 # Legacy standard default
             return result
         
     except Exception as e:
-        logger.error(f"Error during schema auto-detection: {e}")
+        logger.error(f"Error during schema auto-detection for tab '{tab_name}': {e}")
 
-    # Return safe structural fallback defaults
+    # Structural fallback if LLM request fails
     return {
+        "is_tracker_sheet": True,
+        "header_row_index": 1,
         "primary_id_column": "RICEFW ID",
         "primary_id_position": "B",
         "status_column": "Dev Status",
@@ -192,8 +183,7 @@ async def detect_schema_config(
         },
         "critical_fields": ["RICEFW ID", "Module", "Type", "Description", "Dev Status", "Technical Resource "],
         "valid_modules": ["FI", "MM", "SD", "PM", "QM", "PP", "TRM", "HCM", "IM", "CO", "FM", "PS"],
-        "valid_types": ["R", "I", "C", "E", "F", "W"],
-        "data_start_row": 3
+        "valid_types": ["R", "I", "C", "E", "F", "W"]
     }
 
 
