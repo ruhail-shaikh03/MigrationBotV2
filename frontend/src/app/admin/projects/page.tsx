@@ -131,7 +131,7 @@ export default function AdminProjects() {
 
   const handleAnalyzeSheet = async () => {
     if (!spreadsheetUrl.trim()) {
-      alert("Please enter a Google Sheets URL or ID.")
+      setErrorMsg("Please enter a Google Sheets URL or ID.")
       return
     }
     setErrorMsg("")
@@ -139,6 +139,12 @@ export default function AdminProjects() {
     try {
       const googleToken = (session as any)?.googleAccessToken || ""
       const googleRefreshToken = (session as any)?.googleRefreshToken || ""
+
+      if (!googleToken) {
+        setErrorMsg("Google access token is missing. Please sign out and sign back in.")
+        return
+      }
+
       const res = await fetch(`/api/admin/projects/detect-metadata`, {
         method: "POST",
         headers: {
@@ -152,8 +158,13 @@ export default function AdminProjects() {
 
       if (res.ok) {
         const data = await res.json()
-        const config = data.detected_config
+        const config = data.detected_config || {}
         const sheetsMap = config.tabs || {}
+
+        if (Object.keys(sheetsMap).length === 0) {
+          setErrorMsg("Analysis completed but no WRICEF tracker tabs were detected. Make sure the spreadsheet has header rows containing columns like 'RICEFW ID', 'Module', 'Type', or 'Description'.")
+          return
+        }
 
         setSpreadsheetId(data.spreadsheet_id)
         setDetectedTabsMap(sheetsMap)
@@ -173,12 +184,23 @@ export default function AdminProjects() {
 
         rebuildSchemaConfig(sheetsMap, sel, companyPrefix)
       } else {
-        const err = await res.json()
-        setErrorMsg(err.detail || "Auto-detection failed. Make sure the spreadsheet exists and is shared.")
+        // Safely parse error response (may not be JSON)
+        let errorDetail = `Auto-detection failed (HTTP ${res.status}).`
+        try {
+          const errBody = await res.json()
+          errorDetail = errBody.detail || errorDetail
+        } catch {
+          // Response wasn't JSON — try text
+          try {
+            const textBody = await res.text()
+            if (textBody) errorDetail += ` ${textBody.substring(0, 200)}`
+          } catch { /* ignore */ }
+        }
+        setErrorMsg(errorDetail)
       }
-    } catch (err) {
-      console.error(err)
-      setErrorMsg("Failed to communicate with the auto-detection API.")
+    } catch (err: any) {
+      console.error("Analyze sheet error:", err)
+      setErrorMsg(`Failed to communicate with the server: ${err?.message || "Unknown network error"}`)
     } finally {
       setIsAnalyzing(false)
     }
@@ -447,6 +469,16 @@ export default function AdminProjects() {
                     }`}
                 >
                   Manual Mode
+                </button>
+              </div>
+            )}
+
+            {errorMsg && (
+              <div className="p-3 mb-2 bg-rose-500/10 border border-rose-500/20 text-rose-400 text-sm rounded-xl flex items-center gap-3">
+                <AlertTriangle className="h-4 w-4 shrink-0" />
+                <span className="break-all">{errorMsg}</span>
+                <button type="button" onClick={() => setErrorMsg("")} className="ml-auto shrink-0 p-1 hover:bg-white/5 rounded transition cursor-pointer">
+                  <X className="h-3.5 w-3.5" />
                 </button>
               </div>
             )}
