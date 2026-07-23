@@ -52,6 +52,9 @@ app.add_middleware(
 
 # Register REST and WebSocket API Routers
 # Mount chat router at root to expose WebSocket directly at '/ws'
+from app.api.auth import get_current_profile
+app.get("/api/me")(get_current_profile)
+
 app.include_router(chat_router)
 app.include_router(health_router, prefix="/api")
 app.include_router(auth_router, prefix="/api")

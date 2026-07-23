@@ -30,7 +30,7 @@ export default function AdminLayout({
         setAdminStatus("loading")
         return
       }
-      fetch("/api/auth/me", {
+      fetch("/api/me", {
         headers: { Authorization: `Bearer ${apiToken}` }
       })
         .then((res) => {

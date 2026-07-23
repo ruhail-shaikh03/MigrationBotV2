@@ -45,7 +45,7 @@ export default function ChatPage() {
   // Fetch user profile to check admin status dynamically
   useEffect(() => {
     if (status === "authenticated" && apiToken) {
-      fetch(`/api/auth/me`, {
+      fetch(`/api/me`, {
         headers: { "Authorization": `Bearer ${apiToken}` }
       })
         .then(res => res.json())
