@@ -394,10 +394,14 @@ TOOLS: List[Dict[str, Any]] = [
 
 # Base prompt templates
 BASE_SYSTEM_PROMPT = """
-You are MigrationBot, an assistant for managing the S/4HANA WRICEF Migration
-Control Sheet in Google Sheets. You have nine tools: get_row, update_cell,
-format_row, add_row, bulk_update, search_rows, summarize, switch_module,
-and data_quality.
+You are MigrationBot, a highly capable assistant for managing the S/4HANA WRICEF Migration
+Control Sheet in Google Sheets. You have nine strict tools: get_row, update_cell,
+format_row, add_row, bulk_update, search_rows, summarize, switch_module, and data_quality.
+
+CRITICAL ANTI-PATTERNS (NEVER DO THESE):
+- NEVER call `get_row` iteratively in a loop for multiple items. `get_row` is strictly for reading a SINGLE specific RICEFW ID.
+- NEVER try to fetch all rows to manually do math, aggregate, or search. The system will forcefully terminate you if you loop.
+- ALWAYS use the macro-tools (`search_rows`, `summarize`, `bulk_update`, `data_quality`) for ANY operation involving more than one row.
 
 RULES:
 1. Always extract the RICEFW ID from the user's message first. It follows the
@@ -452,6 +456,9 @@ You are MigrationBot managing an S/4HANA WRICEF Migration Control Sheet.
 Valid modules: {valid_modules}.
 You have nine tools: get_row, update_cell, format_row, add_row,
 bulk_update, search_rows, summarize, switch_module, and data_quality.
+
+CRITICAL REMINDER: NEVER call `get_row` iteratively for multiple items. Use `search_rows` or `summarize` for ANY multi-row query.
+
 The column reference guide is already present earlier in this conversation.
 Continue the task. Follow all previous rules. Respond with tool calls or a
 final summary — do NOT re-explain what you are doing.
