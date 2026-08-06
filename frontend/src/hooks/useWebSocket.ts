@@ -2,7 +2,7 @@ import { useEffect, useRef, useCallback } from "react"
 import { useChatStore } from "@/store/useChatStore"
 
 export function useWebSocket(apiToken: string | null, projectId: number | null) {
-  const { isConnected, setIsConnected, addMessage, updateLastMessage, setWs, ws, setActiveTab } = useChatStore()
+  const { isConnected, setIsConnected, addMessage, updateLastMessage, setWs, ws, setSessionInfo } = useChatStore()
   const reconnectTimeoutRef = useRef<NodeJS.Timeout | null>(null)
   const pingIntervalRef = useRef<NodeJS.Timeout | null>(null)
 
@@ -77,7 +77,7 @@ export function useWebSocket(apiToken: string | null, projectId: number | null) 
                 }
               }
               return lastMsg
-            })
+            }, undefined, "assistant")
             break
           }
           case "tool_start": {
@@ -93,7 +93,7 @@ export function useWebSocket(apiToken: string | null, projectId: number | null) 
                 }
               }
               return lastMsg
-            })
+            }, undefined, "assistant")
             break
           }
           case "tool_result": {
@@ -101,7 +101,7 @@ export function useWebSocket(apiToken: string | null, projectId: number | null) 
               if (lastMsg && lastMsg.role === "assistant" && lastMsg.toolCalls) {
                 return {
                   ...lastMsg,
-                  toolCalls: lastMsg.toolCalls.map((tc) => 
+                  toolCalls: lastMsg.toolCalls.map((tc) =>
                     tc.name === data.tool && tc.status === "running"
                       ? { ...tc, status: "completed", result: data.result }
                       : tc
@@ -109,7 +109,7 @@ export function useWebSocket(apiToken: string | null, projectId: number | null) 
                 }
               }
               return lastMsg
-            })
+            }, undefined, "assistant")
             break
           }
           case "queue_update": {
@@ -133,9 +133,11 @@ export function useWebSocket(apiToken: string | null, projectId: number | null) 
             break
           }
           case "connection_ok": {
-            if (data.active_tab) {
-              setActiveTab(data.active_tab)
-            }
+            setSessionInfo({
+              userEmail: data.user_email,
+              projectName: data.project_name,
+              activeTab: data.active_tab
+            })
             break
           }
           case "pong":

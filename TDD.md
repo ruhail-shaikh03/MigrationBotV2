@@ -135,7 +135,7 @@ migrationbot/
 │   │   │                            # get_google_token(): X-Google-Access-Token header extraction
 │   │   │
 │   │   ├── api/                     # HTTP/WS endpoints
-│   │   │   ├── auth.py              # GET /api/auth/me — returns {email, is_admin, display_name}
+│   │   │   ├── auth.py              # GET /api/me — returns {email, is_admin, display_name}
 │   │   │   ├── chat.py              # WS /ws — agentic chat endpoint
 │   │   │   │                        # GET /api/projects — user's accessible projects list
 │   │   │   │                        # Contains: authenticate_ws_user(), connection_ok msg,
@@ -916,7 +916,7 @@ RBAC (core/permissions.py)
 
 Frontend Admin Guard
         ├── HARDCODED email substring check (rohai/ruhail/admin)
-        ├── ALSO queries /api/auth/me for is_admin flag
+        ├── ALSO queries /api/me for is_admin flag
         └── CONFLICT: two admin detection systems active simultaneously
 
 Agentic Loop (core/agentic_loop.py)
@@ -945,7 +945,7 @@ Audit Logger (core/audit.py)
 
 1. **[FIXED] Hardcoded Admin Detection:**
    - Removed hardcoded email checks (`["rohai", "ruhail", "admin"]`) in `chat/page.tsx` and `admin/layout.tsx`.
-   - Replaced with dynamic `/api/auth/me` queries returning case-insensitive `is_admin` flags.
+   - Replaced with dynamic `/api/me` queries returning case-insensitive `is_admin` flags.
 
 2. **[FIXED] Hardcoded Module Tabs Fallback:**
    - Removed static fallback array `["SD", "MM", "FI", "CO", "PP", "QM"]` in `chat/page.tsx`. Module tabs now dynamically reflect the active project's discovered schema configuration (`schema_config.tabs`).
@@ -994,7 +994,7 @@ Audit Logger (core/audit.py)
 4. **Hardcoded admin detection in frontend (TWO conflicting systems):**
    - `chat/page.tsx` line 161: `isAdmin = isAdminState || email.includes("rohai")...` — hybrid check.
    - `admin/layout.tsx` line 28: `isAdmin = ["rohai", "ruhail", "admin"].some(key => email.includes(key))` — pure hardcoded.
-   - Should exclusively query `/api/auth/me` for `is_admin` flag from the backend.
+   - Should exclusively query `/api/me` for `is_admin` flag from the backend.
 
 5. **Hardcoded module tabs fallback in chat:**
    - `chat/page.tsx` line 208: Falls back to `["SD", "MM", "FI", "CO", "PP", "QM"]` when `schema_config.tabs` and `schema_config.global.valid_modules` are both missing.

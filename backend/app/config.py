@@ -1,4 +1,5 @@
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic import ValidationError
 from typing import List, Optional
 
 class Settings(BaseSettings):
@@ -12,14 +13,15 @@ class Settings(BaseSettings):
     GOOGLE_CLIENT_SECRET: str = "mock-google-secret"
     JWT_SECRET: str = "mock-jwt-secret-at-least-32-characters-long"
 
-    # Default project sheet parameters
-    DEFAULT_SPREADSHEET_ID: str = "17mrUyJbhOhBbaQYzQ4iPFH6kPPHBjqOR3dt2EWGCDUA"
+    # Default project sheet parameters — no built-in fallback; each deployment must
+    # provide its own spreadsheet, admin list, and allowed origins via .env.
+    DEFAULT_SPREADSHEET_ID: str
     DEFAULT_SHEET_TAB: str = "SD"
     DEFAULT_SHEET_LABEL: str = "FF Migration Tracker"
 
     # Admin access configuration
-    ADMIN_EMAILS: str = "ruhail.rizwan@tmcltd.com"
-    CORS_ORIGINS: str = "https://migrationbot.duckdns.org,http://localhost:3000"
+    ADMIN_EMAILS: str
+    CORS_ORIGINS: str
 
     @property
     def admin_emails_list(self) -> List[str]:
@@ -34,4 +36,13 @@ class Settings(BaseSettings):
         extra="ignore"
     )
 
-settings = Settings()
+try:
+    settings = Settings()
+except ValidationError as exc:
+    missing = ", ".join(sorted({str(err["loc"][0]) for err in exc.errors() if err["type"] == "missing"}))
+    raise RuntimeError(
+        "Missing required environment variable(s): "
+        f"{missing or exc}. Set ADMIN_EMAILS, CORS_ORIGINS, and DEFAULT_SPREADSHEET_ID "
+        "in your .env file — these no longer fall back to hardcoded production values. "
+        "See .env.example for the expected format."
+    ) from exc

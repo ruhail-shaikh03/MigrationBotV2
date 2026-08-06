@@ -1,7 +1,6 @@
 migrationbot.duckdns.org {
     route {
-        # 1. FastAPI profile check endpoints (explicit backend routes)
-        reverse_proxy /api/auth/me backend:8000
+        # 1. FastAPI profile check endpoint (explicit backend route)
         reverse_proxy /api/me backend:8000
 
         # 2. NextAuth endpoints
