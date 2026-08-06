@@ -76,7 +76,7 @@ async def dispatch_tool(
                     old_values = await get_row_raw(spreadsheet_id, active_tab, ricefw_id, fields, schema_config, service)
                 elif tool_name == "bulk_update":
                     from app.sheets.read import get_bulk_rows_raw
-                    old_values = await get_bulk_rows_raw(spreadsheet_id, active_tab, args, schema_config, service)
+                    old_values = await get_bulk_rows_raw(spreadsheet_id, active_tab, args, schema_config, service, column_map)
             except Exception as pe:
                 logger.warning(f"Failed to pre-read state for audit: {pe}")
 
