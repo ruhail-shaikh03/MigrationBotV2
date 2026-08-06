@@ -11,6 +11,7 @@ from app.config import settings
 from app.db.engine import AsyncSessionLocal
 from app.models.project import Project
 from app.queue.schemas import WriteJobPayload
+from app.queue.events import publish_queue_update
 from app.sheets.client import build_sheets_service
 from app.sheets.write import update_cell, bulk_update, add_row
 from app.sheets.format import format_row
@@ -228,10 +229,13 @@ async def process_job(job_id: str, payload_dict: dict) -> None:
                 error=error_msg
             )
         else:
-            logger.error(f"Unsupported queue tool: {tool}")
-            
+            error_msg = f"Unsupported queue tool: {tool}"
+            logger.error(error_msg)
+
     except Exception as e:
         logger.error(f"Failed to execute mutation {tool} on sheet: {e}")
+        result_ok = False
+        error_msg = str(e)
         await _write_audit_record(
             user_email=payload.user_email,
             session_id=payload.session_id,
@@ -246,6 +250,17 @@ async def process_job(job_id: str, payload_dict: dict) -> None:
             result_ok=False,
             error=str(e)
         )
+
+    # 4. Notify the originating client of the terminal job state over its WebSocket
+    await publish_queue_update(
+        user_email=payload.user_email,
+        job_id=job_id,
+        status="completed" if result_ok else "failed",
+        tool_name=tool,
+        args=args,
+        session_id=payload.session_id,
+        error=error_msg
+    )
 
 
 async def start_worker():

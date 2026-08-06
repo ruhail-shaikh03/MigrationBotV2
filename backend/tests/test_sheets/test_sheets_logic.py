@@ -5,9 +5,10 @@ from unittest.mock import MagicMock, AsyncMock, patch
 from googleapiclient.errors import HttpError
 
 from app.sheets.retry import _with_retry
-from app.sheets.read import find_row_num
+from app.sheets.read import find_row_num, get_bulk_rows_raw
 from app.queue.producer import enqueue_write_job
 from app.queue.worker import start_worker
+from app.queue.events import publish_queue_update, queue_events_channel
 
 # 1. Test transient rate-limiting retry backoff
 @pytest.mark.asyncio
@@ -138,3 +139,103 @@ async def test_worker_throttling():
         # Verify that sleep(1.0) was executed after job run
         mock_sleep.assert_called_with(1.0)
         assert mock_process.called
+
+
+# 5. Test queue_update event payload shape published back to the client
+@pytest.mark.asyncio
+async def test_queue_update_event_payload():
+    """Verify queue_update events carry the fields the frontend toast handler reads."""
+    mock_redis = AsyncMock()
+
+    with patch("app.queue.events.redis_client", mock_redis):
+        event = await publish_queue_update(
+            user_email="Test@Example.com",
+            job_id="job-abc",
+            status="completed",
+            tool_name="update_cell",
+            args={"ricefw_id": "SD-002"},
+            session_id=None,
+            error=None
+        )
+
+    assert mock_redis.publish.called
+    channel, raw = mock_redis.publish.call_args[0]
+
+    # Channel is namespaced per user (lowercased) so events only reach that user's sockets
+    assert channel == queue_events_channel("test@example.com")
+
+    published = json.loads(raw)
+    assert published == event
+    # chat/page.tsx reads: data.type, data.job_id, data.status, data.tool_name, data.args.ricefw_id
+    assert published["type"] == "queue_update"
+    assert published["job_id"] == "job-abc"
+    assert published["status"] == "completed"
+    assert published["tool_name"] == "update_cell"
+    assert published["args"]["ricefw_id"] == "SD-002"
+
+
+# 6. Test publishing failures never break the write job
+@pytest.mark.asyncio
+async def test_queue_update_survives_redis_outage():
+    """Verify a Redis publish failure is swallowed so a completed write still finalizes."""
+    mock_redis = AsyncMock()
+    mock_redis.publish.side_effect = ConnectionError("Redis unreachable")
+
+    with patch("app.queue.events.redis_client", mock_redis):
+        event = await publish_queue_update(
+            user_email="test@example.com",
+            job_id="job-def",
+            status="failed",
+            tool_name="add_row",
+            args={},
+            error="Sheet not found"
+        )
+
+    assert event["status"] == "failed"
+    assert event["error"] == "Sheet not found"
+
+
+# 7. Test bulk pre-read resolves filter columns with the live column map
+@pytest.mark.asyncio
+async def test_bulk_rows_raw_uses_real_column_map():
+    """Verify get_bulk_rows_raw resolves filter_by aliases instead of passing an empty map."""
+    mock_service = MagicMock()
+    column_map = {"Dev Status": ["dev status", "status", "progress"]}
+
+    with patch("app.sheets.read.search_rows", AsyncMock(return_value={"rows": []})) as mock_search, \
+         patch("app.sheets.read.get_row_raw", AsyncMock(return_value={})):
+
+        await get_bulk_rows_raw(
+            spreadsheet_id="sheet-123",
+            active_tab="SD",
+            args={"filter_by": {"field": "status", "value": "In Progress"}, "set_field": "Dev Status"},
+            schema_config={"data_start_row": 3, "primary_id_position": "B"},
+            service=mock_service,
+            column_map=column_map
+        )
+
+    assert mock_search.called
+    assert mock_search.call_args.kwargs["column_map"] == column_map
+
+
+# 8. Test bulk pre-read falls back to the schema's column map when none is passed
+@pytest.mark.asyncio
+async def test_bulk_rows_raw_falls_back_to_schema_column_map():
+    """Verify the column map is sourced from schema_config when the caller omits it."""
+    mock_service = MagicMock()
+    schema_column_map = {"Dev Status": ["dev status", "status"]}
+
+    with patch("app.sheets.read.search_rows", AsyncMock(return_value={"rows": []})) as mock_search, \
+         patch("app.sheets.read.get_row_raw", AsyncMock(return_value={})):
+
+        await get_bulk_rows_raw(
+            spreadsheet_id="sheet-123",
+            active_tab="SD",
+            args={"filter_by": {"field": "status", "value": "In Progress"}, "set_field": "Dev Status"},
+            schema_config={
+                "tabs": {"SD": {"data_start_row": 3, "column_map": schema_column_map}}
+            },
+            service=mock_service
+        )
+
+    assert mock_search.call_args.kwargs["column_map"] == schema_column_map

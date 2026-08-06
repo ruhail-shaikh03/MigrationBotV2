@@ -1,7 +1,9 @@
 import json
+import asyncio
 import logging
 from datetime import datetime, timezone
 from typing import Optional, List, Dict, Any
+import redis.asyncio as aioredis
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Query, Depends
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
@@ -14,6 +16,7 @@ from app.models.session import Session as UserSession
 from app.core.permissions import get_user_permissions
 from app.core.agentic_loop import run_agentic_loop
 from app.core.column_mapper import COLUMN_ALIASES
+from app.queue.events import queue_events_channel
 from app.config import settings
 from openai import AsyncOpenAI
 from jose import jwt, JWTError
@@ -141,8 +144,42 @@ async def websocket_chat_endpoint(
     })
 
     # Define message sender helper
+    # The agentic loop and the queue-event forwarder both write to this socket, so
+    # serialize sends to avoid interleaving two frames on the same connection.
+    send_lock = asyncio.Lock()
+
     async def send_msg(payload: dict) -> None:
-        await websocket.send_json(payload)
+        async with send_lock:
+            await websocket.send_json(payload)
+
+    async def forward_queue_updates() -> None:
+        """Relays queue_update events published by the out-of-process write worker to this client."""
+        sub_client = aioredis.from_url(settings.REDIS_URL, decode_responses=True)
+        pubsub = sub_client.pubsub()
+        try:
+            await pubsub.subscribe(queue_events_channel(user.email))
+            async for message in pubsub.listen():
+                if message.get("type") != "message":
+                    continue
+                try:
+                    await send_msg(json.loads(message["data"]))
+                except Exception as e:
+                    # Socket is gone or the payload is unreadable; stop relaying
+                    logger.warning(f"Failed to forward queue update to {user.email}: {e}")
+                    return
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            # Redis being unavailable must not take down the chat connection itself
+            logger.warning(f"Queue update subscription unavailable for {user.email}: {e}")
+        finally:
+            try:
+                await pubsub.aclose()
+                await sub_client.aclose()
+            except Exception:
+                pass
+
+    queue_listener = asyncio.create_task(forward_queue_updates())
 
     # 3. Message loop
     try:
@@ -215,6 +252,13 @@ async def websocket_chat_endpoint(
         try:
             await websocket.send_json({"type": "error", "message": f"Server error: {str(e)}"})
         except Exception:
+            pass
+    finally:
+        # Tear down the queue subscription with the connection
+        queue_listener.cancel()
+        try:
+            await queue_listener
+        except (asyncio.CancelledError, Exception):
             pass
 
 

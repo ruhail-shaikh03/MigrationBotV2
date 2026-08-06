@@ -82,10 +82,16 @@ async def get_bulk_rows_raw(
     active_tab: str,
     args: dict,
     schema_config: dict,
-    service: Any
+    service: Any,
+    column_map: Optional[dict] = None
 ) -> Dict[str, Dict[str, str]]:
     """Helper to fetch multiple rows' current values for auditing in bulk updates."""
-    schema_config = _get_tab_schema(schema_config, active_tab)
+    tab_schema = _get_tab_schema(schema_config, active_tab)
+    # Resolve the same column map the write path uses (see write.py:bulk_update), so a
+    # filter_by targeting a natural-language field name resolves to the identical rows.
+    column_map = column_map or tab_schema.get("column_map") or schema_config.get("column_map") or {}
+
+    schema_config = tab_schema
     data_start_row = schema_config.get("data_start_row", 3)
     header_row_num = data_start_row - 1
     primary_id_pos = schema_config.get("primary_id_position", "B")
@@ -103,7 +109,7 @@ async def get_bulk_rows_raw(
             return_fields=[primary_id_col, set_field],
             limit=500,
             schema_config=schema_config,
-            column_map={},
+            column_map=column_map,
             service=service
         )
         target_ids = [str(r.get(primary_id_col)) for r in search_res.get("rows", [])]

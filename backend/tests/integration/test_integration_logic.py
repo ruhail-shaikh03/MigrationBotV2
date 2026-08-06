@@ -107,11 +107,22 @@ async def test_e2e_write_flow(db_session: AsyncSession):
     mock_sheets_service.spreadsheets.return_value.values.return_value = mock_values
 
     # Mock dynamic row detection (find_row_num)
+    mock_publish = AsyncMock()
     with patch("app.queue.worker.build_sheets_service", return_value=mock_sheets_service), \
+         patch("app.queue.worker.publish_queue_update", mock_publish), \
          patch("app.sheets.write.find_row_num", return_value=4):
-        
+
         # Execute the queue processing logic
         await process_job(job_envelope["job_id"], job_envelope["payload"])
+
+    # The client must be told the job finished, or the UI shows no feedback at all
+    assert mock_publish.called
+    notify = mock_publish.call_args.kwargs
+    assert notify["status"] == "completed"
+    assert notify["job_id"] == job.id
+    assert notify["tool_name"] == "update_cell"
+    assert notify["user_email"] == user.email
+    assert notify["args"]["ricefw_id"] == "SD-002"
 
     # 5. Verify the Audit Log is updated in the database
     async with AsyncSessionLocal() as fresh_session:
@@ -127,6 +138,43 @@ async def test_e2e_write_flow(db_session: AsyncSession):
         assert record.old_value == "In Progress"
         assert record.new_value == "Done"
         assert record.result_ok is True
+
+
+async def test_worker_notifies_client_on_failure(db_session: AsyncSession):
+    """A write that blows up mid-flight must still surface a 'failed' queue_update."""
+    project = Project(
+        project_name="Failure project",
+        spreadsheet_id="spreadsheet-failure-123",
+        default_tab="SD",
+        company_prefix="FF",
+        schema_config={"data_start_row": 3, "primary_id_position": "B"}
+    )
+    db_session.add(project)
+    await db_session.commit()
+
+    job_payload = {
+        "user_email": "failing@example.com",
+        "google_access_token": "mock-token-123",
+        "session_id": None,
+        "tool_name": "update_cell",
+        "spreadsheet_id": project.spreadsheet_id,
+        "sheet_tab": "SD",
+        "args": {"ricefw_id": "SD-009", "updates": [{"field": "Dev Status", "value": "Done"}]},
+        "old_values": {}
+    }
+
+    mock_publish = AsyncMock()
+    with patch("app.queue.worker.build_sheets_service", return_value=MagicMock()), \
+         patch("app.queue.worker.update_cell", AsyncMock(side_effect=RuntimeError("Sheets API exploded"))), \
+         patch("app.queue.worker.publish_queue_update", mock_publish):
+
+        await process_job("job-failure-1", job_payload)
+
+    assert mock_publish.called
+    notify = mock_publish.call_args.kwargs
+    assert notify["status"] == "failed"
+    assert notify["job_id"] == "job-failure-1"
+    assert "Sheets API exploded" in notify["error"]
 
 
 async def test_e2e_read_flow(db_session: AsyncSession):
