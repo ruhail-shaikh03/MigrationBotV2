@@ -57,6 +57,8 @@ jobs:
           DEEPSEEK_API_KEY: mock-key
           JWT_SECRET: test-secret-32-characters-long-xx
           CORS_ORIGINS: "*"
+          ADMIN_EMAILS: "admin@example.com"
+          DEFAULT_SPREADSHEET_ID: "test-spreadsheet-id"
         run: |
           cd backend
           pytest -v --tb=short

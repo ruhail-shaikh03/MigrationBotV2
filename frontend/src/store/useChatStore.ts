@@ -31,15 +31,18 @@ interface ChatStore {
   isConnected: boolean
   messages: Message[]
   ws: WebSocket | null
-  
+  sessionUserEmail: string | null
+  sessionProjectName: string | null
+
   setProjects: (projects: Project[]) => void
   setActiveProject: (project: Project | null) => void
   setActiveTab: (tab: string) => void
   setIsConnected: (connected: boolean) => void
   setMessages: (messages: Message[]) => void
   addMessage: (message: Message) => void
-  updateLastMessage: (updater: (msg: Message) => Message) => void
+  updateLastMessage: (updater: (msg: Message) => Message, targetId?: string, targetRole?: Message["role"]) => void
   setWs: (ws: WebSocket | null) => void
+  setSessionInfo: (info: { userEmail?: string; projectName?: string; activeTab?: string }) => void
   clearChat: () => void
 }
 
@@ -50,6 +53,8 @@ export const useChatStore = create<ChatStore>((set) => ({
   isConnected: false,
   messages: [],
   ws: null,
+  sessionUserEmail: null,
+  sessionProjectName: null,
 
   setProjects: (projects) => set({ projects }),
   setActiveProject: (project) => set({
@@ -60,13 +65,31 @@ export const useChatStore = create<ChatStore>((set) => ({
   setIsConnected: (connected) => set({ isConnected: connected }),
   setMessages: (messages) => set({ messages }),
   addMessage: (message) => set((state) => ({ messages: [...state.messages, message] })),
-  updateLastMessage: (updater) => set((state) => {
+  updateLastMessage: (updater, targetId, targetRole) => set((state) => {
     if (state.messages.length === 0) return {}
+    let idx = -1
+    if (targetId) {
+      idx = state.messages.findIndex((m) => m.id === targetId)
+    } else if (targetRole) {
+      for (let i = state.messages.length - 1; i >= 0; i--) {
+        if (state.messages[i].role === targetRole) {
+          idx = i
+          break
+        }
+      }
+    } else {
+      idx = state.messages.length - 1
+    }
+    if (idx === -1) return {}
     const newMessages = [...state.messages]
-    const idx = newMessages.length - 1
     newMessages[idx] = updater(newMessages[idx])
     return { messages: newMessages }
   }),
   setWs: (ws) => set({ ws }),
+  setSessionInfo: (info) => set((state) => ({
+    sessionUserEmail: info.userEmail ?? state.sessionUserEmail,
+    sessionProjectName: info.projectName ?? state.sessionProjectName,
+    activeTab: info.activeTab ?? state.activeTab
+  })),
   clearChat: () => set({ messages: [] })
 }))
