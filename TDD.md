@@ -148,7 +148,7 @@ and `JWT_SECRET` (`config.py:11-14`).
 > status directly. Fixed operationally (the var added to the server's `.env`) and structurally:
 > `.env.example` now documents all three required variables and ships a working `CORS_ORIGINS`
 > value instead of the `*` it had before (a literal `*` also silently breaks credentialed
-> cross-origin requests once combined with `allow_credentials=True` — see §16.5), and
+> cross-origin requests once combined with `allow_credentials=True` — see §16.2), and
 > `docker-compose.yml`'s `backend` service now has a `healthcheck` against `GET /api/ready` (§10)
 > so this class of failure shows as `unhealthy` in `docker compose ps` rather than requiring a log
 > read to discover.
@@ -331,7 +331,7 @@ those two tools — `add_row`'s free-form `fields` dict and `format_row` are ung
 JSONB defaulting to `{}` (`models/project.py:23`), in one of two shapes distinguished by a
 top-level `"tabs"` key: multi-tab (`{"tabs": {...}, "global": {...}}`, what `detect_all_tabs`
 produces at `schema_detect.py:73-79`) or flat. The disambiguation is reimplemented at
-`read.py:14-17`, `write.py:23`, `:82`, `:193`, `worker.py:185`, `chat.py:222`, and
+`read.py:14-17`, `write.py:23`, `:82`, `:193`, `worker.py:188`, `chat.py:222`, and
 `agentic_loop.py:32-35` — seven copies, one of them (`read.py`) a private `_get_tab_schema`
 function.
 
@@ -410,7 +410,7 @@ from `window.location` unless `NEXT_PUBLIC_WS_URL` is set (`useWebSocket.ts:21-2
 | `type` | Payload | Sent by | Server handling |
 |---|---|---|---|
 | `message` | `{type, content}` | `useWebSocket.ts:180` | `chat.py:190-191` extracts `content`, drives the loop |
-| `ping` | `{type: "ping"}` | `useWebSocket.ts:37`, every 30 s | **Swallowed.** `chat.py:191` reads `content`, absent → `""` → `:195-196` `continue`. See §16.4 |
+| `ping` | `{type: "ping"}` | `useWebSocket.ts:37`, every 30 s | **Swallowed.** `chat.py:191` reads `content`, absent → `""` → `:195-196` `continue`. See §16.1 |
 
 Non-JSON frames are treated as raw text (`chat.py:192-193`). The literal *content* `"ping"` — not
 the heartbeat frame — is what triggers `pong` (`chat.py:198-199`).
@@ -493,7 +493,7 @@ doubling) on HTTP `{429, 500, 503}` for up to 4 attempts (`:13`, `:25-27`). Othe
 | `get_row_raw` | `read.py:50-77` | 3 — same shape |
 | `search_rows` | `read.py:156-247` | 2 — headers + ≤2001 rows |
 | `summarize` | `read.py:250-417` | 2 |
-| `run_data_quality_check` | `read.py:420-467` | 2 |
+| `run_data_quality_check` | `read.py:424-491` | 2 (+1 or +2 for `consistency`/`stale` DB reads) |
 | `update_cell` | `write.py:10-67` | 3 — `find_row_num` + headers + one `batchUpdate` |
 | `bulk_update` | `write.py:70-175` | 2 + **one `find_row_num` per target ID** (`:126-134`) |
 | `add_row` | `write.py:178-233` | 1 + headers, `values().append` |
@@ -523,7 +523,7 @@ exception (`:46-47`) so an audit failure cannot fail a mutation. Its only caller
 | `update_cell` | one per updated field | `worker.py:71-88` |
 | `bulk_update` | one per succeeded **and** per failed ID | `worker.py:106-121`, `:124-140` |
 | `format_row` | one, `field="Color"` | `worker.py:160-173` |
-| `add_row` | one, `field="ID"` | `worker.py:217-230` |
+| `add_row` | one, `field="ID"` | `worker.py:217-230` (ID always server-computed via `next_ricefw_id`, `prefix=None` — the schema exposes no `ricefw_id`/`prefix` arg) |
 | exception | one, `field="Mutation"` | `worker.py:239-252` |
 
 `old_value` comes from the live pre-read at dispatch time (`tool_dispatch.py:76`, `:79`). Read-only
@@ -546,18 +546,19 @@ building a case-insensitive header index at construction and resolving schema-na
 | `consistency_checks` | four rules — completed-without-signoff, completed-without-completion-date, required-with-blank-status, assignee-not-in-known-emails (`:108-209`) |
 | `completeness_score` | fill rate across `critical_fields`; `100.0` when no rows or no resolvable columns (`:211-241`) |
 
-`run_data_quality_check` (`read.py:420-467`) reads headers and ≤2001 rows live, sources "known
-emails" from `SELECT DISTINCT audit_logs.user_email` (`:445-446`), and pulls audit timestamps scoped
-to the spreadsheet and tab (`:454-458`).
-
-> **⚠ Falsy-index bug.** `if not self._get_col_idx(assignee_col)` (`data_quality.py:122`, repeated
-> `:216`) tests truthiness of a column index. Index `0` is falsy, so a sheet whose assignee column
-> is the **first** column silently falls back to `"Assigned To"`, dropping the unregistered-assignee
-> check and skewing the completeness score. The correct test is `is None`, used correctly elsewhere
-> in the same class (`:134`, `:227-228`).
+`run_data_quality_check` (`read.py:424-491`) reads headers and ≤2001 rows live, then dispatches on
+the **required** `check_type` arg (`blank_fields` / `consistency` / `stale` / `completeness_score` /
+`all`) rather than always running every check — each branch only does the work (and, for
+`consistency`/`stale`, the DB queries) its check needs. `scope_module` filters `rows` to one module
+before the checker is built; `blank_fields` reads `fields` from args (default: the same six-column
+list `search_rows` defaults to) and calls the previously-dead `DataQualityChecker.blank_field_counts`
+(`data_quality.py:20-33`). `consistency` sources "known emails" from
+`SELECT DISTINCT audit_logs.user_email` (`read.py:474-476`); `stale` pulls audit timestamps scoped to
+the spreadsheet and tab (`read.py:484-488`) using `threshold_days` (the schema's actual arg name —
+the code previously read a `stale_threshold_days` key the schema never sends).
 
 > **⚠ "Registered users" is drawn from the audit log**, not `users` or `permissions`
-> (`read.py:445-446`) — a legitimate user who has never performed a write is reported as
+> (`read.py:474-476`) — a legitimate user who has never performed a write is reported as
 > unregistered.
 
 ---
@@ -655,43 +656,29 @@ Ordered by severity. Items marked **(verified)** were reproduced by executing co
 by the remediation plan are removed from this list, not annotated — see git history for what
 changed and when.
 
-### 16.1 `data_quality` ignores `check_type`
-**Severity: medium.** The schema declares `check_type` **required** with five values
-(`tool_schemas.py:351-366`, `:389`) and the system prompt teaches the model to choose among them
-(`:444-448`), but `run_data_quality_check` (`read.py:420-467`) never reads it — it always runs
-consistency + completeness + stale. `scope_module` and `fields` are likewise unread, and
-`DataQualityChecker.blank_field_counts` is never called.
-
-### 16.2 `summarize` ignores `overdue_status_exclusions`
-**Severity: medium.** Declared at `tool_schemas.py:298-305`; the overdue branch uses a hard-coded
-set instead (`read.py:383`).
-
-### 16.3 Falsy-index bug in `DataQualityChecker`
-**Severity: medium.** `data_quality.py:122`, `:216` — see §13.
-
-### 16.4 The WebSocket heartbeat is swallowed
+### 16.1 The WebSocket heartbeat is swallowed
 **Severity: medium.** Client sends `{"type":"ping"}` every 30 s (`useWebSocket.ts:37`); the server
 reads only `packet.get("content", "")` (`chat.py:191`), gets `""`, and `continue`s (`:195-196`).
 `pong` (`:198-199`) fires only if a user literally types "ping". The client's `pong` handler
 (`:143-144`) is consequently dead. Frames still traverse the connection so idle-proxy keep-alive
 survives, but the protocol-level ack does not. Fix: route on `packet["type"]`.
 
-### 16.5 CORS wildcard with credentials
+### 16.2 CORS wildcard with credentials
 **Severity: medium.** `main.py:44-49` sets `allow_credentials=True` with origins split from
 `CORS_ORIGINS` (`:43`). `.env.example:14` ships `CORS_ORIGINS=*`. Starlette does not expand a
 literal `"*"` here, so credentialed cross-origin requests fail rather than being permitted — and
 the example file steers deployments toward exactly that value.
 
-### 16.6 `/api/projects` performs no authorisation filtering
+### 16.3 `/api/projects` performs no authorisation filtering
 **Severity: medium.** `chat.py:265-277` — see §10.
 
-### 16.7 RBAC is fail-open
+### 16.4 RBAC is fail-open
 **Severity: medium.** `permissions.py:88`, `:113` — see §6.2.
 
-### 16.8 Auth bypass and default `JWT_SECRET`
+### 16.5 Auth bypass and default `JWT_SECRET`
 **Severity: medium.** `deps.py:34`, `chat.py:44`, `config.py:14` — see §4.2.
 
-### 16.9 Queue has no durability, retry, or dead-letter path
+### 16.6 Queue has no durability, retry, or dead-letter path
 **Severity: medium.** A plain Redis list (`producer.py:53-57`) on a volume-less container
 (`docker-compose.yml:17-22`). `BLPOP` removes the job before processing (`worker.py:278`), so a
 crash mid-`process_job` loses the write with no record beyond an audit row that is only written if
@@ -699,48 +686,38 @@ the exception was caught (`:235-252`), not if the process dies. No retry, no dea
 no job-state key — the `job_id` returned to the user (`tool_dispatch.py:98`) is stored nowhere and
 cannot be queried after the fact.
 
-### 16.10 OAuth access tokens are serialised into the queue
+### 16.7 OAuth access tokens are serialised into the queue
 **Severity: medium.** `WriteJobPayload` carries `google_access_token` as a plain field
 (`queue/schemas.py:11`), JSON-serialised into the Redis entry (`producer.py:48-57`) so the worker
 can rebuild a client (`worker.py:41`). Live user credentials sit in a Redis instance with no auth
 and port 6379 published to the host (`docker-compose.yml:20-21`) for as long as the job is queued.
 Inherent to the OAuth-only design plus the queue boundary; noted, not solved.
 
-### 16.11 Optimistic write result misleads the model
+### 16.8 Optimistic write result misleads the model
 **Severity: medium.** `dispatch_tool` returns `{"ok": true, "status": "queued"}` before Sheets is
 touched (`tool_dispatch.py:95-100`), and that is what the loop feeds back to the model
 (`agentic_loop.py:158`). The model therefore reports the write as done. The `queue_update` toast
 does eventually tell the truth (§5.1), but the chat transcript still contains a premature success
 claim. Fix: have the system prompt teach `status: "queued"` as pending, not complete.
 
-### 16.12 Silent 2001-row ceiling on every scan
-**Severity: low-medium.** `read.py:203`, `:274`, `:437` request `{start}:{start+2000}`. A tracker
+### 16.9 Silent 2001-row ceiling on every scan
+**Severity: low-medium.** `read.py:203`, `:274`, `:441` request `{start}:{start+2000}`. A tracker
 larger than that is silently truncated — `search_rows` reports fewer matches, `summarize`
 percentages are computed over a partial denominator, and `data_quality` scores a subset, all with
 no indication to the user.
 
-### 16.13 `summarize.blank_fields` silently falls back to column 0
-**Severity: low.** `read.py:349-351` — `id_idx` falls back to `0` when `primary_id_column` isn't
-found. If `primary_id_column` is missing or misnamed, the report returns values from whatever
-column happens to be first, labelled as IDs.
-
-### 16.14 Seven copies of the schema-shape branch
-**Severity: low (maintenance).** `read.py:14-17`, `write.py:23`, `:82`, `:193`, `worker.py:185`,
+### 16.10 Seven copies of the schema-shape branch
+**Severity: low (maintenance).** `read.py:14-17`, `write.py:23`, `:82`, `:193`, `worker.py:188`,
 `chat.py:222`, `agentic_loop.py:32-35`. Per-key defaults are similarly scattered.
 
-### 16.15 `add_row` reads arguments the model cannot supply
-**Severity: low.** `worker.py:178` reads `args.get("prefix")` and `:189` reads
-`args.get("ricefw_id")`, neither declared in the `add_row` schema (`tool_schemas.py:79-100`). Both
-always take their absent-value branch.
-
-### 16.16 Dead code
+### 16.11 Dead code
 **Severity: low.** `core/planner.py` and `core/memory.py` (never imported); `column_mapper.py:151`
 `build_column_map` and `:143` `get_column_map_json` (never called — §7.3); `audit.py:50`
 `log_audit`; `permissions.py:9` `WRITE_TOOLS`; `permissions.py:25-26` `is_admin()`;
 `meta.py:10` `_detect_header_row` (imported by `read.py:5`, called nowhere);
 `models/audit_log.py` `created_month` (no partitioning exists).
 
-### 16.17 Startup `init_db()` failure is non-fatal, and readiness doesn't fully cover it
+### 16.12 Startup `init_db()` failure is non-fatal, and readiness doesn't fully cover it
 **Severity: low.** `init_db()` failures are caught and execution continues (`main.py:26-28`).
 `GET /api/ready` (`health.py:16-47`, added in Phase 0) narrows this but does not close it: it runs
 a live `SELECT 1` (`health.py:28`), which succeeds against a reachable Postgres regardless of

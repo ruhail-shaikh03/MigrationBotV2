@@ -175,28 +175,28 @@ async def process_job(job_id: str, payload_dict: dict) -> None:
         elif tool == "add_row":
             from app.sheets.meta import next_ricefw_id
             module = args.get("module", "")
-            prefix = args.get("prefix")
             type_val = args.get("type", "")
             desc = args.get("description", "")
             assignee = args.get("assigned_to", "")
             fields = args.get("fields", {})
 
-            # 1. Dynamically compute the next RICEFW ID sequentially
+            # The add_row tool schema (tool_schemas.py) declares no ricefw_id/prefix
+            # property, so the model can never supply either — the ID is always
+            # computed here, sequentially, right before the write. That's deliberate:
+            # doing it server-side avoids the race a client-computed ID would hit
+            # under concurrent adds.
             tab_schema = schema_config.get("tabs", {}).get(payload.sheet_tab, {}) if "tabs" in schema_config else schema_config
             data_start_row = tab_schema.get("data_start_row", 3)
             primary_id_pos = tab_schema.get("primary_id_position", "B")
-            # In add_row, we auto-assign ID if not supplied
-            ricefw_id = args.get("ricefw_id")
-            if not ricefw_id:
-                ricefw_id = await next_ricefw_id(
-                    service=service,
-                    spreadsheet_id=payload.spreadsheet_id,
-                    sheet_name=payload.sheet_tab,
-                    module=module,
-                    prefix=prefix,
-                    data_start_row=data_start_row,
-                    primary_id_pos=primary_id_pos
-                )
+            ricefw_id = await next_ricefw_id(
+                service=service,
+                spreadsheet_id=payload.spreadsheet_id,
+                sheet_name=payload.sheet_tab,
+                module=module,
+                prefix=None,
+                data_start_row=data_start_row,
+                primary_id_pos=primary_id_pos
+            )
 
             res = await add_row(
                 service=service,

@@ -5,7 +5,7 @@ from unittest.mock import MagicMock, AsyncMock, patch
 from googleapiclient.errors import HttpError
 
 from app.sheets.retry import _with_retry
-from app.sheets.read import find_row_num, get_bulk_rows_raw, search_rows, summarize
+from app.sheets.read import find_row_num, get_bulk_rows_raw, search_rows, summarize, run_data_quality_check
 from app.queue.producer import enqueue_write_job
 from app.queue.worker import start_worker
 from app.queue.events import publish_queue_update, queue_events_channel
@@ -316,3 +316,63 @@ async def test_summarize_count_by_field_resolves_trailing_space_column():
     breakdown = {b["value"]: b["count"] for b in result["breakdown"]}
     assert breakdown["Ruhail"] == 2
     assert breakdown["Alex"] == 1
+
+
+# 11. Regression for TDD §16.2: summarize's overdue report must read
+# overdue_status_exclusions from args instead of a hard-coded status set.
+@pytest.mark.asyncio
+async def test_summarize_overdue_honors_status_exclusions_arg():
+    """Verify a caller-supplied exclusion list actually excludes a status from 'overdue'."""
+    mock_service = _mock_service_for_sheet(
+        headers_row=["RICEFW ID", "Module", "Dev Status", "Go-Live Date"],
+        data_rows=[
+            ["SD-001", "SD", "In Review", "01/01/2020"],
+            ["SD-002", "SD", "Not Started", "01/01/2020"],
+        ]
+    )
+
+    result = await summarize(
+        spreadsheet_id="sheet-123",
+        active_tab="SD",
+        args={"report_type": "overdue", "overdue_status_exclusions": ["In Review"]},
+        schema_config={"data_start_row": 3},
+        column_map={},
+        service=mock_service
+    )
+
+    assert result["ok"] is True
+    ids = [item["id"] for item in result["items"]]
+    assert "SD-001" not in ids
+    assert "SD-002" in ids
+
+
+# 12. Regression for TDD §16.1: data_quality must dispatch on check_type instead of always
+# running every check, and must honor scope_module and fields.
+@pytest.mark.asyncio
+async def test_data_quality_check_type_blank_fields_only():
+    """Verify check_type='blank_fields' runs only that check and skips DB-backed checks."""
+    mock_service = _mock_service_for_sheet(
+        headers_row=["RICEFW ID", "Module", "Dev Status"],
+        data_rows=[
+            ["SD-001", "SD", "Done"],
+            ["SD-002", "SD", ""],
+        ]
+    )
+    mock_db = AsyncMock()
+
+    result = await run_data_quality_check(
+        spreadsheet_id="sheet-123",
+        active_tab="SD",
+        args={"check_type": "blank_fields", "fields": ["Dev Status"]},
+        schema_config={"data_start_row": 3},
+        db_session=mock_db,
+        service=mock_service
+    )
+
+    assert result["ok"] is True
+    assert result["check_type"] == "blank_fields"
+    assert result["blank_field_counts"] == {"Dev Status": 1}
+    assert "alerts" not in result
+    assert "completeness_score" not in result
+    assert "stale_items" not in result
+    assert not mock_db.execute.called

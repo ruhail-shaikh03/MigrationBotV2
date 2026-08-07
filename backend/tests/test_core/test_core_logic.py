@@ -7,6 +7,7 @@ from app.core.llm_router import select_model
 from app.core.permissions import PermissionChecker
 from app.core import audit
 from app.core.agentic_loop import run_agentic_loop
+from app.core.data_quality import DataQualityChecker
 
 # Test cases below
 
@@ -219,5 +220,33 @@ async def test_audit_logger_nonblocking():
             exception_raised = False
         except Exception:
             exception_raised = True
-            
+
         assert exception_raised is False
+
+
+# 6. Regression for TDD §16.3: DataQualityChecker's assignee-column lookup used
+# `if not self._get_col_idx(...)` which treats a valid index 0 as "not found".
+def test_data_quality_checker_handles_assignee_at_column_zero():
+    """Verify a sheet whose assignee column is physically first (index 0) is not silently
+    swapped for a non-existent 'Assigned To' fallback."""
+    headers = ["Technical Resource ", "RICEFW ID", "Dev Status"]
+    rows = [
+        ["dev@example.com", "SD-001", "Completed"],
+        ["", "SD-002", "Completed"],
+    ]
+    schema = {
+        "assignee_column": "Technical Resource ",
+        "primary_id_column": "RICEFW ID",
+        "status_column": "Dev Status"
+    }
+    checker = DataQualityChecker(headers, rows, schema)
+
+    # completeness_score's default critical_fields must include the assignee column;
+    # if it were dropped (the bug), all remaining fields are filled and the score reads 100.0.
+    score = checker.completeness_score()
+    assert score == 83.3
+
+    # consistency_checks' unregistered-assignee rule must actually run against column 0.
+    alerts = checker.consistency_checks(valid_emails=["someone-else@example.com"])
+    messages = [a["message"] for a in alerts]
+    assert any("not registered in permissions" in m for m in messages)

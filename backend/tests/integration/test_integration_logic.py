@@ -179,6 +179,56 @@ async def test_worker_notifies_client_on_failure(db_session: AsyncSession):
     assert "Sheets API exploded" in notify["error"]
 
 
+async def test_add_row_ignores_client_supplied_id_and_uses_sequential_assignment(db_session: AsyncSession):
+    """Regression for TDD §16.15: add_row must always compute the RICEFW ID server-side via
+    next_ricefw_id. The tool schema never exposes ricefw_id/prefix to the model, so if either
+    sneaks into args (a bug, or a future unreviewed change), the worker must still ignore them
+    rather than silently honoring an unvalidated client-supplied ID."""
+    project = Project(
+        project_name="Add Row Project",
+        spreadsheet_id="spreadsheet-addrow-123",
+        default_tab="SD",
+        company_prefix="FF",
+        schema_config={"data_start_row": 3, "primary_id_position": "B"}
+    )
+    db_session.add(project)
+    await db_session.commit()
+
+    job_payload = {
+        "user_email": "adder@example.com",
+        "google_access_token": "mock-token-123",
+        "session_id": None,
+        "tool_name": "add_row",
+        "spreadsheet_id": project.spreadsheet_id,
+        "sheet_tab": "SD",
+        "args": {
+            "module": "SD",
+            "type": "R",
+            "description": "New report",
+            "ricefw_id": "SD-999",
+            "prefix": "ZZ",
+        },
+        "old_values": {}
+    }
+
+    mock_publish = AsyncMock()
+    with patch("app.queue.worker.build_sheets_service", return_value=MagicMock()), \
+         patch("app.sheets.meta.next_ricefw_id", AsyncMock(return_value="FF-SD-004")) as mock_next_id, \
+         patch("app.queue.worker.add_row", AsyncMock(return_value={"ok": True, "added": "FF-SD-004"})) as mock_add_row, \
+         patch("app.queue.worker.publish_queue_update", mock_publish):
+
+        await process_job("job-addrow-1", job_payload)
+
+    assert mock_next_id.called
+    assert mock_next_id.call_args.kwargs["prefix"] is None
+
+    assert mock_add_row.called
+    assert mock_add_row.call_args.kwargs["ricefw_id"] == "FF-SD-004"
+
+    assert mock_publish.called
+    assert mock_publish.call_args.kwargs["status"] == "completed"
+
+
 async def test_e2e_read_flow(db_session: AsyncSession):
     # 1. Initialize user, project, permission profiles
     user = User(
