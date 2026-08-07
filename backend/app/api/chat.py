@@ -17,6 +17,8 @@ from app.core.permissions import get_user_permissions
 from app.core.agentic_loop import run_agentic_loop
 from app.core.column_mapper import COLUMN_ALIASES
 from app.queue.events import queue_events_channel
+from app.sheets.client import build_sheets_service
+from app.sheets.meta import switch_module
 from app.config import settings
 from openai import AsyncOpenAI
 from jose import jwt, JWTError
@@ -188,15 +190,62 @@ async def websocket_chat_endpoint(
             data = await websocket.receive_text()
             try:
                 packet = json.loads(data)
-                user_msg = packet.get("content", "").strip()
             except Exception:
-                user_msg = data.strip()
+                packet = {"type": "message", "content": data.strip()}
 
-            if not user_msg:
+            # Route on the frame's declared type instead of only ever reading `content` —
+            # previously a {"type": "ping"} heartbeat yielded content="" and fell through
+            # to the empty-message guard below, so `pong` only fired if a user literally
+            # typed the word "ping" into the chat box.
+            packet_type = packet.get("type", "message")
+
+            if packet_type == "ping":
+                await websocket.send_json({"type": "pong"})
                 continue
 
-            if user_msg.lower() == "ping":
-                await websocket.send_json({"type": "pong"})
+            if packet_type == "switch_tab":
+                tab_name = str(packet.get("tab_name", "")).strip()
+                if not tab_name:
+                    await websocket.send_json({"type": "error", "message": "switch_tab requires a non-empty tab_name."})
+                    continue
+
+                async with AsyncSessionLocal() as fresh_db:
+                    stmt_sess = select(UserSession).where(UserSession.id == user_sess.id)
+                    sess_res = await fresh_db.execute(stmt_sess)
+                    current_sess = sess_res.scalar_one()
+
+                    stmt_proj = select(Project).where(Project.id == current_sess.project_id)
+                    proj_res = await fresh_db.execute(stmt_proj)
+                    current_project = proj_res.scalar_one()
+
+                    checker = await get_user_permissions(fresh_db, user.email, current_project.id)
+                    allowed, reason = checker.can_execute("switch_module", {})
+                    if not allowed:
+                        await websocket.send_json({"type": "error", "message": f"Permission denied: {reason}"})
+                        continue
+
+                    service = build_sheets_service(google_access_token)
+                    result = await switch_module(
+                        spreadsheet_id=current_project.spreadsheet_id,
+                        tab_name=tab_name,
+                        db=fresh_db,
+                        user_email=user.email,
+                        session_id=current_sess.id,
+                        service=service
+                    )
+
+                if result.get("ok"):
+                    await websocket.send_json({"type": "tab_switched", "active_tab": result["active_tab"]})
+                else:
+                    await websocket.send_json({"type": "error", "message": result.get("error", "Failed to switch tab.")})
+                continue
+
+            if packet_type != "message":
+                # Unrecognised control frame type — ignore rather than misinterpret as chat text.
+                continue
+
+            user_msg = packet.get("content", "").strip()
+            if not user_msg:
                 continue
 
             logger.info(f"Received message from {user.email}: '{user_msg}'")

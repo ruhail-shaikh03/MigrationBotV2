@@ -31,7 +31,7 @@ export default function ChatPage() {
   const { 
     projects, setProjects,
     activeProject, setActiveProject,
-    activeTab, setActiveTab,
+    activeTab,
     messages, setMessages,
     isConnected, clearChat
   } = useChatStore()
@@ -40,7 +40,7 @@ export default function ChatPage() {
   const googleToken = (session as any)?.googleAccessToken || null
 
   // Instantiate WebSocket
-  const { sendMessage } = useWebSocket(apiToken, activeProject?.id || null)
+  const { sendMessage, switchTab } = useWebSocket(apiToken, activeProject?.id || null)
 
   // Fetch user profile to check admin status dynamically
   useEffect(() => {
@@ -141,12 +141,13 @@ export default function ChatPage() {
     setInput("")
   }
 
-  // Switch Module Tab in Agent Context
+  // Switch Module Tab — sent as an explicit control frame, not a chat message routed
+  // through the LLM. The tab highlight updates only once the server confirms with a
+  // "tab_switched" frame (handled in useWebSocket.ts), not optimistically here, so it
+  // can't drift out of sync with sessions.active_tab if the switch fails.
   const handleTabChange = (tabName: string) => {
     if (!isConnected) return
-    setActiveTab(tabName)
-    // Send a command to the LLM agent to invoke switch_module
-    sendMessage(`Switch active module to ${tabName}`)
+    switchTab(tabName)
   }
 
   if (status === "loading" || !session) {

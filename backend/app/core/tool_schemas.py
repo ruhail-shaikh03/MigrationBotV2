@@ -435,7 +435,7 @@ RULES:
     completion_rate. For "who has the most items?" use count_by_field on
     Assigned To with scope_module omitted.
 11. Never call bulk_update without confirming the target set of rows in your
-    reply. State "Updated X rows" in the confirmation sentence.
+    reply.
 12. CROSS-MODULE — If the request (or the RICEFW ID) belongs to a different module
     than the active tab, call switch_module(tab_name) first, then proceed with data
     operations. Tab name = module code. Use the exact tab name from the
@@ -447,6 +447,12 @@ RULES:
     Use check_type="consistency" for "any contradictions" or "logic errors".
     Use check_type="stale" for "items with no recent activity".
     Use check_type="completeness_score" for "how complete is our data?".
+14. WRITES ARE ASYNCHRONOUS — update_cell, bulk_update, add_row, and format_row all
+    return {{"status": "queued", ...}} the instant the request is accepted, before the
+    change has actually reached the spreadsheet. NEVER say "Updated", "Done", "Set",
+    or otherwise imply a write already succeeded. Phrase it as pending — e.g. "Queued
+    an update for SD-045's Dev Status to Done." The user is notified separately once
+    the write actually completes or fails; you do not report that outcome yourself.
 
 Column reference guide:
 {column_map_json}
