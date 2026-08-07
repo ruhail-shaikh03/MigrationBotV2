@@ -7,12 +7,14 @@ from app.models.project import Project
 from app.models.permission import Permission
 from app.models.audit_log import AuditLog
 from app.models.session import Session
+from tests.conftest import require_test_database
 
 # Mark all tests in this file as async
 pytestmark = pytest.mark.asyncio
 
 @pytest.fixture(autouse=True)
 async def setup_test_db():
+    require_test_database()
     # Setup: Create all tables before tests run
     # Drop first to ensure a clean state if a previous run crashed
     try:

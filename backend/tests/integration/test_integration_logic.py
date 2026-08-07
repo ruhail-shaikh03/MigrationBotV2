@@ -15,11 +15,13 @@ from app.queue.producer import enqueue_write_job
 from app.queue.worker import process_job
 from app.core.agentic_loop import run_agentic_loop
 from app.core.permissions import PermissionChecker
+from tests.conftest import require_test_database
 
 pytestmark = pytest.mark.asyncio
 
 @pytest.fixture(autouse=True)
 async def setup_integration_db():
+    require_test_database()
     # Setup test database tables before each test and teardown after
     try:
         await drop_db()
