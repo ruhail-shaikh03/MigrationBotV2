@@ -1,5 +1,5 @@
 import logging
-from typing import List, Optional, Any
+from typing import List, Dict, Optional, Any
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from app.models.session import Session as UserSession
@@ -60,6 +60,24 @@ async def get_all_ids(service: Any, spreadsheet_id: str, sheet_name: str, data_s
         range=f"{sheet_name}!{col}{data_start_row}:{col}"
     ).execute())
     return [str(r[0]).strip() for r in result.get("values", []) if r and str(r[0]).strip()]
+
+
+async def get_id_row_map(service: Any, spreadsheet_id: str, sheet_name: str, data_start_row: int, primary_id_pos: str = "B") -> Dict[str, int]:
+    """Scans the ID column once and returns {RICEFW_ID (stripped, uppercased): row_num}.
+    find_row_num does the same scan but for a single ID and throws the result away —
+    called once per target ID from a bulk op, that was ~N full-column scans for N
+    IDs. Callers resolving multiple IDs in the same operation (bulk_update,
+    get_bulk_rows_raw) should scan once here and look up row numbers in memory."""
+    col = primary_id_pos or "B"
+    result = await _with_retry(lambda: service.spreadsheets().values().get(
+        spreadsheetId=spreadsheet_id,
+        range=f"{sheet_name}!{col}{data_start_row}:{col}"
+    ).execute())
+    id_map: Dict[str, int] = {}
+    for i, row in enumerate(result.get("values", [])):
+        if row and str(row[0]).strip():
+            id_map[str(row[0]).strip().upper()] = data_start_row + i
+    return id_map
 
 
 async def detect_prefix(service: Any, spreadsheet_id: str, sheet_name: str, data_start_row: int, primary_id_pos: str = "B") -> str:

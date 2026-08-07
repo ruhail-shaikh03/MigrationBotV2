@@ -242,11 +242,11 @@ empty per connection and reassigned each turn — nothing persists chat history.
 | 7 | `dispatch_tool` | `agentic_loop.py:run_agentic_loop` → `tool_dispatch.py:dispatch_tool` | routes by tool name |
 | 8 | `build_sheets_service` | `tool_dispatch.py:dispatch_tool` | client built **with no refresh token** |
 | 9 | `get_row_raw` | `tool_dispatch.py:dispatch_tool` → `read.py:get_row_raw` | pre-reads old values **live from Sheets** for the audit trail |
-| 10 | `enqueue_write_job` | `tool_dispatch.py:dispatch_tool` → `producer.py:enqueue_write_job` | `RPUSH` onto `migrationbot:write_queue` |
+| 10 | `enqueue_write_job` | `tool_dispatch.py:dispatch_tool` → `producer.py:enqueue_write_job` | `RPUSH` onto `migrationbot:write_queue`, then sets a job-state key (below) |
 | 11 | return | `tool_dispatch.py:dispatch_tool` | `{ok: true, status: "queued", job_id}` — **optimistic**, before Sheets is touched |
 | 12 | `send_websocket_msg` | `agentic_loop.py:run_agentic_loop` | emits `tool_result` with that optimistic payload |
 | — | *process boundary* | | |
-| 13 | `start_worker` | `worker.py:start_worker` | `BLPOP`, 10 s timeout |
+| 13 | `start_worker` | `worker.py:start_worker` | `BLMOVE write_queue → write_queue:processing`, 10 s timeout (§5.3) |
 | 14 | `process_job` | `worker.py:process_job` | rehydrates `WriteJobPayload` |
 | 15 | project lookup | `worker.py:process_job` | re-reads `schema_config` from Postgres |
 | 16 | `build_sheets_service` | `worker.py:process_job` | rebuilds client from the token in the job |
@@ -272,7 +272,38 @@ helper).
 `update_cell` returns `{"ok": True, ...}` unconditionally once `batchUpdate` returns
 (`write.py:update_cell`) — the API response body is not inspected.
 
-### 5.2 Read path — `search_rows`
+### 5.2 Queue durability and job-state
+
+Added in Phase 5, closing the gap where `BLPOP` removed a job from the queue on pickup with
+nothing recording it existed if the worker died before finishing — a crash mid-`process_job` lost
+the write silently, leaving only an audit row if the exception happened to be caught.
+
+- **Atomic pickup**: `worker.py:start_worker` uses `BLMOVE` instead of `BLPOP` — it blocks like
+  `BLPOP` but atomically relocates the job into `migrationbot:write_queue:processing`
+  (`worker.py:PROCESSING_KEY`) rather than just removing it. A clean pass through `process_job`
+  (success **or** a recorded business failure — both are terminal, correctly-audited outcomes)
+  removes it from there via `LREM`. Anything left in `PROCESSING_KEY` didn't reach a clean
+  completion.
+- **Recovery on startup**: `worker.py:recover_stale_jobs` runs once before the main loop starts.
+  Anything still in `PROCESSING_KEY` — left by a crash, OOM kill, or forced container restart —
+  gets its `attempt` counter incremented and is re-queued onto `migrationbot:write_queue`, up to
+  `worker.py:MAX_ATTEMPTS` (3). This lines up with the deployment model: `worker` has
+  `restart: unless-stopped` (`docker-compose.yml`), so a crash triggers a container restart, which
+  triggers this recovery scan automatically.
+- **Dead-letter path**: past `MAX_ATTEMPTS`, the job goes to `migrationbot:write_queue:dead_letter`
+  (`worker.py:DEAD_LETTER_KEY`) instead of being retried forever, and `events.py:publish_queue_update`
+  fires a `"failed"` `queue_update` so the user learns the write didn't go through rather than
+  waiting on it indefinitely.
+- **Job-state key**: `migrationbot:job_state:<job_id>` (`queue/schemas.py:JOB_STATE_PREFIX`,
+  7-day TTL) is set to `"queued"` at enqueue time (`producer.py:enqueue_write_job`) and updated
+  through `"processing"` → `"done"` (or `"error"`, if picked up but not cleanly finished — see
+  above) by `worker.py:_set_job_state`. `GET /api/jobs/{job_id}` (`api/jobs.py:get_job_status`,
+  §10) makes the `job_id` already returned to the caller (`tool_dispatch.py:dispatch_tool`)
+  queryable after the fact — previously it was returned once and then went nowhere. Scoped to the
+  job's own `user_email` or a config admin; a mismatch 404s rather than 403s, so a job's existence
+  isn't confirmable to a caller who doesn't own it.
+
+### 5.3 Read path — `search_rows`
 
 | # | Function | Location | Action |
 |---|---|---|---|
@@ -283,13 +314,14 @@ helper).
 | 11 | `col_idx` build | `read.py:search_rows` | `{h.lower().strip(): i}` — normalised on both sides, fixed in Phase 1 (§16 history) |
 | 12 | `resolve_column` | `read.py:search_rows` | maps each filter term to a canonical name |
 | 13 | mapping guard | `read.py:search_rows` | normalised canonical not in `col_idx` → returns `{"ok": false, "error": ...}` |
-| 14 | bulk fetch | `read.py:search_rows` | **API call 2** — `{tab}!{start}:{start+2000}` |
+| 14 | bulk fetch | `read.py:search_rows` → `read.py:_fetch_all_rows` | **API calls 2+** — paginated `page_size`-row (default 2000) chunks until a short page ends the scan (§11) |
 | 15 | matching | `read.py:search_rows` | AND across filters; `blank` / `contains` / `exact` |
-| 16 | truncation | `read.py:search_rows` | stops at `limit`; reports `capped` |
+| 16 | truncation | `read.py:search_rows` | stops at `limit`; reports `capped` and (separately) `truncated` |
 
-Two Sheets API calls per search, and no cache — every `search_rows`, `summarize`, and
-`data_quality` invocation re-reads up to 2001 rows from Google (`read.py:search_rows`,
-`read.py:summarize`, `read.py:run_data_quality_check` — each has its own bulk-range fetch).
+At least two Sheets API calls per search, and no cache — every `search_rows`, `summarize`, and
+`data_quality` invocation re-reads the whole tracker from Google on every request
+(`read.py:search_rows`, `read.py:summarize`, `read.py:run_data_quality_check` — each calls
+`read.py:_fetch_all_rows`, §11).
 
 ---
 
@@ -503,8 +535,11 @@ Non-admin: `GET /api/health` (`health.py:health_check`, liveness — static lite
 probing), `GET /api/ready` (`health.py:readiness_check`, added in Phase 0 of the remediation plan
 — live `SELECT 1` against Postgres and `PING` against the shared `producer.redis_client`, `503`
 with a per-service `detail` dict when either fails; verified against unreachable dependencies),
-`GET /api/me` (`api/auth.py:get_current_profile`, mounted directly in `main.py`), and
-`GET /api/projects` (`chat.py:list_user_projects`).
+`GET /api/me` (`api/auth.py:get_current_profile`, mounted directly in `main.py`),
+`GET /api/projects` (`chat.py:list_user_projects`), and `GET /api/jobs/{job_id}`
+(`api/jobs.py:get_job_status`, added Phase 5 — queries the job-state key a write job's `job_id`
+maps to, §5.2; scoped to the job's own `user_email` or a config admin, 404 rather than 403 on a
+mismatch).
 
 `docker-compose.yml`'s `backend` service now runs a `healthcheck` against `/api/ready` (interval
 30 s, 3 retries, `start_period` 15 s) — see §3.
@@ -533,13 +568,15 @@ errors propagate.
 | `get_header_row` | `meta.py:get_header_row` | 1 — strips every cell |
 | `get_sheet_id` | `meta.py:get_sheet_id` | 1 |
 | `find_row_num` | `read.py:find_row_num` | 1 — full ID-column scan |
+| `get_id_row_map` | `meta.py:get_id_row_map` | 1 — full ID-column scan, resolves every ID in one pass |
 | `get_row` | `read.py:get_row` | 3 — `find_row_num` + row fetch + headers |
-| `get_row_raw` | `read.py:get_row_raw` | 3 — same shape |
-| `search_rows` | `read.py:search_rows` | 2 — headers + ≤2001 rows |
-| `summarize` | `read.py:summarize` | 2 |
-| `run_data_quality_check` | `read.py:run_data_quality_check` | 2 (+1 or +2 for `consistency`/`stale` DB reads) |
+| `get_row_raw` | `read.py:get_row_raw` | 3 — same shape (still per-ID; only ever called for a single ID) |
+| `get_bulk_rows_raw` | `read.py:get_bulk_rows_raw` | 2 + 1 `batchGet` — headers, one `get_id_row_map` scan, one `batchGet` covering every resolved row |
+| `search_rows` | `read.py:search_rows` | 1 + ⌈rows / 2000⌉ — headers + paginated (`read.py:_fetch_all_rows`) |
+| `summarize` | `read.py:summarize` | same shape as `search_rows` |
+| `run_data_quality_check` | `read.py:run_data_quality_check` | same shape (+1 or +2 for `consistency`/`stale` DB reads) |
 | `update_cell` | `write.py:update_cell` | 3 — `find_row_num` + headers + one `batchUpdate` |
-| `bulk_update` | `write.py:bulk_update` | 2 + **one `find_row_num` per target ID** |
+| `bulk_update` | `write.py:bulk_update` | 2 + one `get_id_row_map` scan (not one `find_row_num` per target ID) |
 | `add_row` | `write.py:add_row` | 1 + headers, `values().append` |
 | `format_row` | `format.py:format_row` | `spreadsheets().batchUpdate` `repeatCell` |
 
@@ -547,11 +584,21 @@ errors propagate.
 `switch_module` (`meta.py:switch_module`) optionally verifies the tab exists then updates
 `sessions.active_tab`.
 
-> **⚠ Compounding read cost on bulk paths.** `get_bulk_rows_raw` (`read.py:get_bulk_rows_raw`)
-> calls `get_row_raw` once per target ID, and each of those is three Sheets calls — so the audit
-> pre-read alone costs ~3N calls, before `bulk_update` then spends another N on `find_row_num`
-> (`write.py:bulk_update`). A 50-row bulk update is on the order of 200 API calls against a
-> quota-limited endpoint, throttled at one job/second by the worker.
+`get_bulk_rows_raw` (`read.py:get_bulk_rows_raw`) previously called `get_row_raw` once per target
+ID — three Sheets calls apiece (a full ID-column scan via `find_row_num`, the row fetch, a header
+re-fetch) — so the audit pre-read alone cost ~3N calls, and `bulk_update`
+(`write.py:bulk_update`) separately spent another N on its own per-ID `find_row_num`. A 50-row
+bulk update was on the order of 200 API calls against a quota-limited endpoint. Both paths now
+share `meta.py:get_id_row_map`, which scans the ID column once and resolves every target ID from
+that one pass; `get_bulk_rows_raw` fetches all resolved rows in a single `batchGet` rather than one
+`get()` per row. The same 50-row bulk update is now on the order of 5 calls total, regardless of N.
+
+`search_rows`/`summarize`/`run_data_quality_check` no longer request a single fixed
+`{start}:{start+2000}` window — `read.py:_fetch_all_rows` pages through `page_size`-row (default
+2000) chunks until a short page signals the end of data, so a tracker larger than one page is no
+longer silently truncated (§16 history). A `_MAX_SCAN_ROWS` (`read.py:_MAX_SCAN_ROWS`, 20000)
+safety valve stops pagination and sets a `truncated: true` field in the response if a
+misconfigured schema somehow never yields a short page — no real tracker should reach it.
 
 ---
 
@@ -592,8 +639,9 @@ columns through `_get_col_idx`.
 
 All four are methods on `core/data_quality.py:DataQualityChecker`.
 
-`run_data_quality_check` (`read.py:run_data_quality_check`) reads headers and ≤2001 rows live,
-then dispatches on the **required** `check_type` arg (`blank_fields` / `consistency` / `stale` /
+`run_data_quality_check` (`read.py:run_data_quality_check`) reads headers and the whole tracker
+live (paginated, §11), then dispatches on the **required** `check_type` arg (`blank_fields` /
+`consistency` / `stale` /
 `completeness_score` / `all`) rather than always running every check — each branch only does the
 work (and, for `consistency`/`stale`, the DB queries) its check needs. `scope_module` filters
 `rows` to one module before the checker is built; `blank_fields` reads `fields` from args (default:
@@ -717,16 +765,7 @@ Ordered by severity. Items marked **(verified)** were reproduced by executing co
 by the remediation plan are removed from this list, not annotated — see git history for what
 changed and when.
 
-### 16.1 Queue has no durability, retry, or dead-letter path
-**Severity: medium.** A plain Redis list (`producer.py:enqueue_write_job`) on a volume-less
-container (`docker-compose.yml`, `redis` service). `BLPOP` removes the job before processing
-(`worker.py:start_worker`), so a crash mid-`process_job` loses the write with no record beyond an
-audit row that is only written if the exception was caught (`worker.py:process_job`, the
-top-level `except`), not if the process dies. No retry, no dead-letter list, and no job-state key
-— the `job_id` returned to the user (`tool_dispatch.py:dispatch_tool`) is stored nowhere and
-cannot be queried after the fact.
-
-### 16.2 OAuth tokens are serialised into the queue
+### 16.1 OAuth tokens are serialised into the queue
 **Severity: medium.** `WriteJobPayload` (`queue/schemas.py:WriteJobPayload`) carries
 `google_access_token` **and, since Phase 4, `google_refresh_token`** as plain fields,
 JSON-serialised into the Redis entry (`producer.py:enqueue_write_job`) so the worker can rebuild a
@@ -739,20 +778,13 @@ writes dying whenever the access token expires before the worker gets to them) w
 does widen what's exposed here, and a token-reference indirection (store tokens server-side, pass
 the queue only an opaque reference) remains the real fix, not attempted here.
 
-### 16.3 Silent 2001-row ceiling on every scan
-**Severity: low-medium.** `read.py:search_rows`, `read.py:summarize`, and
-`read.py:run_data_quality_check` each request `{start}:{start+2000}`. A tracker larger than that
-is silently truncated — `search_rows` reports fewer matches, `summarize` percentages are computed
-over a partial denominator, and `data_quality` scores a subset, all with no indication to the
-user.
-
-### 16.4 Seven copies of the schema-shape branch
+### 16.2 Seven copies of the schema-shape branch
 **Severity: low (maintenance).** `read.py:_get_tab_schema`, `write.py:update_cell`,
 `write.py:bulk_update`, `write.py:add_row`, `worker.py:process_job`,
 `chat.py:websocket_chat_endpoint`, `agentic_loop.py:run_agentic_loop`. Per-key defaults are
 similarly scattered.
 
-### 16.5 Dead code
+### 16.3 Dead code
 **Severity: low.** `core/planner.py` and `core/memory.py` (never imported);
 `column_mapper.py:build_column_map` and `column_mapper.py:get_column_map_json` (never called —
 §7.3); `audit.py:log_audit`; `permissions.py:WRITE_TOOLS`; `permissions.py:PermissionChecker.is_admin`;
@@ -760,7 +792,7 @@ similarly scattered.
 in `read.py`, was itself dead and has been removed); `models/audit_log.py:AuditLog.created_month`
 (no partitioning exists).
 
-### 16.6 Startup `init_db()` failure is non-fatal, and readiness doesn't fully cover it
+### 16.4 Startup `init_db()` failure is non-fatal, and readiness doesn't fully cover it
 **Severity: low.** `init_db()` failures are caught and execution continues
 (`main.py:lifespan`). `GET /api/ready` (`health.py:readiness_check`, added in Phase 0) narrows
 this but does not close it: it runs a live `SELECT 1`, which succeeds against a reachable Postgres

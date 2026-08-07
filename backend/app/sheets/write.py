@@ -1,7 +1,7 @@
 import logging
 from typing import List, Any, Optional
 from app.sheets.retry import _with_retry
-from app.sheets.meta import get_header_row
+from app.sheets.meta import get_header_row, get_id_row_map
 from app.sheets.read import find_row_num, idx_to_col_letter, search_rows
 from app.core.column_mapper import resolve_column
 
@@ -117,14 +117,17 @@ async def bulk_update(
     if not target_ids:
         return {"ok": True, "updated": 0, "message": "No matching target objects found for update."}
 
-    # Resolve all row coordinates
+    # Resolve all row coordinates from one ID-column scan instead of one
+    # find_row_num call (its own full-column scan) per target ID.
+    id_row_map = await get_id_row_map(service, spreadsheet_id, sheet_tab, data_start_row, primary_id_pos)
+
     data_items = []
     not_found = []
-    
+
     col_letter = idx_to_col_letter(set_col_idx)
 
     for rid in target_ids:
-        row_num = await find_row_num(service, spreadsheet_id, sheet_tab, rid, data_start_row, primary_id_pos)
+        row_num = id_row_map.get(rid.strip().upper())
         if row_num is None:
             not_found.append({"id": rid, "error": "Not found in sheet"})
             continue

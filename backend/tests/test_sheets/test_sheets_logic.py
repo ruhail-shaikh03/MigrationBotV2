@@ -7,7 +7,7 @@ from googleapiclient.errors import HttpError
 from app.sheets.retry import _with_retry
 from app.sheets.read import find_row_num, get_bulk_rows_raw, search_rows, summarize, run_data_quality_check
 from app.queue.producer import enqueue_write_job
-from app.queue.worker import start_worker
+from app.queue.worker import start_worker, recover_stale_jobs, QUEUE_KEY, PROCESSING_KEY, DEAD_LETTER_KEY, MAX_ATTEMPTS
 from app.queue.events import publish_queue_update, queue_events_channel
 
 # 1. Test transient rate-limiting retry backoff
@@ -100,7 +100,9 @@ async def test_write_job_enqueuing():
 async def test_worker_throttling():
     """Verify that background worker enforces a rate limit sleep between queue events."""
     mock_redis = AsyncMock()
-    
+    mock_redis.get.return_value = None   # no existing job-state for _set_job_state to merge into
+    mock_redis.lpop.return_value = None  # recover_stale_jobs: processing list starts empty
+
     call_count = 0
     job_envelope = {
         "job_id": "job-123",
@@ -115,30 +117,33 @@ async def test_worker_throttling():
             "old_values": {}
         }
     }
-    
-    async def mock_blpop(key, timeout):
+
+    async def mock_blmove(*args, **kwargs):
         nonlocal call_count
         call_count += 1
         if call_count == 1:
-            return (key, json.dumps(job_envelope))
+            return json.dumps(job_envelope)
         else:
             raise asyncio.CancelledError("Stop loop")
-            
-    mock_redis.blpop.side_effect = mock_blpop
-    
+
+    mock_redis.blmove.side_effect = mock_blmove
+
     # Patch process_job and asyncio.sleep to run instantly but track calls
     with patch("app.queue.worker.process_job", AsyncMock()) as mock_process, \
          patch("app.queue.worker.aioredis.from_url", return_value=mock_redis), \
          patch("asyncio.sleep", AsyncMock()) as mock_sleep:
-         
+
         try:
             await start_worker()
         except asyncio.CancelledError:
             pass
-            
+
         # Verify that sleep(1.0) was executed after job run
         mock_sleep.assert_called_with(1.0)
         assert mock_process.called
+        # A clean pass (process_job didn't raise) must remove the job from the
+        # processing list it was BLMOVE'd into on pickup.
+        assert mock_redis.lrem.called
 
 
 # 5. Test queue_update event payload shape published back to the client
@@ -405,3 +410,230 @@ async def test_write_job_carries_refresh_token():
     payload_dict = json.loads(raw_payload)
     assert payload_dict["payload"]["google_access_token"] == "access-tok"
     assert payload_dict["payload"]["google_refresh_token"] == "refresh-tok"
+
+
+# 14. Regression for TDD §16.1: a job left in the processing list by a worker that
+# crashed mid-job (BLMOVE puts it there atomically on pickup) must be requeued, not
+# lost, as long as it hasn't exceeded MAX_ATTEMPTS.
+@pytest.mark.asyncio
+async def test_recover_stale_jobs_requeues_under_max_attempts():
+    mock_redis = AsyncMock()
+    stale_envelope = {
+        "job_id": "job-stale-1",
+        "attempt": 0,
+        "payload": {"user_email": "a@b.com", "tool_name": "update_cell", "args": {}, "session_id": None}
+    }
+    mock_redis.lpop.side_effect = [json.dumps(stale_envelope), None]
+
+    recovered = await recover_stale_jobs(mock_redis)
+
+    assert recovered == 1
+    rpush_calls = [c for c in mock_redis.rpush.call_args_list if c[0][0] == QUEUE_KEY]
+    assert len(rpush_calls) == 1
+    requeued = json.loads(rpush_calls[0][0][1])
+    assert requeued["job_id"] == "job-stale-1"
+    assert requeued["attempt"] == 1  # incremented from 0
+
+
+# 15. Same recovery path, but past MAX_ATTEMPTS: must dead-letter and notify the
+# user instead of retrying forever or silently dropping the write.
+@pytest.mark.asyncio
+async def test_recover_stale_jobs_dead_letters_past_max_attempts():
+    mock_redis = AsyncMock()
+    stale_envelope = {
+        "job_id": "job-stale-2",
+        "attempt": MAX_ATTEMPTS,  # one more crash pushes it over the limit
+        "payload": {"user_email": "a@b.com", "tool_name": "update_cell", "args": {}, "session_id": None}
+    }
+    mock_redis.lpop.side_effect = [json.dumps(stale_envelope), None]
+
+    with patch("app.queue.worker.publish_queue_update", AsyncMock()) as mock_publish:
+        recovered = await recover_stale_jobs(mock_redis)
+
+    assert recovered == 1
+    dead_letter_calls = [c for c in mock_redis.rpush.call_args_list if c[0][0] == DEAD_LETTER_KEY]
+    assert len(dead_letter_calls) == 1
+    queue_calls = [c for c in mock_redis.rpush.call_args_list if c[0][0] == QUEUE_KEY]
+    assert len(queue_calls) == 0  # must NOT go back onto the live queue
+
+    assert mock_publish.called
+    assert mock_publish.call_args.kwargs["status"] == "failed"
+    assert mock_publish.call_args.kwargs["job_id"] == "job-stale-2"
+
+
+# 16. Regression: the job_id dispatch_tool returns to the caller must be queryable
+# immediately at enqueue time, not just after the worker eventually picks it up.
+@pytest.mark.asyncio
+async def test_enqueue_write_job_sets_initial_job_state():
+    from app.queue.schemas import JOB_STATE_PREFIX
+
+    mock_redis = AsyncMock()
+    with patch("app.queue.producer.redis_client", mock_redis):
+        job = await enqueue_write_job(
+            user_email="test@example.com",
+            google_access_token="tok",
+            session_id=None,
+            tool_name="update_cell",
+            spreadsheet_id="sheet-123",
+            sheet_tab="SD",
+            args={},
+            old_values={}
+        )
+
+    state_calls = [c for c in mock_redis.set.call_args_list if c[0][0] == f"{JOB_STATE_PREFIX}:{job.id}"]
+    assert len(state_calls) == 1
+    state = json.loads(state_calls[0][0][1])
+    assert state["status"] == "queued"
+    assert state["user_email"] == "test@example.com"
+    assert state["job_id"] == job.id
+
+
+# 17. Regression for TDD §16.3: a tracker larger than one page must not be silently
+# truncated — previously search_rows/summarize/data_quality each did a single fixed
+# `{start}:{start+2000}` fetch. page_size is dialed down to keep the fixture small
+# while still exercising real multi-page pagination and aggregation.
+@pytest.mark.asyncio
+async def test_fetch_all_rows_paginates_past_a_single_page():
+    from app.sheets.read import _fetch_all_rows
+
+    pages = [
+        [["r1"], ["r2"]],
+        [["r3"], ["r4"]],
+        [["r5"]],  # shorter than page_size — signals end of data
+    ]
+    mock_service = MagicMock()
+    call_count = 0
+
+    def mock_get(spreadsheetId, range):
+        nonlocal call_count
+        mock_exec = MagicMock()
+        page = pages[call_count] if call_count < len(pages) else []
+        call_count += 1
+        mock_exec.execute.return_value = {"values": page}
+        return mock_exec
+
+    mock_service.spreadsheets.return_value.values.return_value.get.side_effect = mock_get
+
+    rows, truncated = await _fetch_all_rows(mock_service, "sheet-123", "SD", data_start_row=3, page_size=2)
+
+    assert truncated is False
+    assert rows == [["r1"], ["r2"], ["r3"], ["r4"], ["r5"]]
+    assert call_count == 3
+
+
+# 18. The pagination safety valve must stop and report truncated=True rather than
+# looping forever if a misconfigured schema causes rows to never run out.
+@pytest.mark.asyncio
+async def test_fetch_all_rows_respects_safety_cap():
+    from app.sheets import read as read_module
+
+    mock_service = MagicMock()
+
+    def mock_get(spreadsheetId, range):
+        mock_exec = MagicMock()
+        # Always a full page — simulates data that never yields a short "end" page.
+        mock_exec.execute.return_value = {"values": [["r"], ["r"]]}
+        return mock_exec
+
+    mock_service.spreadsheets.return_value.values.return_value.get.side_effect = mock_get
+
+    with patch.object(read_module, "_MAX_SCAN_ROWS", 5):
+        rows, truncated = await read_module._fetch_all_rows(
+            mock_service, "sheet-123", "SD", data_start_row=3, page_size=2
+        )
+
+    assert truncated is True
+    assert len(rows) == 5
+
+
+# 19. Regression for the §11 bulk-read-cost callout: resolving N target IDs' current
+# values must cost a small constant number of Sheets calls (one ID-column scan, one
+# header fetch, one batchGet), not ~3 calls per ID.
+@pytest.mark.asyncio
+async def test_get_bulk_rows_raw_uses_one_batch_get_for_n_targets():
+    mock_service = MagicMock()
+    get_call_count = 0
+    batch_get_call_count = 0
+
+    headers_row = ["RICEFW ID", "Dev Status"]
+    id_column_rows = [["SD-001"], ["SD-002"], ["SD-003"]]  # rows 3, 4, 5
+
+    def mock_get(spreadsheetId, range):
+        nonlocal get_call_count
+        get_call_count += 1
+        mock_exec = MagicMock()
+        if range == "SD!2:2":
+            mock_exec.execute.return_value = {"values": [headers_row]}
+        elif range == "SD!B3:B":
+            mock_exec.execute.return_value = {"values": id_column_rows}
+        else:
+            mock_exec.execute.return_value = {"values": []}
+        return mock_exec
+
+    def mock_batch_get(spreadsheetId, ranges):
+        nonlocal batch_get_call_count
+        batch_get_call_count += 1
+        mock_exec = MagicMock()
+        mock_exec.execute.return_value = {
+            "valueRanges": [
+                {"values": [["SD-001", "Done"]]},
+                {"values": [["SD-002", "In Progress"]]},
+            ]
+        }
+        return mock_exec
+
+    mock_service.spreadsheets.return_value.values.return_value.get.side_effect = mock_get
+    mock_service.spreadsheets.return_value.values.return_value.batchGet.side_effect = mock_batch_get
+
+    result = await get_bulk_rows_raw(
+        spreadsheet_id="sheet-123",
+        active_tab="SD",
+        args={"ricefw_ids": ["SD-001", "SD-002"], "set_field": "Dev Status"},
+        schema_config={"data_start_row": 3, "primary_id_position": "B"},
+        service=mock_service
+    )
+
+    assert batch_get_call_count == 1  # one batchGet regardless of target count
+    assert get_call_count == 2        # one header fetch + one ID-column scan, not one per ID
+    assert result["SD-001"]["Dev Status"] == "Done"
+    assert result["SD-002"]["Dev Status"] == "In Progress"
+
+
+# 20. Same fix, the write side: bulk_update must resolve every target ID's row number
+# from one ID-column scan, not one find_row_num call (its own full scan) per ID.
+@pytest.mark.asyncio
+async def test_bulk_update_resolves_rows_with_one_id_scan():
+    from app.sheets.write import bulk_update
+
+    mock_service = MagicMock()
+    id_scan_call_count = 0
+
+    headers_row = ["RICEFW ID", "Dev Status"]
+    id_column_rows = [["SD-001"], ["SD-002"]]
+
+    def mock_get(spreadsheetId, range):
+        nonlocal id_scan_call_count
+        mock_exec = MagicMock()
+        if range == "SD!2:2":
+            mock_exec.execute.return_value = {"values": [headers_row]}
+        elif range == "SD!B3:B":
+            id_scan_call_count += 1
+            mock_exec.execute.return_value = {"values": id_column_rows}
+        else:
+            mock_exec.execute.return_value = {"values": []}
+        return mock_exec
+
+    mock_service.spreadsheets.return_value.values.return_value.get.side_effect = mock_get
+    mock_service.spreadsheets.return_value.values.return_value.batchUpdate.return_value.execute.return_value = {}
+
+    result = await bulk_update(
+        service=mock_service,
+        spreadsheet_id="sheet-123",
+        sheet_tab="SD",
+        args={"ricefw_ids": ["SD-001", "SD-002"], "set_field": "Dev Status", "set_value": "Done"},
+        schema_config={"data_start_row": 3, "primary_id_position": "B"}
+    )
+
+    assert id_scan_call_count == 1  # one scan resolves both IDs, not one scan each
+    assert result["ok"] is True
+    assert set(result["succeeded"]) == {"SD-001", "SD-002"}
