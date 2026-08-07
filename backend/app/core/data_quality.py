@@ -119,9 +119,9 @@ class DataQualityChecker:
         completion_col = date_cols.get("completion", "Completion Date")
         
         assignee_col = self.schema.get("assignee_column", "Technical Resource ")
-        if not self._get_col_idx(assignee_col):
+        if self._get_col_idx(assignee_col) is None:
             assignee_col = "Assigned To"
-            
+
         required_col = "Required"
 
         id_idx = self._get_col_idx(primary_id_col)
@@ -213,7 +213,7 @@ class DataQualityChecker:
         critical_fields = self.schema.get("critical_fields", [])
         if not critical_fields:
             assignee_col = self.schema.get("assignee_column", "Technical Resource ")
-            if not self._get_col_idx(assignee_col):
+            if self._get_col_idx(assignee_col) is None:
                 assignee_col = "Assigned To"
             critical_fields = [
                 self.schema.get("primary_id_column", "RICEFW ID"),

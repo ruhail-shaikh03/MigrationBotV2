@@ -417,7 +417,8 @@ RULES:
 3. If the RICEFW ID is ambiguous or missing, ask for clarification. Do NOT guess.
 4. Conditional commands ("if PM-161 is marked for migration, set frequency to Monthly"):
    call get_row first, evaluate the result, then conditionally call update_cell.
-5. For add_row, find the next RICEFW ID in sequence by scanning existing IDs first.
+5. For add_row, the RICEFW ID is assigned automatically server-side in sequence — never
+   invent or guess one yourself, and do not ask the user for it.
 6. Never invent column names. If ambiguous, list three closest matches and ask.
 7. Confirmations: one sentence. Reads: compact key-value list.
 8. BULK OPERATIONS — use bulk_update when the user provides a list of IDs or

@@ -348,8 +348,8 @@ async def summarize(
         id_col = schema_config.get("primary_id_column", "RICEFW ID")
         id_idx = _col(id_col)
         if id_idx is None:
-            id_idx = 0
-        
+            return {"ok": False, "error": f"Primary ID column '{id_col}' not found; cannot report row IDs."}
+
         blanks = [str(r[id_idx]).strip() for r in rows if not str(r[idx]).strip()]
         return {
             "ok": True,
@@ -371,16 +371,20 @@ async def summarize(
         date_idx = _col(go_live_col)
         status_idx = _col(status_col)
         id_idx = _col(id_col)
-        if id_idx is None:
-            id_idx = 0
 
         if date_idx is None:
             return {"ok": False, "error": f"Date column '{go_live_col}' not found."}
+        if id_idx is None:
+            return {"ok": False, "error": f"Primary ID column '{id_col}' not found; cannot report row IDs."}
 
         today = datetime.today().date()
         overdue = []
 
-        done_statuses = {"complete", "completed", "done", "closed", "retired"}
+        # tool_schemas.py documents the default exclusion set as
+        # ['Complete', 'Done', 'Closed', 'Go-Live', 'Retired']; previously this was a
+        # different hard-coded set and the overdue_status_exclusions arg was never read.
+        exclusions = args.get("overdue_status_exclusions") or ["Complete", "Done", "Closed", "Go-Live", "Retired"]
+        done_statuses = {str(s).strip().lower() for s in exclusions}
 
         for r in rows:
             status = str(r[status_idx]).strip().lower() if status_idx is not None else ""
@@ -429,39 +433,59 @@ async def run_data_quality_check(
     schema_config = _get_tab_schema(schema_config, active_tab)
     data_start_row = schema_config.get("data_start_row", 3)
     header_row_num = data_start_row - 1
-    
+
     headers = await get_header_row(service, spreadsheet_id, active_tab, header_row_num)
-    
+
     result = await _with_retry(lambda: service.spreadsheets().values().get(
         spreadsheetId=spreadsheet_id,
         range=f"{active_tab}!{data_start_row}:{data_start_row + 2000}"
     ).execute())
-    
+
     rows = result.get("values", [])
+
+    # Optional module scoping, same normalized-lookup pattern as summarize()
+    scope_module = args.get("scope_module")
+    if scope_module:
+        col_idx = {h.lower().strip(): i for i, h in enumerate(headers)}
+        module_col = schema_config.get("module_column", "Module")
+        mod_idx = col_idx.get(module_col.lower().strip())
+        if mod_idx is not None:
+            rows = [
+                r for r in rows
+                if mod_idx < len(r) and str(r[mod_idx]).strip().upper() == scope_module.strip().upper()
+            ]
+
     checker = DataQualityChecker(headers, rows, schema_config)
+    check_type = args.get("check_type", "all")
+    valid_check_types = {"blank_fields", "consistency", "stale", "completeness_score", "all"}
+    if check_type not in valid_check_types:
+        return {"ok": False, "error": f"Unknown check_type: {check_type}"}
 
-    # Gather registered emails for RBAC mismatch checks
-    # Select from users
-    users_res = await db_session.execute(select(AuditLog.user_email).distinct())
-    registered_emails = [r[0] for r in users_res.all() if r[0]]
+    report: Dict[str, Any] = {"ok": True, "check_type": check_type, "scope": scope_module or "all modules"}
 
-    alerts = checker.consistency_checks(registered_emails)
-    comp_score = checker.completeness_score()
-    
-    # Staleness evaluation
-    stale_threshold = args.get("stale_threshold_days", 30)
-    # Fetch recent audit entries for the current spreadsheet to calculate stales
-    audit_res = await db_session.execute(
-        select(AuditLog.ricefw_id, AuditLog.timestamp)
-        .where(AuditLog.spreadsheet_id == spreadsheet_id, AuditLog.sheet_tab == active_tab)
-    )
-    audit_entries = [{"ricefw_id": r[0], "timestamp": r[1]} for r in audit_res.all()]
-    
-    stale_objs = checker.stale_items(audit_entries, threshold_days=stale_threshold)
+    if check_type in ("blank_fields", "all"):
+        fields = args.get("fields") or schema_config.get("critical_fields") or [
+            "RICEFW ID", "Module", "Type", "Description", "Dev Status", "Technical Resource "
+        ]
+        report["blank_field_counts"] = checker.blank_field_counts(fields)
 
-    return {
-        "ok": True,
-        "completeness_score": comp_score,
-        "alerts": alerts,
-        "stale_items": stale_objs
-    }
+    if check_type in ("consistency", "all"):
+        # Gather registered emails for RBAC mismatch checks
+        users_res = await db_session.execute(select(AuditLog.user_email).distinct())
+        registered_emails = [r[0] for r in users_res.all() if r[0]]
+        report["alerts"] = checker.consistency_checks(registered_emails)
+
+    if check_type in ("completeness_score", "all"):
+        report["completeness_score"] = checker.completeness_score()
+
+    if check_type in ("stale", "all"):
+        # tool_schemas.py declares this arg as `threshold_days`, not `stale_threshold_days`
+        stale_threshold = args.get("threshold_days", 30)
+        audit_res = await db_session.execute(
+            select(AuditLog.ricefw_id, AuditLog.timestamp)
+            .where(AuditLog.spreadsheet_id == spreadsheet_id, AuditLog.sheet_tab == active_tab)
+        )
+        audit_entries = [{"ricefw_id": r[0], "timestamp": r[1]} for r in audit_res.all()]
+        report["stale_items"] = checker.stale_items(audit_entries, threshold_days=stale_threshold)
+
+    return report
