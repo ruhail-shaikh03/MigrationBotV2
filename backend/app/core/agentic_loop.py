@@ -177,6 +177,15 @@ async def run_agentic_loop(
                 "message": f"System error during agent reasoning: {str(e)}"
             })
             break
-            
+    else:
+        # Loop exhausted max_iterations without a `break` (no final text answer, no
+        # exception) — the model kept calling tools. Without this, the client never
+        # gets an "assistant" or "error" frame and the UI spins forever.
+        logger.warning(f"Agentic loop exhausted {max_iterations} iterations without a final answer.")
+        await send_websocket_msg({
+            "type": "error",
+            "message": f"I couldn't finish this request within {max_iterations} steps. Try rephrasing it or breaking it into smaller requests."
+        })
+
     # Return updated message history (slice off system prompt)
     return messages[1:]

@@ -132,6 +132,61 @@ async def test_agentic_loop_max_iterations():
     assert len(tool_starts) == 8
 
 
+# 4b. Regression for TDD §16.3: exhausting the iteration cap must notify the client
+# instead of returning silently (the for-loop previously had no else: clause, so the
+# UI's spinner never resolved to a final "assistant" or "error" frame).
+@pytest.mark.asyncio
+async def test_agentic_loop_iteration_cap_notifies_client():
+    """Verify hitting max_iterations sends exactly one terminal error frame, last in the stream."""
+    mock_client = AsyncMock()
+
+    mock_tool_call = MagicMock()
+    mock_tool_call.id = "call_mock_id"
+    mock_tool_call.type = "function"
+    mock_tool_call.function.name = "get_row"
+    mock_tool_call.function.arguments = '{"ricefw_id": "SD-012"}'
+
+    mock_message = MagicMock()
+    mock_message.content = "I need to run get_row again."
+    mock_message.tool_calls = [mock_tool_call]
+
+    mock_choice = MagicMock()
+    mock_choice.message = mock_message
+
+    mock_response = MagicMock()
+    mock_response.choices = [mock_choice]
+
+    mock_client.chat.completions.create.return_value = mock_response
+
+    sent_messages = []
+    async def mock_send(msg):
+        sent_messages.append(msg)
+
+    checker = PermissionChecker("admin@example.com", "admin", ["*"], [])
+
+    with patch("app.core.agentic_loop.dispatch_tool", AsyncMock(return_value={"ok": True, "data": {}})):
+        await run_agentic_loop(
+            user_message="Track SD-012",
+            message_history=[],
+            user_email="admin@example.com",
+            session_id="session-123",
+            spreadsheet_id="spread-123",
+            active_tab="SD",
+            schema_config={},
+            column_map={},
+            checker=checker,
+            llm_client=mock_client,
+            send_websocket_msg=mock_send,
+            db_session=None,
+            max_iterations=3
+        )
+
+    errors = [msg for msg in sent_messages if msg["type"] == "error"]
+    assert len(errors) == 1
+    assert "3 steps" in errors[0]["message"]
+    assert sent_messages[-1]["type"] == "error"
+
+
 # 5. Non-blocking audit logger test
 @pytest.mark.asyncio
 async def test_audit_logger_nonblocking():

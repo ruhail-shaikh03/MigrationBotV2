@@ -5,7 +5,7 @@ from unittest.mock import MagicMock, AsyncMock, patch
 from googleapiclient.errors import HttpError
 
 from app.sheets.retry import _with_retry
-from app.sheets.read import find_row_num, get_bulk_rows_raw
+from app.sheets.read import find_row_num, get_bulk_rows_raw, search_rows, summarize
 from app.queue.producer import enqueue_write_job
 from app.queue.worker import start_worker
 from app.queue.events import publish_queue_update, queue_events_channel
@@ -239,3 +239,80 @@ async def test_bulk_rows_raw_falls_back_to_schema_column_map():
         )
 
     assert mock_search.call_args.kwargs["column_map"] == schema_column_map
+
+
+def _mock_service_for_sheet(headers_row, data_rows):
+    """Build a mock Sheets service whose values().get() replies differently for the
+    single-row header fetch vs. the bulk data-row fetch, keyed off the requested range."""
+    mock_service = MagicMock()
+
+    def mock_get(spreadsheetId, range):
+        mock_exec = MagicMock()
+        start, end = range.split("!")[1].split(":")
+        if start == end:
+            mock_exec.execute.return_value = {"values": [headers_row]}
+        else:
+            mock_exec.execute.return_value = {"values": data_rows}
+        return mock_exec
+
+    mock_service.spreadsheets.return_value.values.return_value.get.side_effect = mock_get
+    return mock_service
+
+
+# 9. Regression for TDD §16.2: search_rows must resolve columns whose real sheet header
+# has a trailing space, since get_header_row strips headers but resolve_column's canonical
+# names (from COLUMN_ALIASES) deliberately keep the sheet's real trailing space.
+@pytest.mark.asyncio
+async def test_search_rows_resolves_trailing_space_column():
+    """Verify a filter on a natural-language term ('developer') matches a header stored
+    with a trailing space ('Technical Resource ')."""
+    mock_service = _mock_service_for_sheet(
+        headers_row=["RICEFW ID", "Module", "Technical Resource "],
+        data_rows=[
+            ["SD-001", "SD", "Ruhail"],
+            ["SD-002", "SD", "Alex"],
+        ]
+    )
+
+    result = await search_rows(
+        spreadsheet_id="sheet-123",
+        active_tab="SD",
+        filters=[{"field": "developer", "value": "Ruhail", "match_type": "exact"}],
+        return_fields=None,
+        limit=50,
+        schema_config={"data_start_row": 3},
+        column_map={},
+        service=mock_service
+    )
+
+    assert result["ok"] is True
+    assert result["count"] == 1
+    assert result["rows"][0]["RICEFW ID"] == "SD-001"
+
+
+# 10. Same regression, for summarize's count_by_field branch.
+@pytest.mark.asyncio
+async def test_summarize_count_by_field_resolves_trailing_space_column():
+    """Verify group-by on a natural-language term resolves against a trailing-space header."""
+    mock_service = _mock_service_for_sheet(
+        headers_row=["RICEFW ID", "Module", "Technical Resource "],
+        data_rows=[
+            ["SD-001", "SD", "Ruhail"],
+            ["SD-002", "SD", "Ruhail"],
+            ["SD-003", "SD", "Alex"],
+        ]
+    )
+
+    result = await summarize(
+        spreadsheet_id="sheet-123",
+        active_tab="SD",
+        args={"report_type": "count_by_field", "group_by_field": "developer"},
+        schema_config={"data_start_row": 3},
+        column_map={},
+        service=mock_service
+    )
+
+    assert result["ok"] is True
+    breakdown = {b["value"]: b["count"] for b in result["breakdown"]}
+    assert breakdown["Ruhail"] == 2
+    assert breakdown["Alex"] == 1

@@ -169,24 +169,30 @@ async def search_rows(
     header_row_num = data_start_row - 1
     headers = await get_header_row(service, spreadsheet_id, active_tab, header_row_num)
 
+    # get_header_row strips each header, but resolve_column's canonical names are copied
+    # verbatim from COLUMN_ALIASES / the LLM-built column_map and deliberately keep the
+    # sheet's real trailing spaces (e.g. "Technical Resource "). Compare case/whitespace-
+    # normalized on both sides — same pattern write.py already uses.
+    col_idx = {h.lower().strip(): i for i, h in enumerate(headers)}
+
     # Defaults fields to return if none specified
     critical_fields = schema_config.get("critical_fields", [])
     if not critical_fields:
         critical_fields = ["RICEFW ID", "Module", "Type", "Description", "Dev Status", "Technical Resource "]
-    
-    return_fields = return_fields or [f for f in critical_fields if f in headers]
 
-    col_idx = {h: i for i, h in enumerate(headers)}
+    return_fields = return_fields or [f for f in critical_fields if f.lower().strip() in col_idx]
+
     resolved_filters = []
-    
+
     for f in filters:
         term = f.get("field", "")
         # Resolve user natural term to actual header name
         canonical = resolve_column(term, column_map) or term
-        if canonical not in col_idx:
+        norm_canonical = canonical.lower().strip()
+        if norm_canonical not in col_idx:
             return {"ok": False, "error": f"Column '{term}' could not be mapped to sheet headers."}
         resolved_filters.append({
-            "idx": col_idx[canonical],
+            "idx": col_idx[norm_canonical],
             "value": str(f.get("value", "")).strip(),
             "match_type": f.get("match_type", "exact")
         })
@@ -227,7 +233,7 @@ async def search_rows(
             continue
 
         # Extract only requested return fields
-        row_dict = {f: padded[col_idx[f]] for f in return_fields if f in col_idx}
+        row_dict = {f: padded[col_idx[f.lower().strip()]] for f in return_fields if f.lower().strip() in col_idx}
         matches.append(row_dict)
         
         if len(matches) >= limit:
@@ -256,7 +262,12 @@ async def summarize(
     header_row_num = data_start_row - 1
     
     headers = await get_header_row(service, spreadsheet_id, active_tab, header_row_num)
-    col_idx = {h: i for i, h in enumerate(headers)}
+    # Same header-normalization as search_rows: headers are stripped, canonical names
+    # from resolve_column/schema_config may not be.
+    col_idx = {h.lower().strip(): i for i, h in enumerate(headers)}
+
+    def _col(name: str):
+        return col_idx.get(name.lower().strip()) if name else None
 
     result = await _with_retry(lambda: service.spreadsheets().values().get(
         spreadsheetId=spreadsheet_id,
@@ -267,7 +278,7 @@ async def summarize(
     # Filter by module if scope_module is supplied
     scope_module = args.get("scope_module")
     module_col = schema_config.get("module_column", "Module")
-    mod_idx = col_idx.get(module_col)
+    mod_idx = _col(module_col)
 
     rows = []
     for r in all_rows:
@@ -282,10 +293,10 @@ async def summarize(
     if report_type == "count_by_field":
         group_by = args.get("group_by_field", "")
         canonical = resolve_column(group_by, column_map) or group_by
-        if canonical not in col_idx:
+        idx = _col(canonical)
+        if idx is None:
             return {"ok": False, "error": f"Grouping column '{group_by}' not found."}
-            
-        idx = col_idx[canonical]
+
         counts = {}
         for r in rows:
             val = str(r[idx]).strip() or "(blank)"
@@ -306,10 +317,10 @@ async def summarize(
         comp_val = args.get("completion_value", "Completed")
         
         canonical = resolve_column(comp_field, column_map) or comp_field
-        if canonical not in col_idx:
+        idx = _col(canonical)
+        if idx is None:
             return {"ok": False, "error": f"Completion status column '{comp_field}' not found."}
 
-        idx = col_idx[canonical]
         done = sum(1 for r in rows if str(r[idx]).strip().lower() == comp_val.strip().lower())
         blank = sum(1 for r in rows if not str(r[idx]).strip())
         pct = round((done / total * 100), 1) if total else 0
@@ -330,12 +341,14 @@ async def summarize(
     elif report_type == "blank_fields":
         blank_field = args.get("blank_field", "")
         canonical = resolve_column(blank_field, column_map) or blank_field
-        if canonical not in col_idx:
+        idx = _col(canonical)
+        if idx is None:
             return {"ok": False, "error": f"Column '{blank_field}' not found."}
 
-        idx = col_idx[canonical]
         id_col = schema_config.get("primary_id_column", "RICEFW ID")
-        id_idx = col_idx.get(id_col, 0)
+        id_idx = _col(id_col)
+        if id_idx is None:
+            id_idx = 0
         
         blanks = [str(r[id_idx]).strip() for r in rows if not str(r[idx]).strip()]
         return {
@@ -354,10 +367,12 @@ async def summarize(
         go_live_col = date_cols.get("go_live", "Go-Live Date")
         status_col = schema_config.get("status_column", "Dev Status")
         id_col = schema_config.get("primary_id_column", "RICEFW ID")
-        
-        date_idx = col_idx.get(go_live_col)
-        status_idx = col_idx.get(status_col)
-        id_idx = col_idx.get(id_col, 0)
+
+        date_idx = _col(go_live_col)
+        status_idx = _col(status_col)
+        id_idx = _col(id_col)
+        if id_idx is None:
+            id_idx = 0
 
         if date_idx is None:
             return {"ok": False, "error": f"Date column '{go_live_col}' not found."}
