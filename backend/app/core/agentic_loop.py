@@ -1,6 +1,6 @@
 import json
 import logging
-from typing import List, Dict, Any, Callable, Awaitable
+from typing import List, Dict, Any, Callable, Awaitable, Optional
 from openai import AsyncOpenAI
 from app.core.llm_router import select_model
 from app.core.tool_schemas import TOOLS, get_system_prompt, get_system_prompt_compact
@@ -23,6 +23,7 @@ async def run_agentic_loop(
     send_websocket_msg: Callable[[Dict[str, Any]], Awaitable[None]],
     db_session: Any,
     google_access_token: str = "mock-google-access-token",
+    google_refresh_token: Optional[str] = None,
     max_iterations: int = 8,
 ) -> List[Dict[str, Any]]:
     """
@@ -144,7 +145,8 @@ async def run_agentic_loop(
                         schema_config=schema_config,
                         column_map=column_map,
                         db_session=db_session,
-                        google_access_token=google_access_token
+                        google_access_token=google_access_token,
+                        google_refresh_token=google_refresh_token
                     )
                 
                 # Send result back to client and append to context

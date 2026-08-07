@@ -135,14 +135,22 @@ database exists for identity, authorisation, session state, and the audit trail 
 `Settings` (`config.py:Settings`) reads `("../.env", ".env")` relative to the process working
 directory and ignores unknown keys.
 
-**Three variables are required with no default** — `DEFAULT_SPREADSHEET_ID`, `ADMIN_EMAILS`,
-`CORS_ORIGINS` (all declared on `config.py:Settings`). A `ValidationError` on any of them is
-converted to a `RuntimeError` naming the missing keys, at the `settings = Settings()`
-module-level instantiation in `config.py`. This is a deliberate hardening change: these previously
-fell back to hardcoded production values.
+**Four variables are required with no default** — `DEFAULT_SPREADSHEET_ID`, `ADMIN_EMAILS`,
+`CORS_ORIGINS`, and (since Phase 4) `JWT_SECRET` (all declared on `config.py:Settings`). A
+`ValidationError` on any of them is converted to a `RuntimeError` naming the missing keys, at the
+`settings = Settings()` module-level instantiation in `config.py`. This is a deliberate hardening
+change: these previously fell back to hardcoded production values — `JWT_SECRET`'s fallback was
+the specific problem, since `frontend/src/auth.ts` independently fell back to the identical
+hardcoded string, so a deployment that forgot to set it on either side still verified tokens
+correctly using the shared public default (§4.2).
 
-Secrets still carrying defaults: `DEEPSEEK_API_KEY`, `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`,
-and `JWT_SECRET` (all on `config.py:Settings`).
+Secrets still carrying defaults: `DEEPSEEK_API_KEY`, `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`
+(all on `config.py:Settings`).
+
+`main.py` also refuses to boot if `CORS_ORIGINS` contains a literal `"*"`, since that's
+incompatible with the `allow_credentials=True` the app needs for cookie/Authorization-header
+cross-origin requests — Starlette silently fails those instead of permitting them, so this is
+now a startup error instead of a runtime surprise (§16 history).
 
 > **⚠ This exact gap caused a live outage.** On 2026-08-06 the deployed `.env` had no
 > `CORS_ORIGINS`, and because `settings` is built at module import (`config.py`, the
@@ -150,10 +158,9 @@ and `JWT_SECRET` (all on `config.py:Settings`).
 > `Restarting (1)` on ~20-second cycles for roughly 21 hours before it was noticed, with
 > `frontend`, `caddy`, `postgres`, and `redis` all healthy throughout, giving no visible signal
 > that anything was wrong short of checking container status directly. Fixed operationally (the
-> var added to the server's `.env`) and structurally: `.env.example` now documents all three
-> required variables and ships a working `CORS_ORIGINS` value instead of the `*` it had before (a
-> literal `*` also silently breaks credentialed cross-origin requests once combined with
-> `allow_credentials=True` — see §16.1), and `docker-compose.yml`'s `backend` service now has a
+> var added to the server's `.env`) and structurally: `.env.example` now documents all required
+> variables and ships a working `CORS_ORIGINS` value instead of the `*` it had before (now also
+> rejected outright at startup, above), and `docker-compose.yml`'s `backend` service now has a
 > `healthcheck` against `GET /api/ready` (§10) so this class of failure shows as `unhealthy` in
 > `docker compose ps` rather than requiring a log read to discover.
 
@@ -174,17 +181,18 @@ and `JWT_SECRET` (all on `config.py:Settings`).
    (`auth.ts:callbacks.session`) carrying `email`, `name`, `picture`, `sub`,
    `google_access_token`, and `exp` = now + 24 h, exposed as `session.apiToken`.
 
-> **⚠ Lifetime mismatch.** The backend JWT has a 24-hour `exp` (`auth.ts:callbacks.session`) but
-> embeds a Google access token that lives about an hour. The WebSocket extracts that Google token
-> exactly once at connect time (`chat.py:authenticate_ws_user`) and holds it for the connection's
-> life, so a long-lived socket will present an expired Google credential — surfacing as a 401 from
-> Google, not from FastAPI.
-
-> **⚠ Refresh token never reaches the backend.** `auth.ts:callbacks.session` includes only
-> `google_access_token`. Every Sheets client built on the WebSocket path is therefore constructed
-> with `refresh_token=None` (`tool_dispatch.py:dispatch_tool`, `sheets/client.py:build_sheets_service`)
-> and cannot self-refresh. Only the admin REST path passes one, from the `X-Google-Refresh-Token`
-> header (`deps.py:get_google_auth`, and the `admin.py` routes that depend on it).
+The backend JWT has a 24-hour `exp` (`auth.ts:callbacks.session`) but embeds a Google access token
+that lives about an hour. The WebSocket extracts both tokens once at connect time
+(`chat.py:authenticate_ws_user`) and holds them for the connection's life — but as of Phase 4,
+`auth.ts:callbacks.session` signs `google_refresh_token` into the payload alongside
+`google_access_token`, threaded through `chat.py:websocket_chat_endpoint` →
+`agentic_loop.py:run_agentic_loop` → `tool_dispatch.py:dispatch_tool` →
+`sheets/client.py:build_sheets_service`, and into `queue/schemas.py:WriteJobPayload` for queued
+writes the worker picks up later. `Credentials(refresh_token=...)` self-refreshes on an expired
+access token, so a long-lived socket or a delayed queued write no longer needs the original,
+possibly-stale `google_access_token` to still be valid. Previously this path was always built with
+`refresh_token=None` — only the admin REST path (`deps.py:get_google_auth`, via the
+`X-Google-Refresh-Token` header) had one.
 
 ### 4.2 HTTP authentication
 
@@ -192,20 +200,21 @@ and `JWT_SECRET` (all on `config.py:Settings`).
 an `email` claim. On `JWTError` it falls back to a developer mode accepting any token beginning
 `mock-` or containing `@`; otherwise 401. Unknown emails are **auto-provisioned**.
 
-> **⚠ Production-reachable auth bypass.** The `mock-`/`@` fallback (`deps.py:get_current_user`,
-> mirrored at `chat.py:authenticate_ws_user`) is not gated by any environment flag. Any string
-> containing `@` that fails signature verification is accepted as that identity, and the account
-> is created on the spot. Since admin status is decided purely by email membership
-> (`admin.py:require_admin`), presenting the admin address as a bearer token reaches
-> `require_admin`. `JWT_SECRET` also still has a shipped default (`config.py:Settings`) matching
-> the frontend fallback (`auth.ts`, the `JWT_SECRET` constant), so a deployment that omits it signs
-> with a publicly known key.
+As of Phase 4, that fallback (`deps.py:get_current_user`, mirrored at
+`chat.py:authenticate_ws_user`) only fires when `settings.ALLOW_DEV_AUTH` is true
+(`config.py:Settings`, default `False`) — previously it was reachable in any deployment, so any
+string containing `@` that failed signature verification was accepted as that identity, including
+the admin address (`admin.py:require_admin` decides admin status purely by email membership).
+`JWT_SECRET` is now required with no default on both sides (`config.py:Settings`; `auth.ts`, the
+`JWT_SECRET` constant, throws if unset) — previously both fell back to the same publicly-known
+string independently, so a deployment that forgot to set it on either side still verified tokens
+correctly using the shared default.
 
 ### 4.3 WebSocket authentication and project resolution
 
 `authenticate_ws_user` (`chat.py:authenticate_ws_user`) mirrors the HTTP decoder but pulls
-`google_access_token` from the payload and does **not** auto-provision — unknown email returns
-`None` and the socket closes.
+`google_access_token` and `google_refresh_token` from the payload and does **not**
+auto-provision — unknown email returns `None` and the socket closes.
 
 The socket is accepted *before* authentication, then closed with `1008` on failure (both in
 `chat.py:websocket_chat_endpoint`). Project resolution is a three-step fallback, all in the same
@@ -314,17 +323,22 @@ WRITE_TOOLS     = {"update_cell", "bulk_update", "format_row", "add_row"}
 |---|---|---|---|---|
 | **Config admin** | all | all | none | not consulted |
 | **Row admin** | all | all | none — short-circuits in `PermissionChecker.can_execute` | **not consulted** |
-| **Editor** (incl. default) | all | all not in `denied_ops` | `update_cell`, `bulk_update` only, both in `PermissionChecker.can_execute` | honoured |
-| **Viewer** | all | none (`PermissionChecker.can_execute`) | n/a | **not consulted** |
+| **Editor** | all | all not in `denied_ops` | `update_cell`, `bulk_update` only, both in `PermissionChecker.can_execute` | honoured |
+| **Viewer** (default, §16 history) | all | none (`PermissionChecker.can_execute`) | n/a | **not consulted** |
 
 Field enforcement is skipped entirely when `allowed_fields == ["*"]` (`permissions.py:PermissionChecker.can_execute`),
 and covers only those two tools — `add_row`'s free-form `fields` dict and `format_row` are ungated.
 
-> **⚠ RBAC is fail-open.** `get_user_permissions` returns **editor with `["*"]`** when no
-> `project_id` is given, when no `users` row matches, and when no `permissions` row exists (all in
-> `permissions.py:get_user_permissions`). Combined with the WebSocket's "first active project"
-> fallback (`chat.py:websocket_chat_endpoint`), a user who was never granted anything lands on an
-> arbitrary project as an editor.
+**RBAC is fail-closed.** `get_user_permissions` returns `settings.DEFAULT_ROLE` (`config.py:Settings`,
+default `"viewer"`) with `["*"]` when no `project_id` is given, when no `users` row matches, and
+when no `permissions` row exists (all in `permissions.py:get_user_permissions`) — previously this
+fell back to `"editor"`, so any user the checker couldn't place landed on an arbitrary project
+(via the WebSocket's "first active project" fallback, `chat.py:websocket_chat_endpoint`) with full
+write access. Flipping the default required a one-time migration
+(`backend/scripts/seed_permissions.py`) to grant every existing user explicit `editor` rows on
+every active project *before* the new code deployed — otherwise everyone relying on the old
+fail-open default would have lost write access the moment it shipped. `admin.py:bulk_grant_permissions`
+is the ongoing equivalent for onboarding a user base onto a newly created project.
 
 > **⚠ `WRITE_TOOLS` is never read.** Defined at `permissions.py:WRITE_TOOLS` but `can_execute` only
 > tests `READ_ONLY_TOOLS` (`permissions.py:PermissionChecker.can_execute`). Classification is by
@@ -481,6 +495,7 @@ Admin routes (all gated by `require_admin`, `admin.py:require_admin`):
 | DELETE | `/admin/projects/{id}` | delete, cascades to permissions | `admin.py:delete_project` |
 | PATCH | `/admin/projects/{id}/fields` | toggle a `critical_fields` entry | `admin.py:toggle_project_field` |
 | GET/POST/DELETE | `/admin/permissions[/{id}]` | RBAC CRUD; POST creates the user if absent | `admin.py:list_permissions`, `admin.py:upsert_permission`, `admin.py:delete_permission` |
+| POST | `/admin/permissions/bulk-grant` | grant one role to many (or all) users on one project at once, upserting per user | `admin.py:bulk_grant_permissions` |
 | GET | `/admin/audits` | filter by user/tool/RICEFW ID, limit 100 | `admin.py:list_audits` |
 | GET | `/admin/analytics/summary` | counts and failure totals | `admin.py:get_analytics_summary` |
 
@@ -494,11 +509,10 @@ with a per-service `detail` dict when either fails; verified against unreachable
 `docker-compose.yml`'s `backend` service now runs a `healthcheck` against `/api/ready` (interval
 30 s, 3 retries, `start_period` 15 s) — see §3.
 
-> **⚠ `/api/projects` performs no authorisation filtering.** Every authenticated caller receives
-> all active projects including `spreadsheet_id` and full `schema_config`
-> (`chat.py:list_user_projects`). With the fail-open default (§6.2) and the verbatim `project_id`
-> query parameter (`chat.py:websocket_chat_endpoint`), a user can select any project from that
-> list and operate on it as an editor.
+`chat.py:list_user_projects` filters to projects the caller has an explicit `permissions` row for
+— config admins see every active project; everyone else only sees ones actually granted to them.
+Previously it returned every active project, including `spreadsheet_id` and full `schema_config`,
+to any authenticated caller regardless of whether they had a permissions row for it.
 
 ---
 
@@ -703,23 +717,7 @@ Ordered by severity. Items marked **(verified)** were reproduced by executing co
 by the remediation plan are removed from this list, not annotated — see git history for what
 changed and when.
 
-### 16.1 CORS wildcard with credentials
-**Severity: medium.** `main.py` (the `CORSMiddleware` registration) sets `allow_credentials=True`
-with origins split from `CORS_ORIGINS`. `.env.example` ships `CORS_ORIGINS=*`. Starlette does not
-expand a literal `"*"` here, so credentialed cross-origin requests fail rather than being
-permitted — and the example file steers deployments toward exactly that value.
-
-### 16.2 `/api/projects` performs no authorisation filtering
-**Severity: medium.** `chat.py:list_user_projects` — see §10.
-
-### 16.3 RBAC is fail-open
-**Severity: medium.** `permissions.py:get_user_permissions` — see §6.2.
-
-### 16.4 Auth bypass and default `JWT_SECRET`
-**Severity: medium.** `deps.py:get_current_user`, `chat.py:authenticate_ws_user`,
-`config.py:Settings` — see §4.2.
-
-### 16.5 Queue has no durability, retry, or dead-letter path
+### 16.1 Queue has no durability, retry, or dead-letter path
 **Severity: medium.** A plain Redis list (`producer.py:enqueue_write_job`) on a volume-less
 container (`docker-compose.yml`, `redis` service). `BLPOP` removes the job before processing
 (`worker.py:start_worker`), so a crash mid-`process_job` loses the write with no record beyond an
@@ -728,28 +726,33 @@ top-level `except`), not if the process dies. No retry, no dead-letter list, and
 — the `job_id` returned to the user (`tool_dispatch.py:dispatch_tool`) is stored nowhere and
 cannot be queried after the fact.
 
-### 16.6 OAuth access tokens are serialised into the queue
+### 16.2 OAuth tokens are serialised into the queue
 **Severity: medium.** `WriteJobPayload` (`queue/schemas.py:WriteJobPayload`) carries
-`google_access_token` as a plain field, JSON-serialised into the Redis entry
-(`producer.py:enqueue_write_job`) so the worker can rebuild a client
-(`worker.py:process_job`). Live user credentials sit in a Redis instance with no auth and port
-6379 published to the host (`docker-compose.yml`, `redis` service) for as long as the job is
-queued. Inherent to the OAuth-only design plus the queue boundary; noted, not solved.
+`google_access_token` **and, since Phase 4, `google_refresh_token`** as plain fields,
+JSON-serialised into the Redis entry (`producer.py:enqueue_write_job`) so the worker can rebuild a
+self-refreshing client (`worker.py:process_job`). Live user credentials — now including a
+long-lived refresh token, not just an hour-lived access token — sit in a Redis instance with no
+auth and port 6379 published to the host (`docker-compose.yml`, `redis` service) for as long as
+the job is queued. Inherent to the OAuth-only design plus the queue boundary; noted, not solved.
+Threading the refresh token through was a deliberate Phase 4 tradeoff — the alternative (queued
+writes dying whenever the access token expires before the worker gets to them) was worse — but it
+does widen what's exposed here, and a token-reference indirection (store tokens server-side, pass
+the queue only an opaque reference) remains the real fix, not attempted here.
 
-### 16.7 Silent 2001-row ceiling on every scan
+### 16.3 Silent 2001-row ceiling on every scan
 **Severity: low-medium.** `read.py:search_rows`, `read.py:summarize`, and
 `read.py:run_data_quality_check` each request `{start}:{start+2000}`. A tracker larger than that
 is silently truncated — `search_rows` reports fewer matches, `summarize` percentages are computed
 over a partial denominator, and `data_quality` scores a subset, all with no indication to the
 user.
 
-### 16.8 Seven copies of the schema-shape branch
+### 16.4 Seven copies of the schema-shape branch
 **Severity: low (maintenance).** `read.py:_get_tab_schema`, `write.py:update_cell`,
 `write.py:bulk_update`, `write.py:add_row`, `worker.py:process_job`,
 `chat.py:websocket_chat_endpoint`, `agentic_loop.py:run_agentic_loop`. Per-key defaults are
 similarly scattered.
 
-### 16.9 Dead code
+### 16.5 Dead code
 **Severity: low.** `core/planner.py` and `core/memory.py` (never imported);
 `column_mapper.py:build_column_map` and `column_mapper.py:get_column_map_json` (never called —
 §7.3); `audit.py:log_audit`; `permissions.py:WRITE_TOOLS`; `permissions.py:PermissionChecker.is_admin`;
@@ -757,7 +760,7 @@ similarly scattered.
 in `read.py`, was itself dead and has been removed); `models/audit_log.py:AuditLog.created_month`
 (no partitioning exists).
 
-### 16.10 Startup `init_db()` failure is non-fatal, and readiness doesn't fully cover it
+### 16.6 Startup `init_db()` failure is non-fatal, and readiness doesn't fully cover it
 **Severity: low.** `init_db()` failures are caught and execution continues
 (`main.py:lifespan`). `GET /api/ready` (`health.py:readiness_check`, added in Phase 0) narrows
 this but does not close it: it runs a live `SELECT 1`, which succeeds against a reachable Postgres
@@ -776,7 +779,9 @@ record `init_db()`'s outcome and have `health.py:readiness_check` report unready
 | `REDIS_URL` | `producer.py:enqueue_write_job`, `events.py:publish_queue_update`, `worker.py:start_worker`, `chat.py:forward_queue_updates` | `redis://localhost:6379` (`config.py:Settings`) |
 | `DEEPSEEK_API_KEY` | `chat.py:llm_client` | `"mock-deepseek-key"` (`config.py:Settings`) |
 | `GOOGLE_CLIENT_ID` / `_SECRET` | `sheets/client.py:build_sheets_service`, `auth.ts` (`GoogleProvider` config) | mock values (`config.py:Settings`) |
-| `JWT_SECRET` | `deps.py:get_current_user`, `chat.py:authenticate_ws_user`, `auth.ts` (the `JWT_SECRET` constant) | `"mock-jwt-secret-…"` (`config.py:Settings`) |
+| **`JWT_SECRET`** | `deps.py:get_current_user`, `chat.py:authenticate_ws_user`, `auth.ts` (the `JWT_SECRET` constant) | **required — no default on either side** (`config.py:Settings`; `auth.ts` throws if unset) |
+| `ALLOW_DEV_AUTH` | `deps.py:get_current_user`, `chat.py:authenticate_ws_user` | `false` (`config.py:Settings`) — only set true for local dev/tests |
+| `DEFAULT_ROLE` | `permissions.py:get_user_permissions` | `"viewer"` (`config.py:Settings`) — fail-closed default when no permissions row applies |
 | **`CORS_ORIGINS`** | `main.py` (`CORSMiddleware` registration) | **required — no default** (`config.py:Settings`) |
 | **`ADMIN_EMAILS`** | `config.py:Settings.admin_emails_list` | **required — no default** (`config.py:Settings`) |
 | **`DEFAULT_SPREADSHEET_ID`** | declared `config.py:Settings` | **required — no default**; referenced nowhere in `backend/app/` |

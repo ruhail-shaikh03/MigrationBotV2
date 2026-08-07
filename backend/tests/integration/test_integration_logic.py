@@ -15,6 +15,7 @@ from app.queue.producer import enqueue_write_job
 from app.queue.worker import process_job
 from app.core.agentic_loop import run_agentic_loop
 from app.core.permissions import PermissionChecker
+from app.api.chat import list_user_projects
 from tests.conftest import require_test_database
 
 pytestmark = pytest.mark.asyncio
@@ -321,3 +322,42 @@ async def test_e2e_read_flow(db_session: AsyncSession):
 
     assert len(assistant_replies) == 1
     assert "In Progress" in assistant_replies[0]["content"]
+
+
+async def test_list_user_projects_filters_to_permitted_projects(db_session: AsyncSession):
+    """Regression for TDD §16.2: GET /api/projects must only return projects the caller
+    has an explicit permissions row for — previously every authenticated caller saw
+    every active project, including ones nobody had granted them access to."""
+    user = User(email="regular@example.com", display_name="Regular User", google_sub="sub-regular-1")
+    granted_project = Project(
+        project_name="Granted Project",
+        spreadsheet_id="spreadsheet-granted-1",
+        default_tab="SD",
+        company_prefix="FF"
+    )
+    ungranted_project = Project(
+        project_name="Ungranted Project",
+        spreadsheet_id="spreadsheet-ungranted-1",
+        default_tab="SD",
+        company_prefix="FF"
+    )
+    db_session.add_all([user, granted_project, ungranted_project])
+    await db_session.commit()
+    await db_session.refresh(user)
+    await db_session.refresh(granted_project)
+    await db_session.refresh(ungranted_project)
+
+    db_session.add(Permission(
+        user_id=user.id,
+        project_id=granted_project.id,
+        role="editor",
+        allowed_fields=["*"],
+        denied_operations=[]
+    ))
+    await db_session.commit()
+
+    projects = await list_user_projects(db=db_session, current_user=user)
+
+    project_ids = {p["id"] for p in projects}
+    assert granted_project.id in project_ids
+    assert ungranted_project.id not in project_ids

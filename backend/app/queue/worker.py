@@ -36,7 +36,7 @@ async def process_job(job_id: str, payload_dict: dict) -> None:
 
     # 2. Build Google Sheets API client with active credentials
     # Supports mock credential fallback for test suites
-    service = build_sheets_service(payload.google_access_token)
+    service = build_sheets_service(payload.google_access_token, payload.google_refresh_token)
 
     # 3. Dispatch and execute mutation
     tool = payload.tool_name

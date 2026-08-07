@@ -41,6 +41,17 @@ app = FastAPI(
 
 # Configure CORS Middleware
 origins = [origin.strip() for origin in settings.CORS_ORIGINS.split(",") if origin.strip()]
+if "*" in origins:
+    # allow_credentials=True + a literal "*" origin doesn't do what it looks like it
+    # does: Starlette will not echo back a wildcard for a credentialed request, so
+    # cross-origin requests silently fail instead of being permitted. Fail loudly at
+    # startup instead of shipping a CORS config that looks permissive but isn't.
+    raise RuntimeError(
+        "CORS_ORIGINS contains '*', which is incompatible with allow_credentials=True "
+        "(used because the app sends/receives cookies and Authorization headers "
+        "cross-origin). Set CORS_ORIGINS to an explicit comma-separated origin list, "
+        "e.g. https://migrationbot.duckdns.org — see .env.example."
+    )
 app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,

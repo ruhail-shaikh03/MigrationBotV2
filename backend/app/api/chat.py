@@ -11,6 +11,7 @@ from app.db.engine import get_db, AsyncSessionLocal
 from app.deps import get_current_user
 from app.models.user import User
 from app.models.project import Project
+from app.models.permission import Permission
 from app.models.session import Session as UserSession
 from app.core.permissions import get_user_permissions
 from app.core.agentic_loop import run_agentic_loop
@@ -33,18 +34,21 @@ llm_client = AsyncOpenAI(
     base_url="https://api.deepseek.com/v1" if "deepseek.com" in settings.DEEPSEEK_API_KEY or settings.DEEPSEEK_API_KEY.startswith("sk-") else "https://api.openai.com/v1"
 )
 
-async def authenticate_ws_user(token: str, db: AsyncSession) -> Optional[tuple[User, str]]:
-    """Helper to authenticate WebSocket connections via token query parameter. Returns (User, google_access_token)."""
+async def authenticate_ws_user(token: str, db: AsyncSession) -> Optional[tuple[User, str, Optional[str]]]:
+    """Helper to authenticate WebSocket connections via token query parameter.
+    Returns (User, google_access_token, google_refresh_token)."""
     try:
         # Standard decode
         payload = jwt.decode(token, settings.JWT_SECRET, algorithms=["HS256"])
         email = payload.get("email")
         google_access_token = payload.get("google_access_token", "mock-google-access-token")
+        google_refresh_token = payload.get("google_refresh_token")
     except JWTError:
-        # Developer mock fallback
-        if token.startswith("mock-") or "@" in token:
+        # Dev-only fallback — see deps.py:get_current_user for why this is gated.
+        if settings.ALLOW_DEV_AUTH and (token.startswith("mock-") or "@" in token):
             email = token.replace("mock-", "")
             google_access_token = "mock-google-access-token"
+            google_refresh_token = None
         else:
             return None
 
@@ -56,7 +60,7 @@ async def authenticate_ws_user(token: str, db: AsyncSession) -> Optional[tuple[U
     user = result.scalar()
     if not user:
         return None
-    return user, google_access_token
+    return user, google_access_token, google_refresh_token
 
 
 @router.websocket("/ws")
@@ -81,7 +85,7 @@ async def websocket_chat_endpoint(
         await websocket.close(code=1008)
         return
 
-    user, google_access_token = auth_result
+    user, google_access_token, google_refresh_token = auth_result
     logger.info(f"WebSocket authenticated for user: {user.email}")
 
     # 2. Set up or load Session state context
@@ -223,7 +227,7 @@ async def websocket_chat_endpoint(
                         await websocket.send_json({"type": "error", "message": f"Permission denied: {reason}"})
                         continue
 
-                    service = build_sheets_service(google_access_token)
+                    service = build_sheets_service(google_access_token, google_refresh_token)
                     result = await switch_module(
                         spreadsheet_id=current_project.spreadsheet_id,
                         tab_name=tab_name,
@@ -286,7 +290,8 @@ async def websocket_chat_endpoint(
                     llm_client=llm_client,
                     send_websocket_msg=send_msg,
                     db_session=fresh_db,
-                    google_access_token=google_access_token
+                    google_access_token=google_access_token,
+                    google_refresh_token=google_refresh_token
                 )
 
                 # Update session activity timestamp
@@ -312,8 +317,20 @@ async def websocket_chat_endpoint(
 
 @router.get("/api/projects", response_model=List[Dict[str, Any]])
 async def list_user_projects(db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user)):
-    """List active projects in the system for the current authenticated user."""
-    result = await db.execute(select(Project).where(Project.is_active == True))
+    """List active projects the current user is permitted to access. Config admins see
+    every active project; everyone else sees only projects with an explicit permissions
+    row — a user who reaches a project solely through the fail-closed default (§6.2)
+    isn't shown it here, since nothing was actually granted."""
+    email_clean = current_user.email.lower().strip()
+
+    if email_clean in settings.admin_emails_list:
+        result = await db.execute(select(Project).where(Project.is_active == True))
+    else:
+        result = await db.execute(
+            select(Project)
+            .join(Permission, Permission.project_id == Project.id)
+            .where(Project.is_active == True, Permission.user_id == current_user.id)
+        )
     projects = result.scalars().all()
     return [{
         "id": p.id,

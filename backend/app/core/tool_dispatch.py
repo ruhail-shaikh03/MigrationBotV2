@@ -1,5 +1,5 @@
 import logging
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 
 logger = logging.getLogger("tool_dispatch")
 
@@ -13,7 +13,8 @@ async def dispatch_tool(
     schema_config: dict,
     column_map: dict,
     db_session: Any,
-    google_access_token: str = "mock-google-access-token"
+    google_access_token: str = "mock-google-access-token",
+    google_refresh_token: Optional[str] = None
 ) -> Dict[str, Any]:
     """
     Routes a tool execution request.
@@ -26,7 +27,7 @@ async def dispatch_tool(
     if tool_name in ("get_row", "search_rows", "summarize", "switch_module", "data_quality"):
         try:
             from app.sheets.client import build_sheets_service
-            service = build_sheets_service(google_access_token)
+            service = build_sheets_service(google_access_token, google_refresh_token)
 
             if tool_name == "get_row":
                 from app.sheets.read import get_row
@@ -63,7 +64,7 @@ async def dispatch_tool(
     elif tool_name in ("update_cell", "bulk_update", "format_row", "add_row"):
         try:
             from app.sheets.client import build_sheets_service
-            service = build_sheets_service(google_access_token)
+            service = build_sheets_service(google_access_token, google_refresh_token)
 
             # Pre-read current state to preserve 'old_value' for audit logging
             old_values = {}
@@ -85,6 +86,7 @@ async def dispatch_tool(
             job = await enqueue_write_job(
                 user_email=user_email,
                 google_access_token=google_access_token,
+                google_refresh_token=google_refresh_token,
                 session_id=session_id,
                 tool_name=tool_name,
                 spreadsheet_id=spreadsheet_id,
