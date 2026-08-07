@@ -109,3 +109,11 @@ jobs:
           npm run build
         env:
           NEXT_TELEMETRY_DISABLED: 1
+          # Next.js evaluates route handlers (incl. auth.ts) during "Collecting page
+          # data" to build the route manifest — it's not just bundling source, so
+          # auth.ts's module-level "throw if JWT_SECRET is unset" (Phase 4) fires here
+          # too, not just at runtime. Dummy values only; never real secrets in CI.
+          JWT_SECRET: test-secret-32-characters-long-xx
+          GOOGLE_CLIENT_ID: test-google-client-id
+          GOOGLE_CLIENT_SECRET: test-google-client-secret
+          NEXTAUTH_SECRET: test-nextauth-secret
