@@ -97,13 +97,14 @@ export function useWebSocket(apiToken: string | null, projectId: number | null) 
             break
           }
           case "tool_result": {
+            const succeeded = data.result?.ok !== false
             updateLastMessage((lastMsg) => {
               if (lastMsg && lastMsg.role === "assistant" && lastMsg.toolCalls) {
                 return {
                   ...lastMsg,
                   toolCalls: lastMsg.toolCalls.map((tc) =>
                     tc.name === data.tool && tc.status === "running"
-                      ? { ...tc, status: "completed", result: data.result }
+                      ? { ...tc, status: succeeded ? "completed" : "failed", result: data.result }
                       : tc
                   )
                 }
