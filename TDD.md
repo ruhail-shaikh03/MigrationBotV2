@@ -101,7 +101,7 @@ round trip to Google, so read latency and Sheets quota are directly user-facing.
 | Backend | FastAPI, uvicorn, SQLAlchemy 2.0 + asyncpg, Pydantic 2, python-jose | `backend/requirements.txt:1-10` |
 | Data | PostgreSQL 16 — RBAC/audit only, **not** sheet data | `docker-compose.yml:4-5` |
 | Queue | Redis 7 — list-backed FIFO **and** pub/sub event bus | `producer.py:57`, `events.py:46` |
-| LLM | `AsyncOpenAI` against `https://api.deepseek.com/v1` | `api/chat.py:30-33` |
+| LLM | `AsyncOpenAI` against `https://api.deepseek.com/v1` | `api/chat.py:32-34` |
 | Sheets | `google-api-python-client`, per-user OAuth `Credentials` | `sheets/client.py:11-19` |
 | Proxy | Caddy 2-alpine, auto-TLS | `docker-compose.yml:71-72` |
 
@@ -148,7 +148,7 @@ and `JWT_SECRET` (`config.py:11-14`).
 > status directly. Fixed operationally (the var added to the server's `.env`) and structurally:
 > `.env.example` now documents all three required variables and ships a working `CORS_ORIGINS`
 > value instead of the `*` it had before (a literal `*` also silently breaks credentialed
-> cross-origin requests once combined with `allow_credentials=True` — see §16.2), and
+> cross-origin requests once combined with `allow_credentials=True` — see §16.1), and
 > `docker-compose.yml`'s `backend` service now has a `healthcheck` against `GET /api/ready` (§10)
 > so this class of failure shows as `unhealthy` in `docker compose ps` rather than requiring a log
 > read to discover.
@@ -173,7 +173,7 @@ and `JWT_SECRET` (`config.py:11-14`).
 
 > **⚠ Lifetime mismatch.** The backend JWT has a 24-hour `exp` (`auth.ts:104`) but embeds a Google
 > access token that lives about an hour. The WebSocket extracts that Google token exactly once at
-> connect time (`chat.py:41`) and holds it for the connection's life, so a long-lived socket will
+> connect time (`chat.py:43`) and holds it for the connection's life, so a long-lived socket will
 > present an expired Google credential — surfacing as a 401 from Google, not from FastAPI.
 
 > **⚠ Refresh token never reaches the backend.** `auth.ts:98-105` includes only
@@ -190,7 +190,7 @@ claim (`:25-31`). On `JWTError` it falls back to a developer mode accepting any 
 **auto-provisioned** (`:56-67`).
 
 > **⚠ Production-reachable auth bypass.** The `mock-`/`@` fallback (`deps.py:34`, mirrored at
-> `chat.py:44`) is not gated by any environment flag. Any string containing `@` that fails
+> `chat.py:46`) is not gated by any environment flag. Any string containing `@` that fails
 > signature verification is accepted as that identity, and the account is created on the spot.
 > Since admin status is decided purely by email membership (`admin.py:23`), presenting the admin
 > address as a bearer token reaches `require_admin`. `JWT_SECRET` also still has a shipped default
@@ -199,18 +199,18 @@ claim (`:25-31`). On `JWTError` it falls back to a developer mode accepting any 
 
 ### 4.3 WebSocket authentication and project resolution
 
-`authenticate_ws_user` (`chat.py:35-58`) mirrors the HTTP decoder but pulls `google_access_token`
-from the payload (`:41`) and does **not** auto-provision — unknown email returns `None` and the
-socket closes (`:56-57`).
+`authenticate_ws_user` (`chat.py:37-60`) mirrors the HTTP decoder but pulls `google_access_token`
+from the payload (`:43`) and does **not** auto-provision — unknown email returns `None` and the
+socket closes (`:58-59`).
 
-The socket is accepted *before* authentication (`chat.py:72`), then closed with `1008` on failure
-(`:79-81`). Project resolution is a three-step fallback: the `project_id` query parameter
-(`:65`, `:87`); else the user's most recently active session's project (`:88-95`); else the first
-`is_active` project (`:98-102`). All three failing closes the socket (`:104-110`).
+The socket is accepted *before* authentication (`chat.py:74`), then closed with `1008` on failure
+(`:81-83`). Project resolution is a three-step fallback: the `project_id` query parameter
+(`:67`, `:89`); else the user's most recently active session's project (`:90-97`); else the first
+`is_active` project (`:100-104`). All three failing closes the socket (`:106-112`).
 
 A `sessions` row is loaded or created with `active_tab` = `project.default_tab` or `"SD"`
-(`:121-133`). Conversation history is **in-process only**, initialised empty per connection
-(`:136`) and reassigned each turn (`:228`) — nothing persists chat history.
+(`:123-135`). Conversation history is **in-process only**, initialised empty per connection
+(`:138`) and reassigned each turn (`:277`) — nothing persists chat history.
 
 ---
 
@@ -220,9 +220,9 @@ A `sessions` row is loaded or created with `active_tab` = `project.default_tab` 
 
 | # | Function | Location | Action |
 |---|---|---|---|
-| 1 | `websocket_chat_endpoint` | `chat.py:188-191` | receives frame, extracts `content` |
-| 2 | `get_user_permissions` | `chat.py:218` → `permissions.py:77` | builds `PermissionChecker` |
-| 3 | `run_agentic_loop` | `chat.py:228-242` | enters the LLM loop |
+| 1 | `websocket_chat_endpoint` | `chat.py:190`, `:247` | receives frame, extracts `content` |
+| 2 | `get_user_permissions` | `chat.py:267` → `permissions.py:77` | builds `PermissionChecker` |
+| 3 | `run_agentic_loop` | `chat.py:277-291` | enters the LLM loop |
 | 4 | LLM call | `agentic_loop.py:60` | model returns `tool_calls` |
 | 5 | `send_websocket_msg` | `agentic_loop.py:120-124` | emits `tool_start` |
 | 6 | `can_execute` | `agentic_loop.py:127` → `permissions.py:28` | RBAC gate; denial → `error` frame (`:131-134`) |
@@ -244,15 +244,15 @@ A `sessions` row is loaded or created with `active_tab` = `project.default_tab` 
 | 21 | `_with_retry(batchUpdate)` | `write.py:54-60` → `retry.py:7` | one `values().batchUpdate` |
 | 22 | `_write_audit_record` | `worker.py:75-88` | one `audit_logs` row **per field** |
 | 23 | `publish_queue_update` | `worker.py:255-263` → `events.py:22` | publishes terminal state to `migrationbot:queue_events:<email>` |
-| 24 | `forward_queue_updates` | `chat.py:155-180` | API's per-connection subscriber relays it as a `queue_update` frame |
+| 24 | `forward_queue_updates` | `chat.py:157-182` | API's per-connection subscriber relays it as a `queue_update` frame |
 | 25 | throttle | `worker.py:297` | `asyncio.sleep(1.0)` before the next job |
 
 Steps 23–24 are the completion-feedback path. `publish_queue_update` is called on **every**
 terminal path including the unsupported-tool branch (`worker.py:231-233`, which sets `error_msg`)
 and the exception handler (`:235-252`), and a publish failure is swallowed so a successful write is
 never failed by a notification problem (`events.py:51-53`). The API subscribes per connection
-(`chat.py:182`) and tears the task down in `finally` (`:257-262`). Because the agentic loop and the
-relay both write to one socket, sends are serialised behind an `asyncio.Lock` (`chat.py:149-153`).
+(`chat.py:184`) and tears the task down in `finally` (`:305-311`). Because the agentic loop and the
+relay both write to one socket, sends are serialised behind an `asyncio.Lock` (`chat.py:151-155`).
 
 `update_cell` returns `{"ok": True, ...}` unconditionally once `batchUpdate` returns
 (`write.py:62-67`) — the API response body is not inspected.
@@ -315,7 +315,7 @@ those two tools — `add_row`'s free-form `fields` dict and `format_row` are ung
 > **⚠ RBAC is fail-open.** `get_user_permissions` returns **editor with `["*"]`** when no
 > `project_id` is given (`permissions.py:90-91`), when no `users` row matches (`:94-97`), and when
 > no `permissions` row exists (`:113`). Combined with the WebSocket's "first active project"
-> fallback (`chat.py:98-102`), a user who was never granted anything lands on an arbitrary project
+> fallback (`chat.py:100-104`), a user who was never granted anything lands on an arbitrary project
 > as an editor.
 
 > **⚠ `WRITE_TOOLS` is never read.** Defined at `permissions.py:9` but `can_execute` only tests
@@ -331,7 +331,7 @@ those two tools — `add_row`'s free-form `fields` dict and `format_row` are ung
 JSONB defaulting to `{}` (`models/project.py:23`), in one of two shapes distinguished by a
 top-level `"tabs"` key: multi-tab (`{"tabs": {...}, "global": {...}}`, what `detect_all_tabs`
 produces at `schema_detect.py:73-79`) or flat. The disambiguation is reimplemented at
-`read.py:14-17`, `write.py:23`, `:82`, `:193`, `worker.py:188`, `chat.py:222`, and
+`read.py:14-17`, `write.py:23`, `:82`, `:193`, `worker.py:188`, `chat.py:271`, and
 `agentic_loop.py:32-35` — seven copies, one of them (`read.py`) a private `_get_tab_schema`
 function.
 
@@ -376,7 +376,7 @@ therefore runs on the static `COLUMN_ALIASES` unless an admin hand-edits `schema
 
 ## 8. The Agentic Loop
 
-`run_agentic_loop` (`agentic_loop.py:12-191`) drives at most **8** iterations (`:26`).
+`run_agentic_loop` (`agentic_loop.py:12-200`) drives at most **8** iterations (`:26`).
 
 - **Model routing** — `select_model` returns `deepseek-reasoner` only on iteration 0 and only when
   the latest user message contains a conditional keyword (`llm_router.py:5`, `:9-21`); everything
@@ -402,30 +402,35 @@ Nine tools in `core/tool_schemas.py:TOOLS`: `get_row`, `update_cell`, `format_ro
 ## 9. WebSocket Protocol Reference
 
 Endpoint `WS /ws?token=<apiToken>[&project_id=<int>]` (`chat.py:61-66`). The client derives the URL
-from `window.location` unless `NEXT_PUBLIC_WS_URL` is set (`useWebSocket.ts:21-24`);
+from `window.location` unless `NEXT_PUBLIC_WS_URL` is set (`useWebSocket.ts:26-29`);
 `docker-compose.yml:58` leaves it empty, so the window-derived value is used.
 
 ### 9.1 Client → server
 
+The server routes on the frame's declared `type` (`chat.py:190-200`) rather than only ever reading
+`content` — a non-JSON or untyped frame is normalized to `{"type": "message", "content": <raw
+text>}` (`:191-194`) before dispatch.
+
 | `type` | Payload | Sent by | Server handling |
 |---|---|---|---|
-| `message` | `{type, content}` | `useWebSocket.ts:180` | `chat.py:190-191` extracts `content`, drives the loop |
-| `ping` | `{type: "ping"}` | `useWebSocket.ts:37`, every 30 s | **Swallowed.** `chat.py:191` reads `content`, absent → `""` → `:195-196` `continue`. See §16.1 |
+| `message` | `{type, content}` | `useWebSocket.ts:193` | extracts `content` (`:247`), drives `run_agentic_loop` (`:277-291`) |
+| `ping` | `{type: "ping"}` | `useWebSocket.ts:42`, every 30 s | replies `pong` (`chat.py:202-204`) |
+| `switch_tab` | `{type, tab_name}` | `useWebSocket.ts:199-203`, on tab-button click | RBAC-checked (`can_execute("switch_module", {})`, `chat.py:221-225`), then `switch_module` verifies the tab exists live against Sheets and updates `sessions.active_tab` (`chat.py:227-235`, `meta.py:117-154`) |
 
-Non-JSON frames are treated as raw text (`chat.py:192-193`). The literal *content* `"ping"` — not
-the heartbeat frame — is what triggers `pong` (`chat.py:198-199`).
+Any other `type` is ignored rather than misread as chat text (`chat.py:243-245`).
 
 ### 9.2 Server → client
 
 | `type` | Payload | Emitted by | Client consumer | Effect |
 |---|---|---|---|---|
-| `connection_ok` | `{type, user_email, project_name, active_tab}` | `chat.py:139-144` | `useWebSocket.ts:135-142` | `setSessionInfo` applies all three fields |
-| `assistant` | `{type, content, done: true}` | `agentic_loop.py:101-105` | `useWebSocket.ts:69-82` | appends to the most recent assistant message |
-| `tool_start` | `{type, tool, args}` | `agentic_loop.py:120-124` | `useWebSocket.ts:83-98` | pushes `{name, args, status:"running"}` |
-| `tool_result` | `{type, tool, result}` | `agentic_loop.py:151-155` | `useWebSocket.ts:99-115` | marks the matching running entry `"completed"` or `"failed"` per `result.ok` |
-| `error` | `{type, message}` | `chat.py:79`, `:105-108`, `:116`, `:253`; `agentic_loop.py:131-134`, `:175-178` | `useWebSocket.ts:120-134` | appends a `system` message, deduped against an identical predecessor |
-| `pong` | `{type: "pong"}` | `chat.py:199` | `useWebSocket.ts:143-144` | no-op |
-| `queue_update` | `{type, job_id, status, tool_name, args, session_id, error}` | `events.py:35-43` via `worker.py:255-263`, relayed by `chat.py:165` | `useWebSocket.ts:115-119` → DOM `CustomEvent` → `chat/page.tsx:103-125` | toast keyed on `status` |
+| `connection_ok` | `{type, user_email, project_name, active_tab}` | `chat.py:139-144` | `useWebSocket.ts:147-154` | `setSessionInfo` applies all three fields |
+| `assistant` | `{type, content, done: true}` | `agentic_loop.py:101-105` | `useWebSocket.ts:74-87` | appends to the most recent assistant message |
+| `tool_start` | `{type, tool, args}` | `agentic_loop.py:120-124` | `useWebSocket.ts:88-103` | pushes `{name, args, status:"running"}` |
+| `tool_result` | `{type, tool, result}` | `agentic_loop.py:151-155` | `useWebSocket.ts:104-120` | marks the matching running entry `"completed"` or `"failed"` per `result.ok` |
+| `tab_switched` | `{type, active_tab}` | `chat.py:238` | `useWebSocket.ts:126-131` | `setActiveTab(active_tab)` — the client no longer sets it optimistically (§14) |
+| `error` | `{type, message}` | `chat.py:81`, `:107-110`, `:118`, `:209`, `:224`, `:240`, `:302`; `agentic_loop.py:131-134`, `:184-187`, `:194-197` | `useWebSocket.ts:132-146` | appends a `system` message, deduped against an identical predecessor |
+| `pong` | `{type: "pong"}` | `chat.py:203` | `useWebSocket.ts:155-156` | no-op |
+| `queue_update` | `{type, job_id, status, tool_name, args, session_id, error}` | `events.py:35-43` via `worker.py:255-263`, relayed by `chat.py:167` | `useWebSocket.ts:121-124` → DOM `CustomEvent` → `chat/page.tsx:103-125` | toast keyed on `status` |
 
 `status` is `"completed"` or `"failed"` (`worker.py:258`); the frontend also handles a generic
 "other" branch (`chat/page.tsx:116-118`), which nothing currently emits.
@@ -436,8 +441,12 @@ each other.
 
 ### 9.3 Lifecycle
 
-Reconnect after 3 s for any close code other than `1008` or `1000` (`useWebSocket.ts:52-57`).
-Heartbeat every 30 s (`:34-39`). No server-side idle handling — `chat.py:188` blocks indefinitely.
+Reconnect after 3 s for any close code other than `1008` or `1000` (`useWebSocket.ts:57-62`).
+Heartbeat every 30 s (`:39-44`). No server-side idle handling — `chat.py:190`'s `receive_text()`
+blocks indefinitely.
+`connect` tracks the live socket in a ref (`wsRef`, `:10`, `:18-24`, `:165`) rather than the Zustand
+`ws` state, so a reconnect always closes the actual current socket regardless of which render's
+closure is running (§14).
 
 ---
 
@@ -462,14 +471,14 @@ probing), `GET /api/ready` (`health.py:16-48`, added in Phase 0 of the remediati
 `SELECT 1` against Postgres and `PING` against the shared `producer.redis_client`, `503` with a
 per-service `detail` dict when either fails; verified against unreachable dependencies), `GET
 /api/me` (`api/auth.py:19-34`, mounted directly in `main.py:54-55`), and `GET /api/projects`
-(`chat.py:265-277`).
+(`chat.py:314-326`).
 
 `docker-compose.yml`'s `backend` service now runs a `healthcheck` against `/api/ready` (interval
 30 s, 3 retries, `start_period` 15 s) — see §3.
 
 > **⚠ `/api/projects` performs no authorisation filtering.** Every authenticated caller receives all
-> active projects including `spreadsheet_id` and full `schema_config` (`chat.py:268-277`). With the
-> fail-open default (§6.2) and the verbatim `project_id` query parameter (`chat.py:65`, `:87`), a
+> active projects including `spreadsheet_id` and full `schema_config` (`chat.py:317-326`). With the
+> fail-open default (§6.2) and the verbatim `project_id` query parameter (`chat.py:67`, `:89`), a
 > user can select any project from that list and operate on it as an editor.
 
 ---
@@ -580,16 +589,15 @@ layout.
 State lives in one Zustand store (`useChatStore.ts:49-95`) holding `projects`, `activeProject`,
 `activeTab`, `isConnected`, `messages`, `ws`, and session metadata.
 
-> **⚠ Tab switching is optimistic and prompt-driven.** `handleTabChange` sets `activeTab` locally
-> and then asks the *model* to perform the switch by sending the string `Switch active module to
-> {tab}` (`chat/page.tsx:143-148`). If the model declines to call `switch_module`, or the tool's
-> existence check fails (`meta.py:136-137`), the highlighted tab no longer reflects
-> `sessions.active_tab`. Only `connection_ok` — sent once per connection — ever corrects it.
+Tab switching is an explicit control frame, not prompt-driven (`chat/page.tsx:148-150`): the client
+sends `{type: "switch_tab", tab_name}` and only applies the new `activeTab` once the server confirms
+with `tab_switched` (§9.1–9.2) — it no longer sets `activeTab` optimistically before the switch is
+known to have succeeded.
 
-> **⚠ Stale-closure hazard.** `connect` reads `ws` (`useWebSocket.ts:13`) to close a prior socket,
-> but `ws` is absent from its dependency array (`:154`), as is `setSessionInfo` (used at `:136`).
-> On `apiToken`/`projectId` change the effect re-runs (`:156-163`) with a possibly stale socket
-> reference and may fail to close the previous connection.
+`connect` tracks the live socket in a ref (`wsRef`, `useWebSocket.ts:10`) rather than reading the
+Zustand `ws` state through its own closure, so a reconnect from `onclose`'s `setTimeout` (`:59-61`)
+or an effect re-run always closes the actual current socket — not a value captured at whatever
+render created that particular `connect` closure.
 
 ---
 
@@ -656,29 +664,22 @@ Ordered by severity. Items marked **(verified)** were reproduced by executing co
 by the remediation plan are removed from this list, not annotated — see git history for what
 changed and when.
 
-### 16.1 The WebSocket heartbeat is swallowed
-**Severity: medium.** Client sends `{"type":"ping"}` every 30 s (`useWebSocket.ts:37`); the server
-reads only `packet.get("content", "")` (`chat.py:191`), gets `""`, and `continue`s (`:195-196`).
-`pong` (`:198-199`) fires only if a user literally types "ping". The client's `pong` handler
-(`:143-144`) is consequently dead. Frames still traverse the connection so idle-proxy keep-alive
-survives, but the protocol-level ack does not. Fix: route on `packet["type"]`.
-
-### 16.2 CORS wildcard with credentials
+### 16.1 CORS wildcard with credentials
 **Severity: medium.** `main.py:44-49` sets `allow_credentials=True` with origins split from
 `CORS_ORIGINS` (`:43`). `.env.example:14` ships `CORS_ORIGINS=*`. Starlette does not expand a
 literal `"*"` here, so credentialed cross-origin requests fail rather than being permitted — and
 the example file steers deployments toward exactly that value.
 
-### 16.3 `/api/projects` performs no authorisation filtering
-**Severity: medium.** `chat.py:265-277` — see §10.
+### 16.2 `/api/projects` performs no authorisation filtering
+**Severity: medium.** `chat.py:314-326` — see §10.
 
-### 16.4 RBAC is fail-open
+### 16.3 RBAC is fail-open
 **Severity: medium.** `permissions.py:88`, `:113` — see §6.2.
 
-### 16.5 Auth bypass and default `JWT_SECRET`
-**Severity: medium.** `deps.py:34`, `chat.py:44`, `config.py:14` — see §4.2.
+### 16.4 Auth bypass and default `JWT_SECRET`
+**Severity: medium.** `deps.py:34`, `chat.py:46`, `config.py:14` — see §4.2.
 
-### 16.6 Queue has no durability, retry, or dead-letter path
+### 16.5 Queue has no durability, retry, or dead-letter path
 **Severity: medium.** A plain Redis list (`producer.py:53-57`) on a volume-less container
 (`docker-compose.yml:17-22`). `BLPOP` removes the job before processing (`worker.py:278`), so a
 crash mid-`process_job` loses the write with no record beyond an audit row that is only written if
@@ -686,38 +687,31 @@ the exception was caught (`:235-252`), not if the process dies. No retry, no dea
 no job-state key — the `job_id` returned to the user (`tool_dispatch.py:98`) is stored nowhere and
 cannot be queried after the fact.
 
-### 16.7 OAuth access tokens are serialised into the queue
+### 16.6 OAuth access tokens are serialised into the queue
 **Severity: medium.** `WriteJobPayload` carries `google_access_token` as a plain field
 (`queue/schemas.py:11`), JSON-serialised into the Redis entry (`producer.py:48-57`) so the worker
 can rebuild a client (`worker.py:41`). Live user credentials sit in a Redis instance with no auth
 and port 6379 published to the host (`docker-compose.yml:20-21`) for as long as the job is queued.
 Inherent to the OAuth-only design plus the queue boundary; noted, not solved.
 
-### 16.8 Optimistic write result misleads the model
-**Severity: medium.** `dispatch_tool` returns `{"ok": true, "status": "queued"}` before Sheets is
-touched (`tool_dispatch.py:95-100`), and that is what the loop feeds back to the model
-(`agentic_loop.py:158`). The model therefore reports the write as done. The `queue_update` toast
-does eventually tell the truth (§5.1), but the chat transcript still contains a premature success
-claim. Fix: have the system prompt teach `status: "queued"` as pending, not complete.
-
-### 16.9 Silent 2001-row ceiling on every scan
+### 16.7 Silent 2001-row ceiling on every scan
 **Severity: low-medium.** `read.py:203`, `:274`, `:441` request `{start}:{start+2000}`. A tracker
 larger than that is silently truncated — `search_rows` reports fewer matches, `summarize`
 percentages are computed over a partial denominator, and `data_quality` scores a subset, all with
 no indication to the user.
 
-### 16.10 Seven copies of the schema-shape branch
+### 16.8 Seven copies of the schema-shape branch
 **Severity: low (maintenance).** `read.py:14-17`, `write.py:23`, `:82`, `:193`, `worker.py:188`,
-`chat.py:222`, `agentic_loop.py:32-35`. Per-key defaults are similarly scattered.
+`chat.py:271`, `agentic_loop.py:32-35`. Per-key defaults are similarly scattered.
 
-### 16.11 Dead code
+### 16.9 Dead code
 **Severity: low.** `core/planner.py` and `core/memory.py` (never imported); `column_mapper.py:151`
 `build_column_map` and `:143` `get_column_map_json` (never called — §7.3); `audit.py:50`
 `log_audit`; `permissions.py:9` `WRITE_TOOLS`; `permissions.py:25-26` `is_admin()`;
 `meta.py:10` `_detect_header_row` (imported by `read.py:5`, called nowhere);
 `models/audit_log.py` `created_month` (no partitioning exists).
 
-### 16.12 Startup `init_db()` failure is non-fatal, and readiness doesn't fully cover it
+### 16.10 Startup `init_db()` failure is non-fatal, and readiness doesn't fully cover it
 **Severity: low.** `init_db()` failures are caught and execution continues (`main.py:26-28`).
 `GET /api/ready` (`health.py:16-47`, added in Phase 0) narrows this but does not close it: it runs
 a live `SELECT 1` (`health.py:28`), which succeeds against a reachable Postgres regardless of
@@ -733,15 +727,15 @@ probe catches "Postgres is down" (which is what caused the 2026-08-06 outage —
 | Variable | Consumed by | Default |
 |---|---|---|
 | `DATABASE_URL` | `db/engine.py:9` | `…@localhost:5433/migrationbot` (`config.py:7`) |
-| `REDIS_URL` | `producer.py:12`, `events.py:14`, `worker.py:269`, `chat.py:157` | `redis://localhost:6379` (`config.py:8`) |
-| `DEEPSEEK_API_KEY` | `chat.py:31` | `"mock-deepseek-key"` (`config.py:11`) |
+| `REDIS_URL` | `producer.py:12`, `events.py:14`, `worker.py:269`, `chat.py:159` | `redis://localhost:6379` (`config.py:8`) |
+| `DEEPSEEK_API_KEY` | `chat.py:33` | `"mock-deepseek-key"` (`config.py:11`) |
 | `GOOGLE_CLIENT_ID` / `_SECRET` | `sheets/client.py:15-16`, `auth.ts:48-49` | mock values (`config.py:12-13`) |
-| `JWT_SECRET` | `deps.py:25`, `chat.py:39`, `auth.ts:5` | `"mock-jwt-secret-…"` (`config.py:14`) |
+| `JWT_SECRET` | `deps.py:25`, `chat.py:41`, `auth.ts:5` | `"mock-jwt-secret-…"` (`config.py:14`) |
 | **`CORS_ORIGINS`** | `main.py:43` | **required — no default** (`config.py:24`) |
 | **`ADMIN_EMAILS`** | `config.py:29` | **required — no default** (`config.py:23`) |
 | **`DEFAULT_SPREADSHEET_ID`** | declared `config.py:18` | **required — no default**; referenced nowhere in `backend/app/` |
 | `DEFAULT_SHEET_TAB` / `_LABEL` | declared `config.py:19-20` | defaults present; referenced nowhere in `backend/app/` |
 | `NEXTAUTH_SECRET` / `NEXTAUTH_URL` | `auth.ts:114`, `docker-compose.yml:59-60` | secret falls back to `JWT_SECRET` |
 | `DB_PASSWORD` | `docker-compose.yml:10`, `:30`, `:46` | none — compose only |
-| `NEXT_PUBLIC_WS_URL` | `useWebSocket.ts:23` | empty in compose (`docker-compose.yml:58`) |
+| `NEXT_PUBLIC_WS_URL` | `useWebSocket.ts:28` | empty in compose (`docker-compose.yml:58`) |
 | `VPS_HOST` / `VPS_USER` / `VPS_SSH_KEY` / `VPS_PASSWORD` | `deploy.yml:14-17` | GitHub secrets |

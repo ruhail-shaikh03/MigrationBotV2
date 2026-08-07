@@ -162,6 +162,15 @@ async def run_agentic_loop(
                         f"\n[System Recovery Note]: Tool '{tool_name}' failed with error: '{err_detail}'. "
                         "If this was due to column alias or RICEFW ID mismatch, formulate a corrected tool call."
                     )
+                elif tool_result.get("status") == "queued":
+                    # Reinforced here, not just in the system prompt: from iteration 1 onward
+                    # the system message is swapped for the compact variant (see below), which
+                    # doesn't carry the RULES section — this note is the only guaranteed place
+                    # the model still sees the "don't claim this is done" instruction.
+                    content_str += (
+                        f"\n[System Note]: '{tool_name}' has been queued, not yet applied to the "
+                        "spreadsheet. Do not tell the user it is done — phrase your reply as pending."
+                    )
 
                 messages.append({
                     "role": "tool",

@@ -250,3 +250,74 @@ def test_data_quality_checker_handles_assignee_at_column_zero():
     alerts = checker.consistency_checks(valid_emails=["someone-else@example.com"])
     messages = [a["message"] for a in alerts]
     assert any("not registered in permissions" in m for m in messages)
+
+
+# 7. Regression for TDD (prior §16.8, "optimistic write result misleads the model"): a
+# queued write result must never be fed back to the model as if it already succeeded.
+@pytest.mark.asyncio
+async def test_agentic_loop_flags_queued_write_as_pending():
+    """Verify a queued (not-yet-applied) write result is annotated in the tool message
+    content — this is the only place the note reliably reaches the model, since the
+    compact system prompt used from iteration 1 onward drops the RULES section."""
+    mock_client = AsyncMock()
+
+    mock_tool_call = MagicMock()
+    mock_tool_call.id = "call_bulk_1"
+    mock_tool_call.type = "function"
+    mock_tool_call.function.name = "bulk_update"
+    mock_tool_call.function.arguments = '{"set_field": "Dev Status", "set_value": "Done"}'
+
+    mock_msg_turn1 = MagicMock()
+    mock_msg_turn1.content = "Updating rows."
+    mock_msg_turn1.tool_calls = [mock_tool_call]
+    mock_choice_turn1 = MagicMock()
+    mock_choice_turn1.message = mock_msg_turn1
+    mock_response_turn1 = MagicMock()
+    mock_response_turn1.choices = [mock_choice_turn1]
+
+    mock_msg_turn2 = MagicMock()
+    mock_msg_turn2.content = "Queued the update — I'll confirm once it's applied."
+    mock_msg_turn2.tool_calls = None
+    mock_choice_turn2 = MagicMock()
+    mock_choice_turn2.message = mock_msg_turn2
+    mock_response_turn2 = MagicMock()
+    mock_response_turn2.choices = [mock_choice_turn2]
+
+    mock_client.chat.completions.create.side_effect = [mock_response_turn1, mock_response_turn2]
+
+    sent_messages = []
+    async def mock_send(msg):
+        sent_messages.append(msg)
+
+    checker = PermissionChecker("editor@example.com", "editor", ["*"], [])
+
+    queued_result = {
+        "ok": True,
+        "status": "queued",
+        "job_id": "job-1",
+        "message": "Operation queued successfully. Job ID: job-1"
+    }
+
+    with patch("app.core.agentic_loop.dispatch_tool", AsyncMock(return_value=queued_result)):
+        history = await run_agentic_loop(
+            user_message="Set all SD items to Done",
+            message_history=[],
+            user_email="editor@example.com",
+            session_id="session-123",
+            spreadsheet_id="spread-123",
+            active_tab="SD",
+            schema_config={},
+            column_map={},
+            checker=checker,
+            llm_client=mock_client,
+            send_websocket_msg=mock_send,
+            db_session=None,
+            max_iterations=5
+        )
+
+    tool_messages = [m for m in history if m.get("role") == "tool"]
+    assert len(tool_messages) == 1
+    assert "[System Note]" in tool_messages[0]["content"]
+    assert "not yet applied" in tool_messages[0]["content"]
+    # A failure-recovery note must never appear alongside a successful queued result.
+    assert "[System Recovery Note]" not in tool_messages[0]["content"]
