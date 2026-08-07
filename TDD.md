@@ -1,1073 +1,808 @@
 # MigrationBot Enterprise Portal — Technical Design Document
 
-**Version:** 3.0 (Phases 6–9 Production Complete)  
-**Team:** FF Team  
-**Status:** Deployed & Production Ready (Phases 6–9 Complete)  
-**Stack:** Next.js 16 · FastAPI · PostgreSQL 16 · Redis 7 · DeepSeek (`deepseek-chat`, `deepseek-reasoner`) · Google Sheets API v4 · Google OAuth 2.0  
-**Deployment Target:** Hetzner CX22 VPS via Docker Compose + Caddy 2 reverse proxy  
-**Domain:** `migrationbot.duckdns.org`
+> **Provenance.** Written from a full read of the `main` branch at commit `0e988c7`. Every factual
+> claim carries a `file:line` citation verified against that code. Descriptive sections state only
+> what the code does; opinions — bugs, risks, smells — are confined to blockquoted **⚠ callouts**
+> and to §16 *Known Issues*. Findings marked **(verified)** were reproduced by executing code, not
+> only by reading it.
+>
+> Out of scope: `_legacy/` (dead Streamlit prototype; nothing under `backend/` imports it).
 
 ---
 
 ## Table of Contents
 
 1. [System Overview](#1-system-overview)
-2. [Repository Structure — Complete File Map](#2-repository-structure--complete-file-map)
-3. [Authentication & Session Management](#3-authentication--session-management)
-4. [Database Schema (PostgreSQL)](#4-database-schema-postgresql)
-5. [LLM Orchestration & Agentic Loop](#5-llm-orchestration--agentic-loop)
-6. [Tool System & RBAC Enforcement](#6-tool-system--rbac-enforcement)
-7. [Embedded Sheets Layer](#7-embedded-sheets-layer)
-8. [Queue-Backed Write Path](#8-queue-backed-write-path)
-9. [Column Mapping (LLM-Driven & Fallbacks)](#9-column-mapping-llm-driven--fallbacks)
-10. [Schema Auto-Detection](#10-schema-auto-detection)
-11. [Audit Logging System](#11-audit-logging-system)
-12. [Data Quality & Analytics Engine](#12-data-quality--analytics-engine)
-13. [Next.js Frontend — Complete Component Audit](#13-nextjs-frontend--complete-component-audit)
-14. [WebSocket Protocol](#14-websocket-protocol)
-15. [Deployment Architecture](#15-deployment-architecture)
-16. [CI/CD Pipeline](#16-cicd-pipeline)
-17. [Performance Architecture](#17-performance-architecture)
-18. [Feature Interaction Map](#18-feature-interaction-map)
-19. [Known Bugs, Discrepancies & Technical Debt](#19-known-bugs-discrepancies--technical-debt)
+2. [Persistence Model](#2-persistence-model)
+3. [Configuration & Startup](#3-configuration--startup)
+4. [Authentication & Session Resolution](#4-authentication--session-resolution)
+5. [Data Flow Traces](#5-data-flow-traces)
+6. [RBAC Model](#6-rbac-model)
+7. [Schema & Column Resolution](#7-schema--column-resolution)
+8. [The Agentic Loop](#8-the-agentic-loop)
+9. [WebSocket Protocol Reference](#9-websocket-protocol-reference)
+10. [REST Surface](#10-rest-surface)
+11. [Google Sheets Integration](#11-google-sheets-integration)
+12. [Audit Logging](#12-audit-logging)
+13. [Data Quality Engine](#13-data-quality-engine)
+14. [Frontend Application](#14-frontend-application)
+15. [Deployment, CI/CD & Tests](#15-deployment-cicd--tests)
+16. [Known Issues & Technical Debt](#16-known-issues--technical-debt)
+17. [Appendix — Environment Variables](#17-appendix--environment-variables)
 
 ---
 
 ## 1. System Overview
 
-MigrationBot Enterprise Portal is the second-generation implementation of the MigrationBot conversational AI assistant, migrated from a synchronous Streamlit prototype (v3.0) to a high-concurrency event-driven architecture. The system allows SAP team members to interact with S/4HANA WRICEF Migration Tracker Google Sheets via natural language.
+MigrationBot is a conversational interface over S/4HANA WRICEF migration tracker spreadsheets in
+Google Sheets. Users sign in with Google, open a WebSocket to a FastAPI backend, and issue
+natural-language requests. An agentic LLM loop turns those into calls against a fixed nine-tool
+catalogue.
 
-### Architecture Summary
+**Reads go straight to the Google Sheets API on every request — there is no cache.** Writes are
+queued through Redis to a separate worker container, which performs the mutation, writes the audit
+row, and publishes the outcome back to the API over Redis pub/sub for delivery to the originating
+client.
 
-| Layer | Technology | Responsibility |
-|-------|-----------|----------------|
-| Frontend | Next.js 16 (App Router) + Tailwind CSS v4 | Auth, Chat UI, Admin Dashboard |
-| Backend | FastAPI (async) | WebSocket chat, REST admin API, Agentic loop |
-| LLM | DeepSeek (`deepseek-chat`, `deepseek-reasoner`) via `AsyncOpenAI` | Intent parsing, tool selection, response composition |
-| Data Source | Google Sheets API v4 | WRICEF tracker data (reads and writes) |
-| Auth | NextAuth.js v5 (Google OAuth) → HS256 JWT → FastAPI | Single-scope OAuth, JWT-based API auth |
-| RBAC/Audit | PostgreSQL 16 | Users, permissions, projects, sessions, audit logs |
-| Write Queue | Redis 7 (RPUSH/BLPOP FIFO) | Throttled mutation pipeline (1 req/sec) |
-| Reverse Proxy | Caddy 2 (Alpine) | Auto-HTTPS (Let's Encrypt), WebSocket proxying, route splitting |
+### 1.1 Component map
 
-### Request Lifecycle
-
-```text
-User types message in Next.js Chat UI
-        │
-        ▼
-WebSocket sends JSON: {"type": "message", "content": "..."}
-        │
-        ▼
-Caddy /ws* → reverse_proxy → backend:8000
-        │
-        ▼
-FastAPI /ws endpoint receives, authenticates via JWT query param
-        │
-        ▼
-run_agentic_loop() invoked with user context
-        │
-        ├── Iteration 0: select_model() → deepseek-reasoner (if conditional) or deepseek-chat
-        │         │
-        │         ▼
-        │   AsyncOpenAI.chat.completions.create()
-        │         │
-        │         ├── finish_reason == "stop" → stream final reply via WS
-        │         │
-        │         └── finish_reason == "tool_calls"
-        │                   │
-        │                   ▼
-        │             PermissionChecker.can_execute() — RBAC interception
-        │                   │
-        │                   ├── READ tool → dispatch_tool() → Sheets API (direct)
-        │                   │
-        │                   └── WRITE tool → dispatch_tool() → Redis queue (throttled)
-        │                              │
-        │                              ▼
-        │                        Worker processes at 1 req/sec
-        │                              │
-        │                              ▼
-        │                        Audit log → PostgreSQL (non-blocking)
-        │
-        └── Iterations 1-7: deepseek-chat processes tool results
-                  │
-                  ▼
-        Final assistant message streamed via WebSocket
+```
+                        ┌──────────────────────────────────────────┐
+   Browser              │  caddy  (:80/:443)                       │
+     │                  │  route-ordered reverse proxy             │
+     │  HTTPS / WSS     │  Caddyfile:2-17                          │
+     └─────────────────▶│  /api/me     ──▶ backend:8000            │
+                        │  /api/auth/* ──▶ frontend:3000 (NextAuth)│
+                        │  /api/*      ──▶ backend:8000            │
+                        │  /ws*        ──▶ backend:8000            │
+                        │  *           ──▶ frontend:3000           │
+                        └──────────┬───────────────────┬───────────┘
+                                   │                   │
+                  ┌────────────────▼──────┐   ┌────────▼─────────────────────┐
+                  │ frontend  (Next.js)   │   │ backend  (FastAPI, uvicorn)  │
+                  │ standalone output     │   │  GET  /api/health            │
+                  │                       │   │  GET  /api/me                │
+                  │ NextAuth v5 mints     │   │  GET  /api/projects          │
+                  │ HS256 apiToken        │   │  /api/admin/*                │
+                  │ auth.ts:107-109       │   │  WS   /ws                    │
+                  └───────────────────────┘   └───┬──────────┬──────────┬────┘
+                                                  │          │          │
+                                        RBAC/audit│    writes│          │ LLM
+                                                  │          │          │
+                             ┌────────────────────▼──┐  ┌────▼──────┐   │
+                             │ postgres:16           │  │ redis:7   │   │
+                             │ users, projects,      │  │ write     │   │
+                             │ permissions, sessions,│  │ queue +   │   │
+                             │ audit_logs            │  │ pub/sub   │   │
+                             └───────────▲───────────┘  └──┬─────▲──┘   │
+                                         │        BLPOP    │     │      │
+                                   audit │           ┌─────▼─────┴──┐   │
+                                         └───────────┤ worker       │   │
+                                                     │ (separate    │   │
+                                                     │  container)  │   │
+                                                     └──────┬───────┘   │
+                                                            │           │
+                          reads (direct) ───────────────────┼──────▶ Google Sheets API v4
+                                                            │           │
+                                                            ▼           ▼
+                                                        writes      DeepSeek
 ```
 
-### Design Principles
+**Two process boundaries matter.** `backend` and `worker` are separate containers from the same
+image (`docker-compose.yml:24-25`, `:39-42`), so the worker cannot touch the API's sockets — job
+outcomes travel back over a per-user Redis pub/sub channel (§5.1). And every read is a synchronous
+round trip to Google, so read latency and Sheets quota are directly user-facing.
 
-- **No service accounts:** Every Sheets API call uses the signed-in user's own Google OAuth access token, forwarded from NextAuth via JWT claims.
-- **Async everywhere:** FastAPI uses `AsyncOpenAI`, `asyncpg`, and `redis.asyncio` for non-blocking I/O.
-- **Queue-backed writes:** All mutations are enqueued to Redis and executed by a throttled worker process to prevent Google Sheets API quota exhaustion.
-- **Schema-driven:** Column references are resolved via `schema_config` (JSONB per project) rather than hardcoded names.
-- **RBAC at dispatch layer:** Permissions are checked before every tool execution, not at the UI layer.
+### 1.2 Technology inventory
+
+| Layer | Technology | Citation |
+|---|---|---|
+| Frontend | Next.js 16.2.9, React 19.2.4, NextAuth 5.0.0-beta.31, Zustand 5, Tailwind 4, Recharts | `frontend/package.json:11-32` |
+| Backend | FastAPI, uvicorn, SQLAlchemy 2.0 + asyncpg, Pydantic 2, python-jose | `backend/requirements.txt:1-10` |
+| Data | PostgreSQL 16 — RBAC/audit only, **not** sheet data | `docker-compose.yml:4-5` |
+| Queue | Redis 7 — list-backed FIFO **and** pub/sub event bus | `producer.py:57`, `events.py:46` |
+| LLM | `AsyncOpenAI` against `https://api.deepseek.com/v1` | `api/chat.py:30-33` |
+| Sheets | `google-api-python-client`, per-user OAuth `Credentials` | `sheets/client.py:11-19` |
+| Proxy | Caddy 2-alpine, auto-TLS | `docker-compose.yml:71-72` |
 
 ---
 
-## 2. Repository Structure — Complete File Map
+## 2. Persistence Model
 
-```text
-migrationbot/
-├── _legacy/                         # Reference-only v3.0 Streamlit code
-│   ├── llm/
-│   │   ├── deepseek_client.py       # Sync OpenAI client (superseded by AsyncOpenAI)
-│   │   └── tools.py                 # Original tool schemas & system prompts
-│   ├── sheets/
-│   │   ├── column_map.py            # Static alias dictionary (ported to core/column_mapper.py)
-│   │   ├── dynamic_column_mapper.py # LLM 2-pass mapper (ported to core/column_mapper.py)
-│   │   ├── executor.py              # SheetsExecutor (logic split into sheets/ submodules)
-│   │   ├── project_registry.py      # Config sheet project CRUD (replaced by PostgreSQL)
-│   │   └── sheet_registry.py        # Active sheet tracking (replaced by sessions table)
-│   ├── permissions.py               # PermissionChecker (ported to core/permissions.py)
-│   ├── audit.py                     # AuditLogger (ported to core/audit.py)
-│   ├── data_quality.py              # DataQualityChecker (ported to core/data_quality.py)
-│   └── sheets_auth.py               # Credential builder (ported to sheets/client.py)
-│
-├── backend/                         # FastAPI application
-│   ├── app/
-│   │   ├── __init__.py
-│   │   ├── main.py                  # FastAPI app entry, CORS, lifespan (init_db), router mounts
-│   │   ├── config.py                # Pydantic Settings: DATABASE_URL, REDIS_URL, DEEPSEEK_API_KEY,
-│   │   │                            #   GOOGLE_CLIENT_ID/SECRET, JWT_SECRET, DEFAULT_* params,
-│   │   │                            #   ADMIN_EMAILS, CORS_ORIGINS — reads from .env
-│   │   ├── deps.py                  # get_current_user(): JWT decode + user auto-upsert
-│   │   │                            # get_google_token(): X-Google-Access-Token header extraction
-│   │   │
-│   │   ├── api/                     # HTTP/WS endpoints
-│   │   │   ├── auth.py              # GET /api/me — returns {email, is_admin, display_name}
-│   │   │   ├── chat.py              # WS /ws — agentic chat endpoint
-│   │   │   │                        # GET /api/projects — user's accessible projects list
-│   │   │   │                        # Contains: authenticate_ws_user(), connection_ok msg,
-│   │   │   │                        #   session creation, agentic_loop invocation
-│   │   │   ├── admin.py             # POST/GET/PUT/DELETE /api/admin/projects
-│   │   │   │                        # POST/GET /api/admin/permissions
-│   │   │   │                        # GET /api/admin/audits
-│   │   │   │                        # POST /api/admin/projects/detect-metadata (auto-detect)
-│   │   │   └── health.py            # GET /api/health — returns {"status": "ok"}
-│   │   │
-│   │   ├── core/                    # Business logic
-│   │   │   ├── agentic_loop.py      # run_agentic_loop(): max 8 iterations, DSML guard,
-│   │   │   │                        #   CoT stripping, system prompt swap (full → compact),
-│   │   │   │                        #   WS streaming (tool_start/tool_result/assistant msgs)
-│   │   │   ├── llm_router.py        # select_model(): conditional keywords → deepseek-reasoner,
-│   │   │   │                        #   else deepseek-chat; has_conditional_logic() helper
-│   │   │   ├── tool_schemas.py      # 9 tool definitions (OpenAI function-calling format) +
-│   │   │   │                        #   SYSTEM_PROMPT + SYSTEM_PROMPT_COMPACT templates
-│   │   │   ├── tool_dispatch.py     # dispatch_tool(): routes reads (direct) vs writes (queue),
-│   │   │   │                        #   pre-reads old_values for audit, enqueue_write_job()
-│   │   │   ├── permissions.py       # PermissionChecker: 3-tier RBAC (admin/editor/viewer),
-│   │   │   │                        #   field-level enforcement, denied_operations,
-│   │   │   │                        #   READ_ONLY_TOOLS & WRITE_TOOLS sets,
-│   │   │   │                        #   resolve_user_permissions() DB lookup
-│   │   │   ├── audit.py             # log_audit(): asyncio.create_task non-blocking pattern,
-│   │   │   │                        #   _write_audit_record(): direct sync insert,
-│   │   │   │                        #   convenience wrappers: log_update_cell, log_bulk_update,
-│   │   │   │                        #     log_format_row, log_add_row (UNUSED — dead code)
-│   │   │   ├── data_quality.py      # DataQualityChecker: blank_field_counts(),
-│   │   │   │                        #   completeness_score(), stale_items(),
-│   │   │   │                        #   consistency_checks() (4 rules, schema_config-driven)
-│   │   │   ├── column_mapper.py     # COLUMN_ALIASES (72 entries), resolve_column() 3-tier
-│   │   │   │                        #   (exact → alias → fuzzy), build_column_map() 2-pass LLM,
-│   │   │   │                        #   get_column_map_json() for system prompt injection
-│   │   │   └── schema_detect.py     # detect_schema_config(): single LLM call per tab,
-│   │   │                            #   detect_all_tabs(): iterates all tabs, returns
-│   │   │                            #   {tabs: {tabName: config}, global: {...}}
-│   │   │
-│   │   ├── sheets/                  # Embedded Google Sheets layer
-│   │   │   ├── client.py            # build_sheets_service(): OAuth Credentials → googleapiclient
-│   │   │   │                        #   Uses settings.GOOGLE_CLIENT_ID/SECRET for token refresh
-│   │   │   ├── read.py              # get_row(), search_rows() (AND filters, 3 match types),
-│   │   │   │                        #   summarize() (count_by_field, completion_rate,
-│   │   │   │                        #     blank_fields, overdue), run_data_quality_check(),
-│   │   │   │                        #   get_row_raw(), get_bulk_rows_raw(), find_row_num(),
-│   │   │   │                        #   idx_to_col_letter(), _get_tab_schema()
-│   │   │   ├── write.py             # update_cell() (batchUpdate), bulk_update() (with filter
-│   │   │   │                        #   fallback + individual retry), add_row() (append)
-│   │   │   ├── format.py            # format_row(): repeatCell color formatting,
-│   │   │   │                        #   COLOR_MAP: red/green/amber/blue/white
-│   │   │   ├── meta.py              # _detect_header_row() (canonical markers scan),
-│   │   │   │                        #   get_sheet_id(), get_header_row(), get_all_ids(),
-│   │   │   │                        #   detect_prefix(), next_ricefw_id(), switch_module()
-│   │   │   └── retry.py             # _with_retry(): exponential backoff for 429/500/503,
-│   │   │                            #   max 4 attempts, base delay 1.0s
-│   │   │
-│   │   ├── models/                  # SQLAlchemy 2.0 ORM models (Mapped[] annotations)
-│   │   │   ├── __init__.py          # Re-exports Base for init_db()
-│   │   │   ├── user.py              # User: email(unique), google_sub, display_name,
-│   │   │   │                        #   avatar_url, last_login, created_at
-│   │   │   ├── project.py           # Project: spreadsheet_id(unique), project_name,
-│   │   │   │                        #   default_tab, company_prefix, is_active,
-│   │   │   │                        #   schema_config(JSON), created_at
-│   │   │   ├── permission.py        # Permission: user_id+project_id(unique), role(enum),
-│   │   │   │                        #   allowed_fields(JSON), denied_operations(JSON)
-│   │   │   ├── session.py           # Session: id(UUID), user_id, project_id, active_tab,
-│   │   │   │                        #   last_active, created_at
-│   │   │   └── audit_log.py         # AuditLog: 13 columns + created_month(computed)
-│   │   │
-│   │   ├── queue/                   # Redis write queue
-│   │   │   ├── producer.py          # enqueue_write_job() → Redis RPUSH "migrationbot:write_queue",
-│   │   │   │                        #   EnqueuedJob class, uuid4 job IDs
-│   │   │   ├── worker.py            # process_job(): handles update_cell/bulk_update/format_row/add_row
-│   │   │   │                        #   start_worker(): BLPOP consumer, 1-sec throttle,
-│   │   │   │                        #   audit logging per mutation, __main__ entry point
-│   │   │   └── schemas.py           # WriteJobPayload: Pydantic model with user_email,
-│   │   │                            #   google_access_token, session_id, tool_name,
-│   │   │                            #   spreadsheet_id, sheet_tab, args, old_values
-│   │   │
-│   │   └── db/
-│   │       └── engine.py            # create_async_engine (asyncpg), AsyncSessionLocal,
-│   │                                #   Base(DeclarativeBase), get_db() yield dependency,
-│   │                                #   init_db() / drop_db() helpers
-│   │
-│   ├── tests/                       # pytest test suites
-│   │   ├── test_db.py
-│   │   ├── test_core/
-│   │   ├── test_sheets/
-│   │   └── integration/
-│   │
-│   ├── requirements.txt             # 19 dependencies: fastapi, uvicorn, sqlalchemy, asyncpg,
-│   │                                #   pydantic, python-jose, redis, structlog, google-*,
-│   │                                #   openai, pandas, pytest, httpx, greenlet
-│   ├── Dockerfile                   # python:3.12-slim, uvicorn CMD
-│   └── pyproject.toml
-│
-├── frontend/                        # Next.js 16 application
-│   ├── src/
-│   │   ├── auth.ts                  # NextAuth v5 config: Google provider (spreadsheets scope),
-│   │   │                            #   JWT callback (stores googleAccessToken), session callback
-│   │   │                            #   (signs HS256 JWT with email/name/sub/google_access_token),
-│   │   │                            #   trustHost: true, strategy: "jwt"
-│   │   ├── hooks/
-│   │   │   └── useWebSocket.ts      # useWebSocket(apiToken, projectId): auto-connect,
-│   │   │                            #   reconnect on close (3s, skip code 1000/1008),
-│   │   │                            #   30s ping heartbeat, message dispatch:
-│   │   │                            #     assistant → append content to last msg
-│   │   │                            #     tool_start → add toolCall with running status
-│   │   │                            #     tool_result → mark toolCall as completed
-│   │   │                            #     queue_update → dispatch CustomEvent
-│   │   │                            #     error → add system message
-│   │   │                            #     connection_ok → set activeTab
-│   │   ├── store/
-│   │   │   └── useChatStore.ts      # Zustand store: Project/Message interfaces,
-│   │   │                            #   projects[], activeProject, activeTab("SD" default),
-│   │   │                            #   isConnected, messages[], ws ref,
-│   │   │                            #   setProjects, setActiveProject (resets activeTab),
-│   │   │                            #   addMessage, updateLastMessage, clearChat
-│   │   └── app/
-│   │       ├── layout.tsx           # Root layout: SessionProvider, Geist + Geist_Mono fonts,
-│   │       │                        #   dark mode, bg-[#030014], metadata title/description
-│   │       ├── page.tsx             # Landing page: Google sign-in button, 3 feature cards
-│   │       │                        #   (AI-Agentic Actions, Queue-Throttled Writes, RBAC),
-│   │       │                        #   animated blobs, grid overlay, auto-redirect if authed
-│   │       ├── globals.css          # Tailwind v4 @import, custom CSS variables, glass-panel,
-│   │       │                        #   glass-card, chat-bubble-user/agent, custom scrollbar,
-│   │       │                        #   animate-pulse-slow, animate-slide-up, animate-blob
-│   │       ├── chat/
-│   │       │   └── page.tsx         # Chat interface: WebSocket messages, project dropdown,
-│   │       │                        #   module tab selector (from schema_config.tabs keys,
-│   │       │                        #   fallback to hardcoded [SD,MM,FI,CO,PP,QM]),
-│   │       │                        #   tool call visualization, toast notifications,
-│   │       │                        #   streaming dots, HARDCODED admin email check
-│   │       ├── admin/
-│   │       │   ├── layout.tsx       # Admin sidebar: Overview, Projects Manager, User
-│   │       │   │                    #   Permissions, Audit Viewer nav links,
-│   │       │   │                    #   HARDCODED admin email guard (rohai/ruhail/admin)
-│   │       │   ├── page.tsx         # Overview dashboard: 4 metric cards (projects, users,
-│   │       │   │                    #   audits, errors), operations area chart (recharts),
-│   │       │   │                    #   tool distribution bar chart
-│   │       │   ├── projects/
-│   │       │   │   └── page.tsx     # Project CRUD: table list, create/edit modal,
-│   │       │   │                    #   Auto-Detect Wizard (URL → analyze → tab checkboxes),
-│   │       │   │                    #   Manual Mode (JSON schema editor), delete with confirm
-│   │       │   ├── users/
-│   │       │   │   └── page.tsx     # User permission management: assign projects, set roles,
-│   │       │   │                    #   field-level access, denied operations
-│   │       │   └── audit/
-│   │       │       └── page.tsx     # Audit log viewer: filterable, paginated, sortable
-│   │       └── api/auth/[...nextauth]/
-│   │           └── route.ts         # NextAuth catch-all API route handler
-│   │
-│   ├── Dockerfile                   # Multi-stage: deps → builder → runner (node:20-alpine),
-│   │                                #   standalone output, non-root user
-│   ├── package.json                 # Dependencies: next@16.2.9, react@19.2.4, next-auth@5,
-│   │                                #   zustand@5, recharts@2, lucide-react, framer-motion,
-│   │                                #   jose, clsx, tailwind-merge
-│   └── next.config.ts               # output: "standalone" (for Docker deployment)
-│
-├── docker-compose.yml               # 6 services: postgres:16, redis:7-alpine, backend,
-│                                    #   worker, frontend, caddy:2-alpine
-├── Caddyfile                        # migrationbot.duckdns.org: route-based splitting
-│                                    #   /api/auth/* → frontend, /api/* → backend,
-│                                    #   /ws* → backend, * → frontend
-├── .github/workflows/
-│   ├── ci.yml                       # On push to main/develop/phase3: pytest + Next.js build
-│   └── deploy.yml                   # On push to main/phase3: SSH to VPS, git pull,
-│                                    #   docker compose down && up --build
-├── .env.example                     # Template for all env vars (23 lines)
-├── .env                             # Actual secrets (gitignored)
-├── .gitignore
-├── .gitattributes                   # LF enforcement for .sh and .py files
-├── implementation.md                # Detailed implementation plan
-├── TDD.md                           # This document
-└── gemini.md                        # AI developer guide
-```
+Five tables, all SQLAlchemy 2.0 `Mapped[...]` / `mapped_column(...)` on a shared `DeclarativeBase`
+(`db/engine.py:25-26`). Created at API startup by `init_db()` in the lifespan hook
+(`main.py:24`); failure is logged and swallowed (`main.py:26-28`). No migration tool exists —
+schema evolution relies on `metadata.create_all` (`db/engine.py:39-40`).
 
-### File Byte Sizes (Significant Files)
+| Table | Model | Notable columns |
+|---|---|---|
+| `users` | `models/user.py:12-26` | unique indexed `email`; nullable `google_sub`; `last_login` |
+| `projects` | `models/project.py:14-30` | unique `spreadsheet_id`; `default_tab`; `company_prefix`; `schema_config` JSONB default `{}` |
+| `permissions` | `models/permission.py:13-34` | `role` default `"editor"`; `allowed_fields` default `["*"]`; `denied_operations` default `[]`; unique `(user_id, project_id)`; CHECK `role IN ('admin','editor','viewer')` |
+| `sessions` | `models/session.py:13-31` | UUID PK; `active_tab`; `project_id` `ON DELETE SET NULL` |
+| `audit_logs` | `models/audit_log.py:8-30` | `old_value`/`new_value` Text; `args_json` JSONB; `result_ok`; generated `created_month` |
 
-| File | Size | Purpose |
-|------|------|---------|
-| `backend/app/core/agentic_loop.py` | ~5.3 KB | Central agent execution engine |
-| `backend/app/core/tool_schemas.py` | ~5.0 KB | 9 tool definitions + system prompts |
-| `backend/app/core/column_mapper.py` | ~5.3 KB | 72 aliases + LLM mapper + resolve_column |
-| `backend/app/sheets/read.py` | ~16.2 KB | All read operations + summarize + data quality |
-| `backend/app/sheets/write.py` | ~8.6 KB | All write operations (cell, bulk, add) |
-| `backend/app/queue/worker.py` | ~11.0 KB | Queue consumer with all 4 write handlers |
-| `frontend/src/app/admin/projects/page.tsx` | ~28.2 KB | Full project CRUD + auto-detect wizard |
-| `frontend/src/app/admin/users/page.tsx` | ~15.6 KB | RBAC permission management UI |
-| `frontend/src/app/chat/page.tsx` | ~16.9 KB | Chat interface + tool visualization |
-| `frontend/src/hooks/useWebSocket.ts` | ~5.6 KB | WebSocket client with reconnect logic |
+**Postgres holds no spreadsheet data.** Every WRICEF row is read live from Google Sheets. The
+database exists for identity, authorisation, session state, and the audit trail only.
 
 ---
 
-## 3. Authentication & Session Management
+## 3. Configuration & Startup
 
-### OAuth Flow
+`Settings` (`config.py:5-37`) reads `("../.env", ".env")` relative to the process working directory
+(`config.py:34`) and ignores unknown keys (`:36`).
 
-```text
-Browser → NextAuth.js (Google OAuth, scope: openid email profile spreadsheets)
-       ↓
-Google authorization code → NextAuth exchanges for tokens
-       ↓
-NextAuth JWT callback: stores google_access_token in JWT claims
-       ↓
-NextAuth Session callback: signs HS256 JWT containing {email, name, sub, google_access_token}
-       ↓
-Frontend stores session.apiToken (signed JWT) and session.googleAccessToken
-       ↓
-WebSocket: sends apiToken as query parameter ?token=<JWT>
-REST API: sends apiToken in Authorization: Bearer <JWT> header
-       ↓
-FastAPI deps.py: jose.jwt.decode(token, JWT_SECRET, HS256) → extracts email
-       ↓
-User lookup/auto-create in PostgreSQL → attach to request context
-```
+**Three variables are required with no default** — `DEFAULT_SPREADSHEET_ID` (`config.py:18`),
+`ADMIN_EMAILS` (`:23`), `CORS_ORIGINS` (`:24`). A `ValidationError` on any of them is converted to
+a `RuntimeError` naming the missing keys (`config.py:39-48`). This is a deliberate hardening
+change: these previously fell back to hardcoded production values.
 
-### Key Auth Files
+Secrets still carrying defaults: `DEEPSEEK_API_KEY`, `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`,
+and `JWT_SECRET` (`config.py:11-14`).
 
-| File | Responsibility |
-|------|---------------|
-| `frontend/src/auth.ts` | NextAuth v5 config: Google provider (spreadsheets scope), JWT callback stores `googleAccessToken`, session callback signs HS256 JWT via `jose.SignJWT` |
-| `backend/app/deps.py` | `get_current_user()`: JWT decode + user auto-upsert; `get_google_token()`: X-Google-Access-Token header extraction |
-| `backend/app/api/chat.py` | `authenticate_ws_user()`: WebSocket JWT decode from `?token=` query param; extracts `google_access_token` from JWT payload |
-
-### Security Architecture
-
-- Google OAuth tokens are embedded in the signed JWT and forwarded to FastAPI for Sheets API calls.
-- The `google_access_token` is embedded in the JWT payload (signed at NextAuth session callback) — NOT via a separate `X-Google-Access-Token` header.
-- The WS endpoint extracts `google_access_token` directly from the decoded JWT payload.
-- A mock fallback exists (`token.startsWith("mock-")`) for local development without Google OAuth.
-- Token expiry: JWT is signed with `exp` = 24 hours from creation time.
-
-### Admin Detection
-
-- **Backend:** `config.py` → `ADMIN_EMAILS` env var → `admin_emails_list` property. `deps.py` checks email against this list.
-- **Frontend (BUG):** `chat/page.tsx` line 161 and `admin/layout.tsx` line 28 use a **hardcoded** substring check (`["rohai", "ruhail", "admin"].some(key => email.includes(key))`) as admin detection. This duplicates and deviates from the backend's `ADMIN_EMAILS` env var approach.
+> **⚠ This exact gap caused a live outage.** On 2026-08-06 the deployed `.env` had no
+> `CORS_ORIGINS`, and because `settings` is built at module import (`config.py:40`), both
+> `backend` and `worker` crash-looped — `docker ps` showed `Restarting (1)` on ~20-second cycles
+> for roughly 21 hours before it was noticed, with `frontend`, `caddy`, `postgres`, and `redis` all
+> healthy throughout, giving no visible signal that anything was wrong short of checking container
+> status directly. Fixed operationally (the var added to the server's `.env`) and structurally:
+> `.env.example` now documents all three required variables and ships a working `CORS_ORIGINS`
+> value instead of the `*` it had before (a literal `*` also silently breaks credentialed
+> cross-origin requests once combined with `allow_credentials=True` — see §16.8), and
+> `docker-compose.yml`'s `backend` service now has a `healthcheck` against `GET /api/ready` (§10)
+> so this class of failure shows as `unhealthy` in `docker compose ps` rather than requiring a log
+> read to discover.
 
 ---
 
-## 4. Database Schema (PostgreSQL)
+## 4. Authentication & Session Resolution
 
-### Tables
+### 4.1 Token chain
 
-| Table | Purpose | Key Fields |
-|-------|---------|------------|
-| `users` | Auto-registered on first login | `email` (unique), `google_sub`, `display_name`, `avatar_url`, `last_login` |
-| `projects` | Registered spreadsheet trackers | `spreadsheet_id` (unique), `project_name`, `default_tab`, `company_prefix`, `schema_config` (JSON), `is_active` |
-| `permissions` | Per-user per-project RBAC | `user_id` + `project_id` (unique), `role` (admin/editor/viewer), `allowed_fields` (JSON), `denied_operations` (JSON) |
-| `sessions` | WebSocket session tracking | `id` (UUID), `user_id`, `project_id`, `active_tab`, `last_active` |
-| `audit_logs` | Immutable mutation trail | `user_email`, `tool_name`, `ricefw_id`, `field`, `old_value`, `new_value`, `args_json`, `result_ok`, `error`, `created_month` (computed) |
+1. **Google OAuth** — NextAuth requests `openid email profile
+   https://www.googleapis.com/auth/spreadsheets` with `access_type: "offline"` and
+   `prompt: "consent"` (`frontend/src/auth.ts:52-54`).
+2. **JWT callback** — first sign-in captures the Google access token, absolute expiry, and refresh
+   token (`auth.ts:63-70`). Later calls treat the token as fresh while
+   `Date.now() < expiresAt - 5*60*1000` (`auth.ts:76`); otherwise `refreshGoogleAccessToken()`
+   performs a refresh grant (`auth.ts:13-22`), preserving the existing refresh token when Google
+   returns none (`:37`).
+3. **Backend token** — the `session` callback signs a fresh HS256 JWT on every session read
+   (`auth.ts:107-109`) carrying `email`, `name`, `picture`, `sub`, `google_access_token`, and
+   `exp` = now + 24 h (`auth.ts:98-105`), exposed as `session.apiToken`.
 
-### ORM Details (SQLAlchemy 2.0)
+> **⚠ Lifetime mismatch.** The backend JWT has a 24-hour `exp` (`auth.ts:104`) but embeds a Google
+> access token that lives about an hour. The WebSocket extracts that Google token exactly once at
+> connect time (`chat.py:41`) and holds it for the connection's life, so a long-lived socket will
+> present an expired Google credential — surfacing as a 401 from Google, not from FastAPI.
 
-All models use `DeclarativeBase` with `Mapped[]` type annotations (SQLAlchemy 2.0 style):
+> **⚠ Refresh token never reaches the backend.** `auth.ts:98-105` includes only
+> `google_access_token`. Every Sheets client built on the WebSocket path is therefore constructed
+> with `refresh_token=None` (`tool_dispatch.py:29`, `:66`; `sheets/client.py:6`) and cannot
+> self-refresh. Only the admin REST path passes one, from the `X-Google-Refresh-Token` header
+> (`deps.py:78`, `admin.py:96-99`, `:137-140`).
+
+### 4.2 HTTP authentication
+
+`get_current_user` (`deps.py:14-73`) decodes the bearer token with HS256 and requires an `email`
+claim (`:25-31`). On `JWTError` it falls back to a developer mode accepting any token beginning
+`mock-` or containing `@` (`:32-41`); otherwise 401 (`:43-46`). Unknown emails are
+**auto-provisioned** (`:56-67`).
+
+> **⚠ Production-reachable auth bypass.** The `mock-`/`@` fallback (`deps.py:34`, mirrored at
+> `chat.py:44`) is not gated by any environment flag. Any string containing `@` that fails
+> signature verification is accepted as that identity, and the account is created on the spot.
+> Since admin status is decided purely by email membership (`admin.py:23`), presenting the admin
+> address as a bearer token reaches `require_admin`. `JWT_SECRET` also still has a shipped default
+> (`config.py:14`) matching the frontend fallback (`auth.ts:5`), so a deployment that omits it
+> signs with a publicly known key.
+
+### 4.3 WebSocket authentication and project resolution
+
+`authenticate_ws_user` (`chat.py:35-58`) mirrors the HTTP decoder but pulls `google_access_token`
+from the payload (`:41`) and does **not** auto-provision — unknown email returns `None` and the
+socket closes (`:56-57`).
+
+The socket is accepted *before* authentication (`chat.py:72`), then closed with `1008` on failure
+(`:79-81`). Project resolution is a three-step fallback: the `project_id` query parameter
+(`:65`, `:87`); else the user's most recently active session's project (`:88-95`); else the first
+`is_active` project (`:98-102`). All three failing closes the socket (`:104-110`).
+
+A `sessions` row is loaded or created with `active_tab` = `project.default_tab` or `"SD"`
+(`:121-133`). Conversation history is **in-process only**, initialised empty per connection
+(`:136`) and reassigned each turn (`:228`) — nothing persists chat history.
+
+---
+
+## 5. Data Flow Traces
+
+### 5.1 Write path — `update_cell`, end to end
+
+| # | Function | Location | Action |
+|---|---|---|---|
+| 1 | `websocket_chat_endpoint` | `chat.py:188-191` | receives frame, extracts `content` |
+| 2 | `get_user_permissions` | `chat.py:218` → `permissions.py:77` | builds `PermissionChecker` |
+| 3 | `run_agentic_loop` | `chat.py:228-242` | enters the LLM loop |
+| 4 | LLM call | `agentic_loop.py:60` | model returns `tool_calls` |
+| 5 | `send_websocket_msg` | `agentic_loop.py:120-124` | emits `tool_start` |
+| 6 | `can_execute` | `agentic_loop.py:127` → `permissions.py:28` | RBAC gate; denial → `error` frame (`:131-134`) |
+| 7 | `dispatch_tool` | `agentic_loop.py:137-148` → `tool_dispatch.py:6` | routes by tool name |
+| 8 | `build_sheets_service` | `tool_dispatch.py:66` | client built **with no refresh token** |
+| 9 | `get_row_raw` | `tool_dispatch.py:76` → `read.py:50` | pre-reads old values **live from Sheets** for the audit trail |
+| 10 | `enqueue_write_job` | `tool_dispatch.py:85-94` → `producer.py:21` | `RPUSH` onto `migrationbot:write_queue` (`producer.py:53-57`) |
+| 11 | return | `tool_dispatch.py:95-100` | `{ok: true, status: "queued", job_id}` — **optimistic**, before Sheets is touched |
+| 12 | `send_websocket_msg` | `agentic_loop.py:151-155` | emits `tool_result` with that optimistic payload |
+| — | *process boundary* | | |
+| 13 | `start_worker` | `worker.py:278` | `BLPOP`, 10 s timeout |
+| 14 | `process_job` | `worker.py:30` | rehydrates `WriteJobPayload` |
+| 15 | project lookup | `worker.py:34-37` | re-reads `schema_config` from Postgres |
+| 16 | `build_sheets_service` | `worker.py:41` | rebuilds client from the token in the job |
+| 17 | `update_cell` | `worker.py:58-65` → `write.py:10` | the mutation |
+| 18 | `find_row_num` | `write.py:29` → `read.py:28` | scans the ID column live from Sheets |
+| 19 | `get_header_row` | `write.py:33` → `meta.py:45` | fetches headers |
+| 20 | `resolve_column` | `write.py:42` → `column_mapper.py:120` | maps field name to a real header |
+| 21 | `_with_retry(batchUpdate)` | `write.py:54-60` → `retry.py:7` | one `values().batchUpdate` |
+| 22 | `_write_audit_record` | `worker.py:75-88` | one `audit_logs` row **per field** |
+| 23 | `publish_queue_update` | `worker.py:255-263` → `events.py:22` | publishes terminal state to `migrationbot:queue_events:<email>` |
+| 24 | `forward_queue_updates` | `chat.py:155-180` | API's per-connection subscriber relays it as a `queue_update` frame |
+| 25 | throttle | `worker.py:297` | `asyncio.sleep(1.0)` before the next job |
+
+Steps 23–24 are the completion-feedback path. `publish_queue_update` is called on **every**
+terminal path including the unsupported-tool branch (`worker.py:231-233`, which sets `error_msg`)
+and the exception handler (`:235-252`), and a publish failure is swallowed so a successful write is
+never failed by a notification problem (`events.py:51-53`). The API subscribes per connection
+(`chat.py:182`) and tears the task down in `finally` (`:257-262`). Because the agentic loop and the
+relay both write to one socket, sends are serialised behind an `asyncio.Lock` (`chat.py:149-153`).
+
+`update_cell` returns `{"ok": True, ...}` unconditionally once `batchUpdate` returns
+(`write.py:62-67`) — the API response body is not inspected.
+
+### 5.2 Read path — `search_rows`
+
+| # | Function | Location | Action |
+|---|---|---|---|
+| 1–7 | as the write path, through `dispatch_tool` | | |
+| 8 | read branch | `tool_dispatch.py:26` | membership test against the 5-name read tuple |
+| 9 | `search_rows` | `tool_dispatch.py:36-45` → `read.py:156` | filters, `return_fields`, `limit` (default 20) |
+| 10 | `get_header_row` | `read.py:170` → `meta.py:45` | **API call 1** — headers, each cell `.strip()`ed (`meta.py:52`) |
+| 11 | `col_idx` build | `read.py:179` | `{h: i}` — **exact-match** keys, no normalisation |
+| 12 | `resolve_column` | `read.py:185` | maps each filter term to a canonical name |
+| 13 | mapping guard | `read.py:186-187` | canonical not in `col_idx` → returns `{"ok": false, "error": ...}` |
+| 14 | bulk fetch | `read.py:195-198` | **API call 2** — `{tab}!{start}:{start+2000}` |
+| 15 | matching | `read.py:203-234` | AND across filters; `blank` / `contains` / `exact` |
+| 16 | truncation | `read.py:233-234`, `:240` | stops at `limit`; reports `capped` |
+
+Two Sheets API calls per search, and no cache — every `search_rows`, `summarize`, and
+`data_quality` invocation re-reads up to 2001 rows from Google (`read.py:197`, `:263`, `:422`).
+
+---
+
+## 6. RBAC Model
+
+### 6.1 Two authorisation systems
+
+- **Config admin** governs `/api/admin/*`: `require_admin` compares the caller's email against
+  `settings.admin_emails_list` (`admin.py:22-28`), re-read from `os.environ` per access
+  (`config.py:27-30`).
+- **Row role** governs tool execution: `permissions.role` ∈ `admin`/`editor`/`viewer`
+  (`models/permission.py:33`).
+
+They bridge one way only — a config admin short-circuits to `role="admin"` before any DB lookup
+(`permissions.py:84-85`). A row-level `admin` gets no REST access.
+
+### 6.2 Enforcement
+
+Exactly one point: `checker.can_execute(...)` in the agentic loop before every dispatch
+(`agentic_loop.py:127`). `dispatch_tool` performs no check of its own (`tool_dispatch.py:6-108`).
+Frontend admin gating is cosmetic (`chat/page.tsx` fetches `/api/me`'s `is_admin`).
 
 ```python
-# Example: Project model (project.py)
-class Project(Base):
-    __tablename__ = "projects"
-    id: Mapped[int] = mapped_column(primary_key=True)
-    project_name: Mapped[str] = mapped_column(String(255), nullable=False)
-    spreadsheet_id: Mapped[str] = mapped_column(String(255), unique=True, nullable=False)
-    default_tab: Mapped[Optional[str]] = mapped_column(String(100))
-    company_prefix: Mapped[Optional[str]] = mapped_column(String(20))
-    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
-    schema_config: Mapped[Optional[dict]] = mapped_column(JSON, default=dict)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=func.now())
+READ_ONLY_TOOLS = {"get_row", "search_rows", "summarize", "switch_module", "data_quality"}
+WRITE_TOOLS     = {"update_cell", "bulk_update", "format_row", "add_row"}
 ```
+— `permissions.py:8-9`.
 
-### Database Lifecycle
+| Role | Reads | Writes | Field limits | `denied_operations` |
+|---|---|---|---|---|
+| **Config admin** | all | all | none | not consulted |
+| **Row admin** | all | all | none — returns at `permissions.py:34-35` | **not consulted** |
+| **Editor** (incl. default) | all | all not in `denied_ops` | `update_cell` (`:52-63`), `bulk_update` (`:66-72`) only | honoured (`:45-49`) |
+| **Viewer** | all | none (`:37-43`) | n/a | **not consulted** |
 
-- **`init_db()`**: Called in FastAPI lifespan hook at startup — `metadata.create_all()`. Only creates tables that don't exist.
-- **No Alembic migrations** configured. Schema changes require manual `drop_db()` or direct SQL.
-- **Connection:** `create_async_engine()` with `postgresql+asyncpg`, `pool_pre_ping=True`, `expire_on_commit=False`.
+Field enforcement is skipped entirely when `allowed_fields == ["*"]` (`:52`, `:66`), and covers only
+those two tools — `add_row`'s free-form `fields` dict and `format_row` are ungated.
 
----
+> **⚠ RBAC is fail-open.** `get_user_permissions` returns **editor with `["*"]`** when no
+> `project_id` is given (`permissions.py:90-91`), when no `users` row matches (`:94-97`), and when
+> no `permissions` row exists (`:113`). Combined with the WebSocket's "first active project"
+> fallback (`chat.py:98-102`), a user who was never granted anything lands on an arbitrary project
+> as an editor.
 
-## 5. LLM Orchestration & Agentic Loop
-
-### Model Selection (`core/llm_router.py`)
-
-| Condition | Model | Rationale |
-|-----------|-------|-----------| 
-| Iteration 0 + conditional keywords detected | `deepseek-reasoner` | Chain-of-thought for "if X then Y" logic |
-| All other cases | `deepseek-chat` (V3) | Faster, cheaper, no CoT leakage risk |
-
-**Conditional keywords:** `if`, `only if`, `check first`, `depending on`, `unless`, `conditional`, `where`.
-
-### LLM Client Configuration (`chat.py`)
-
-```python
-client = AsyncOpenAI(
-    api_key=settings.DEEPSEEK_API_KEY,
-    base_url="https://api.deepseek.com"  # or OpenAI URL heuristic
-)
-```
-
-The base URL is determined by a heuristic: if `DEEPSEEK_API_KEY` does not contain `"sk-"` + alphanumeric OpenAI pattern, it defaults to DeepSeek's API endpoint.
-
-### Agentic Loop (`core/agentic_loop.py`)
-
-- **Max iterations:** 8 (hard limit)
-- **System prompt strategy:**
-  - Iteration 0: Full `SYSTEM_PROMPT` with `column_map` JSON and complete schema context
-  - Iterations 1+: `SYSTEM_PROMPT_COMPACT` (shorter, saves tokens)
-- **DSML leakage guard:** If response content contains `<｜｜DSML｜｜>` markers, the response is discarded and retried with `deepseek-chat` (not reasoner)
-- **CoT stripping:** `reasoning_content` attribute from deepseek-reasoner is logged internally but never sent to the client
-- **Tool dispatch flow:** For each `tool_call`, sends `tool_start` WS message → RBAC check → `dispatch_tool()` → `tool_result` WS message
-- **Streaming:** The final assistant text is sent via `{"type": "assistant", "content": "...", "done": true}` as a complete message (not token-by-token streaming)
+> **⚠ `WRITE_TOOLS` is never read.** Defined at `permissions.py:9` but `can_execute` only tests
+> `READ_ONLY_TOOLS` (`:38`). Classification is by exclusion, so a new read tool omitted from that
+> set is silently denied to viewers.
 
 ---
 
-## 6. Tool System & RBAC Enforcement
+## 7. Schema & Column Resolution
 
-### Tool Catalogue (9 tools in `core/tool_schemas.py`)
+### 7.1 `schema_config` shape
 
-| Tool | Path | Description |
-|------|------|-------------|
-| `get_row` | READ (direct) | Fetch WRICEF object by ID |
-| `search_rows` | READ (direct) | Multi-filter search with AND logic, 3 match types (exact, contains, blank) |
-| `summarize` | READ (direct) | Aggregation reports: count_by_field, completion_rate, blank_fields, overdue |
-| `switch_module` | READ (direct) | Change active sheet tab (validates tab existence) |
-| `data_quality` | READ (direct) | Validation checks: blank fields, stale items, consistency |
-| `update_cell` | WRITE (queued) | Update one or more field values for a single RICEFW ID |
-| `bulk_update` | WRITE (queued) | Batch update field across multiple IDs (by list or filter) |
-| `format_row` | WRITE (queued) | Apply background color to row/cells (5 colors) |
-| `add_row` | WRITE (queued) | Append new WRICEF object with auto-generated ID |
+JSONB defaulting to `{}` (`models/project.py:23`), in one of two shapes distinguished by a
+top-level `"tabs"` key: multi-tab (`{"tabs": {...}, "global": {...}}`, what `detect_all_tabs`
+produces at `schema_detect.py:73-79`) or flat. The disambiguation is reimplemented at
+`read.py:14-17`, `write.py:23`, `:82`, `:193`, `worker.py:185`, `chat.py:222`, and
+`agentic_loop.py:32-35` — seven copies, one of them (`read.py`) a private `_get_tab_schema`
+function.
 
-### Tool Dispatch (`core/tool_dispatch.py`)
+Per-tab defaults are applied inline at each use: `data_start_row` → `3`, `primary_id_position` →
+`"B"`, `primary_id_column` → `"RICEFW ID"`, `assignee_column` → `"Technical Resource "` (with
+trailing space), `critical_fields` → a six-name list (`read.py:175`). `header_row_num` is always
+`data_start_row - 1`.
 
-```python
-READ_TOOLS = {"get_row", "search_rows", "summarize", "switch_module", "data_quality"}
-WRITE_TOOLS = {"update_cell", "bulk_update", "format_row", "add_row"}
-```
+### 7.2 Column-name resolution and the whitespace asymmetry
 
-- **READ tools** execute directly via `sheets/read.py` or `sheets/meta.py` and return results immediately.
-- **WRITE tools** pre-read old values for auditing, then enqueue via `enqueue_write_job()` to Redis.
+`resolve_column(term, column_map)` (`column_mapper.py:120-140`) resolves in three stages: exact
+match on canonical keys, alias-list match (both compared case-insensitively and stripped), then
+`difflib.get_close_matches` at `cutoff=0.6`. It returns the **unstripped** canonical key.
 
-### RBAC Model (`core/permissions.py`)
+`COLUMN_ALIASES` deliberately preserves the tracker's real header typos and trailing spaces —
+`"Technical Resource "`, `"Functinal Resource "`, `"Color "`, `"Programe Name"`
+(`column_mapper.py:70-76`).
 
-| Tier | Capabilities | Resolution |
-|------|-------------|------------|
-| **Admin** | Bypass all restrictions | Matched via `ADMIN_EMAILS` env var |
-| **Editor** | Write access, field-level restrictions, tool blacklists | DB `permissions` table lookup |
-| **Viewer** | Read-only tools only | DB `permissions` table lookup |
-| **Default** | Editor with `["*"]` access | Fallback when no DB record exists |
+`get_header_row` strips every header cell (`meta.py:52`). The two sides then treat that differently:
 
-**Permission Resolution Chain:**
-1. Check `ADMIN_EMAILS` → if match, grant all
-2. Query `permissions` table for `(user_id, project_id)` → resolve role
-3. For editors: check `allowed_fields` list for write operations
-4. Check `denied_operations` list for tool blacklists
-5. No record found → fall back to default editor with `["*"]` access
+- **Write path** builds `{h.lower().strip(): i}` and looks up `canonical.lower().strip()`
+  (`write.py:34`/`:43`, `:90`/`:96`) — both sides normalised, so it matches.
+- **Read path** builds `{h: i}` and tests `canonical in col_idx` verbatim (`read.py:179`, `:186`;
+  `summarize` at `:259`, `:285`, `:309`, `:333`) — no normalisation.
 
----
+> **⚠ Reads fail on any column whose canonical name carries trailing whitespace (verified).**
+> Executing the real `resolve_column` against a stripped header list reproduces it: `"technical
+> resource"`, `"developer"`, `"abaper"` → `"Technical Resource "` → **not** in `col_idx`;
+> `"color"`, `"flag"` → `"Color "` → **not** in `col_idx`; while `"status"` → `"Dev Status"` →
+> found. `read.py:186-187` turns the miss into a hard `{"ok": false, "error": "Column '<term>'
+> could not be mapped to sheet headers."}`. The same guard fires in all three `summarize` branches
+> (`:285-286`, `:309-310`, `:333-334`). Net effect: users can **write** to the Technical Resource
+> and Color columns but cannot **search, filter, or group by** them. See §16.1.
 
-## 7. Embedded Sheets Layer
+### 7.3 Auto-detection
 
-All Google Sheets API interactions are encapsulated in `backend/app/sheets/`:
+`detect_all_tabs` (`schema_detect.py:19`) enumerates tabs, reads `A1:Z10` from each, and asks
+`deepseek-chat` at `temperature=0.1` to classify the tab and map columns (`:128-157`). Non-tracker
+tabs are skipped (`:58-60`); `data_start_row` = `header_row_index + 2` (`:64`). On LLM failure a
+hard-coded fallback is returned with `is_tracker_sheet: True` (`:167-187`) — so an outage registers
+every tab, including cover pages, as a tracker.
 
-| File | Functions | Notes |
-|------|-----------|-------|
-| `client.py` | `build_sheets_service()` | Builds `googleapiclient` from OAuth token, uses `cache_discovery=False` |
-| `read.py` | `get_row()`, `search_rows()`, `summarize()`, `run_data_quality_check()`, `find_row_num()`, `get_row_raw()`, `get_bulk_rows_raw()` | Schema-driven column resolution via `_get_tab_schema()` |
-| `write.py` | `update_cell()`, `bulk_update()`, `add_row()` | Uses `values.batchUpdate` for minimal API calls; `bulk_update` has individual retry fallback |
-| `format.py` | `format_row()` | `repeatCell` color formatting via `batchUpdate`; COLOR_MAP: red/green/amber/blue/white |
-| `meta.py` | `_detect_header_row()`, `get_sheet_id()`, `get_header_row()`, `get_all_ids()`, `detect_prefix()`, `next_ricefw_id()`, `switch_module()` | Header scanning (canonical markers: ricefw id, module, description, type), RICEFW ID sequence generation |
-| `retry.py` | `_with_retry()` | Exponential backoff: base 1.0s, max 4 attempts, transient codes: {429, 500, 503} |
-
-### Multi-Tab Schema Resolution
-
-All sheet operations support multi-tab configurations via `_get_tab_schema()`:
-
-```python
-def _get_tab_schema(schema_config: dict, active_tab: str) -> dict:
-    if "tabs" in schema_config:
-        return schema_config.get("tabs", {}).get(active_tab, {})
-    return schema_config
-```
-
-This allows both legacy single-tab configs and the newer `{tabs: {SD: {...}, MM: {...}}}` format.
-
-### Key Defaults
-
-- **`data_start_row`**: defaults to `3` (header row assumed at row 2)
-- **`primary_id_position`**: defaults to `"B"` (column B contains RICEFW IDs)
-- **`primary_id_column`**: defaults to `"RICEFW ID"`
-- **Scan limit**: `search_rows()` and `summarize()` scan up to 2000 data rows
+`build_column_map` (`column_mapper.py:151-210`), a two-pass LLM alias generator, is never called
+from anywhere in `backend/`; `detect_all_tabs` writes no `column_map` key. Every deployment
+therefore runs on the static `COLUMN_ALIASES` unless an admin hand-edits `schema_config`.
 
 ---
 
-## 8. Queue-Backed Write Path
+## 8. The Agentic Loop
 
-### Architecture
+`run_agentic_loop` (`agentic_loop.py:12-182`) drives at most **8** iterations (`:26`).
 
-```text
-Tool dispatch → pre-read old_values → enqueue_write_job() → Redis RPUSH "migrationbot:write_queue"
-                                                                    │
-                                                          ┌─────────┴──────────┐
-                                                          │  Worker Process     │
-                                                          │  (separate Docker   │
-                                                          │   container)        │
-                                                          │  BLPOP consumer     │
-                                                          │  1-sec sleep/job    │
-                                                          └─────────┬──────────┘
-                                                                    │
-                                                          Google Sheets API write
-                                                                    │
-                                                          Audit log → PostgreSQL
-```
+- **Model routing** — `select_model` returns `deepseek-reasoner` only on iteration 0 and only when
+  the latest user message contains a conditional keyword (`llm_router.py:5`, `:9-21`); everything
+  else uses `deepseek-chat`.
+- **Prompt swapping** — iteration 0 sends the full prompt with the serialised column map
+  (`:39`); from iteration 1 the system message is replaced in place with a compact variant (`:46-47`).
+- **DSML leakage guard** — content containing `<｜｜DSML｜｜>` triggers one retry against
+  `deepseek-chat` (`:66-76`).
+- **CoT suppression** — `reasoning_content` is logged, never forwarded (`:78-82`).
+- **Self-repair** — a failed tool result gets a `[System Recovery Note]` appended (`:157-164`).
+- **Termination** — no `tool_calls` → emit `assistant` with `done: true`, break (`:100-106`); any
+  exception → emit `error`, break (`:173-179`).
 
-### Queue Schema (`WriteJobPayload`)
+> **⚠ Exhausting the iteration cap notifies nobody (verified).** The `for` at `agentic_loop.py:44`
+> has **no `else:` clause** — scanning lines 44–182 finds only `return messages[1:]` at `:182`
+> after the loop. When all 8 iterations run without the model stopping, the function returns having
+> sent no `assistant` frame and no `error` frame. The client has already seeded an empty assistant
+> bubble in `sendMessage` (`useWebSocket.ts:173-179`) and renders bouncing dots while
+> `content === ""`, so the user sees an indefinite "thinking" state on a request the server has
+> already abandoned. See §16.2.
 
-```python
-class WriteJobPayload(BaseModel):
-    user_email: str
-    google_access_token: str = "mock-google-access-token"
-    session_id: Optional[UUID] = None
-    tool_name: str
-    spreadsheet_id: str
-    sheet_tab: str
-    args: Dict[str, Any] = Field(default_factory=dict)
-    old_values: Dict[str, Any] = Field(default_factory=dict)
-```
+### 8.1 Tool catalogue
 
-### Worker (`queue/worker.py`)
-
-- Runs as separate Docker container (`python -m app.queue.worker`)
-- BLPOP with 10-second timeout (async)
-- Processes one job at a time with 1-second `asyncio.sleep()` between jobs
-- Handles all 4 write tools: `update_cell`, `bulk_update`, `format_row`, `add_row`
-- Fetches fresh `schema_config` from PostgreSQL per job
-- Logs audit records via `_write_audit_record()` — per field for `update_cell`, per RICEFW ID for `bulk_update`
-- `add_row` auto-generates RICEFW ID via `next_ricefw_id()` if not supplied
-
-### Job Envelope Format
-
-```json
-{
-  "job_id": "uuid4-string",
-  "payload": { /* WriteJobPayload fields */ }
-}
-```
+Nine tools in `core/tool_schemas.py:TOOLS`: `get_row`, `update_cell`, `format_row`, `add_row`
+(`:79`), `bulk_update`, `search_rows`, `summarize`, `switch_module`, `data_quality` (`:337`).
 
 ---
 
-## 9. Column Mapping (LLM-Driven & Fallbacks)
+## 9. WebSocket Protocol Reference
 
-### Static Aliases (`core/column_mapper.py`)
+Endpoint `WS /ws?token=<apiToken>[&project_id=<int>]` (`chat.py:61-66`). The client derives the URL
+from `window.location` unless `NEXT_PUBLIC_WS_URL` is set (`useWebSocket.ts:21-24`);
+`docker-compose.yml:58` leaves it empty, so the window-derived value is used.
 
-72 pre-defined aliases covering SAP/WRICEF domain terms. Examples:
-- `"ricefw id"` → `["object id", "tracker id", "rice id", ...]`
-- `"dev status"` → `["development status", "status", "progress", ...]`
-- `"technical resource"` → `["developer", "assigned to", "resource", ...]`
+### 9.1 Client → server
 
-### Resolution Pipeline (`resolve_column()`)
+| `type` | Payload | Sent by | Server handling |
+|---|---|---|---|
+| `message` | `{type, content}` | `useWebSocket.ts:180` | `chat.py:190-191` extracts `content`, drives the loop |
+| `ping` | `{type: "ping"}` | `useWebSocket.ts:37`, every 30 s | **Swallowed.** `chat.py:191` reads `content`, absent → `""` → `:195-196` `continue`. See §16.6 |
 
-1. **Exact match** against canonical keys (case-insensitive, stripped)
-2. **Alias list match** against all alias entries
-3. **Fuzzy match** via `difflib.get_close_matches` (cutoff 0.6)
+Non-JSON frames are treated as raw text (`chat.py:192-193`). The literal *content* `"ping"` — not
+the heartbeat frame — is what triggers `pong` (`chat.py:198-199`).
 
-### LLM Two-Pass Mapper (`build_column_map()`)
+### 9.2 Server → client
 
-- **Pass 1:** Send actual headers to DeepSeek → generate 3-6 natural-language aliases per header
-- **Pass 2:** Send Pass 1 result + actual headers back → verify, correct ambiguities, add missing SAP terms
-- **Hallucination guard:** After each pass, strips any keys not present in the actual header row
-- **Fallback:** If LLM calls fail, returns static `COLUMN_ALIASES` dictionary
+| `type` | Payload | Emitted by | Client consumer | Effect |
+|---|---|---|---|---|
+| `connection_ok` | `{type, user_email, project_name, active_tab}` | `chat.py:139-144` | `useWebSocket.ts:135-142` | `setSessionInfo` applies all three fields |
+| `assistant` | `{type, content, done: true}` | `agentic_loop.py:101-105` | `useWebSocket.ts:69-82` | appends to the most recent assistant message |
+| `tool_start` | `{type, tool, args}` | `agentic_loop.py:120-124` | `useWebSocket.ts:83-98` | pushes `{name, args, status:"running"}` |
+| `tool_result` | `{type, tool, result}` | `agentic_loop.py:151-155` | `useWebSocket.ts:99-113` | marks the matching running entry `"completed"` |
+| `error` | `{type, message}` | `chat.py:79`, `:105-108`, `:116`, `:253`; `agentic_loop.py:131-134`, `:175-178` | `useWebSocket.ts:120-134` | appends a `system` message, deduped against an identical predecessor |
+| `pong` | `{type: "pong"}` | `chat.py:199` | `useWebSocket.ts:143-144` | no-op |
+| `queue_update` | `{type, job_id, status, tool_name, args, session_id, error}` | `events.py:35-43` via `worker.py:255-263`, relayed by `chat.py:165` | `useWebSocket.ts:115-119` → DOM `CustomEvent` → `chat/page.tsx:103-125` | toast keyed on `status` |
 
----
+`status` is `"completed"` or `"failed"` (`worker.py:258`); the frontend also handles a generic
+"other" branch (`chat/page.tsx:116-118`), which nothing currently emits.
 
-## 10. Schema Auto-Detection
+`updateLastMessage` targets by explicit `targetId` or most-recent-role rather than always the final
+element (`useChatStore.ts:68-87`), so interleaved `assistant` and `tool_*` frames no longer corrupt
+each other.
 
-### API Endpoint
+> **⚠ Tool failures render as successes.** `useWebSocket.ts:104-107` sets `status: "completed"` for
+> every `tool_result` regardless of `result.ok`. The `"failed"` state exists in the type
+> (`useChatStore.ts:22`) and has UI for it, but is never assigned.
 
-`POST /api/admin/projects/detect-metadata`
-- Input: `{ "spreadsheet_url": "..." }`
-- Headers: `Authorization: Bearer <JWT>`, `X-Google-Access-Token: <token>`
-- Output: `{ "spreadsheet_id": "...", "detected_config": { tabs: {...}, global: {...} } }`
+### 9.3 Lifecycle
 
-### Detection Flow (`core/schema_detect.py`)
-
-1. Parse spreadsheet ID from URL
-2. Fetch all tab names from spreadsheet metadata
-3. For each tab: read first 5 rows for headers + 3 sample data rows
-4. Send to DeepSeek via `detect_schema_config()` → returns per-tab config
-5. Aggregate all tabs into `detect_all_tabs()` response
-
-### Per-Tab Detection Output
-
-```json
-{
-  "primary_id_column": "RICEFW ID",
-  "primary_id_position": "B",
-  "status_column": "Dev Status",
-  "module_column": "Module",
-  "assignee_column": "Technical Resource ",
-  "description_column": "Description",
-  "type_column": "Type",
-  "date_columns": {
-    "go_live": "Go-Live Date",
-    "signoff": "Sign-Off Date",
-    "start": "Start Date",
-    "completion": "Completion Date"
-  },
-  "critical_fields": ["RICEFW ID", "Module", "Type", "Description", "Dev Status"],
-  "valid_modules": ["FI", "MM", "SD", "PM", "QM", "PP"],
-  "valid_types": ["R", "I", "C", "E", "F", "W"],
-  "data_start_row": 3,
-  "column_map": { /* LLM-generated aliases */ }
-}
-```
-
-### Current Integration Status
-
-- The `/api/admin/projects/detect-metadata` endpoint exists and works.
-- The frontend `admin/projects/page.tsx` has a full **Auto-Detect Wizard** UI that calls this endpoint.
-- However, `admin.py:create_project()` still creates projects with `schema_config = {}` initially. The schema is applied via a subsequent `PUT` update after creation.
-- The `detect_schema_config()` function is NOT called automatically during standard `POST /api/admin/projects` creation — it requires the admin to explicitly click "Analyze" in the wizard.
+Reconnect after 3 s for any close code other than `1008` or `1000` (`useWebSocket.ts:52-57`).
+Heartbeat every 30 s (`:34-39`). No server-side idle handling — `chat.py:188` blocks indefinitely.
 
 ---
 
-## 11. Audit Logging System
+## 10. REST Surface
 
-### Storage
+Admin routes (all gated by `require_admin`, `admin.py:19`, `:22-28`):
 
-PostgreSQL `audit_logs` table with 13 columns + computed `created_month` for partitioning readiness.
+| Method | Path | Purpose | Citation |
+|---|---|---|---|
+| GET | `/admin/projects` | list all projects | `admin.py:64-78` |
+| POST | `/admin/projects/detect-metadata` | LLM tab detection, no persist | `admin.py:81-110` |
+| POST | `/admin/projects` | create; auto-detects `schema_config` when omitted | `admin.py:113-165` |
+| PUT | `/admin/projects/{id}` | patch fields incl. raw `schema_config` | `admin.py:168-188` |
+| DELETE | `/admin/projects/{id}` | delete, cascades to permissions | `admin.py:191-201` |
+| PATCH | `/admin/projects/{id}/fields` | toggle a `critical_fields` entry | `admin.py:204-235` |
+| GET/POST/DELETE | `/admin/permissions[/{id}]` | RBAC CRUD; POST creates the user if absent | `admin.py:240-316` |
+| GET | `/admin/audits` | filter by user/tool/RICEFW ID, limit 100 | `admin.py:321-357` |
+| GET | `/admin/analytics/summary` | counts and failure totals | `admin.py:360-388` |
 
-### Dual Logging Paths
+Non-admin: `GET /api/health` (`health.py:10-13`, liveness — static literal, no dependency
+probing), `GET /api/ready` (`health.py:16-48`, added in Phase 0 of the remediation plan — live
+`SELECT 1` against Postgres and `PING` against the shared `producer.redis_client`, `503` with a
+per-service `detail` dict when either fails; verified against unreachable dependencies), `GET
+/api/me` (`api/auth.py:19-34`, mounted directly in `main.py:54-55`), and `GET /api/projects`
+(`chat.py:265-277`).
 
-| Path | Used By | Pattern |
-|------|---------|---------|
-| `_write_audit_record()` | Queue worker (`worker.py`) | Direct insert in worker context |
-| `log_audit()` | Agentic loop (available but minimal usage) | `asyncio.create_task()` fire-and-forget |
+`docker-compose.yml`'s `backend` service now runs a `healthcheck` against `/api/ready` (interval
+30 s, 3 retries, `start_period` 15 s) — see §3.
 
-### Audit Columns
-
-| Column | Type | Description |
-|--------|------|-------------|
-| `timestamp` | TIMESTAMPTZ | Default `func.now()` |
-| `user_email` | VARCHAR(255) | Authenticated user |
-| `session_id` | UUID | WebSocket session reference |
-| `tool_name` | VARCHAR(50) | Which tool was invoked |
-| `spreadsheet_id` | VARCHAR(255) | Target spreadsheet |
-| `sheet_tab` | VARCHAR(100) | Active tab |
-| `ricefw_id` | VARCHAR(50) | Target object ID |
-| `field` | VARCHAR(255) | Modified column |
-| `old_value` | TEXT | Value before change |
-| `new_value` | TEXT | Value after change |
-| `args_json` | JSON | Full tool arguments |
-| `result_ok` | BOOLEAN | Success/failure |
-| `error` | TEXT | Error message if failed |
-
-### Dead Code
-
-`log_update_cell()`, `log_bulk_update()`, `log_format_row()`, `log_add_row()` convenience wrappers in `core/audit.py` are **never called** from any code path. The worker calls `_write_audit_record()` directly.
+> **⚠ `/api/projects` performs no authorisation filtering.** Every authenticated caller receives all
+> active projects including `spreadsheet_id` and full `schema_config` (`chat.py:268-277`). With the
+> fail-open default (§6.2) and the verbatim `project_id` query parameter (`chat.py:65`, `:87`), a
+> user can select any project from that list and operate on it as an editor.
 
 ---
 
-## 12. Data Quality & Analytics Engine
+## 11. Google Sheets Integration
 
-### `DataQualityChecker` (`core/data_quality.py`)
+`build_sheets_service(access_token, refresh_token=None)` builds `Credentials` with the process
+client ID/secret and disables discovery caching (`sheets/client.py:11-19`). There is no service
+account — every call is made as the signed-in user, which is what makes audit attribution real.
 
-Framework-agnostic class operating on `headers[]`, `rows[][]`, and `schema_config`:
+`_with_retry(fn)` (`retry.py:7-32`) is the sole sync bridge: it dispatches onto a module-level
+`ThreadPoolExecutor(max_workers=4)` (`:5`, `:20`) and retries with exponential backoff (base 1 s,
+doubling) on HTTP `{429, 500, 503}` for up to 4 attempts (`:13`, `:25-27`). Other errors propagate.
 
-| Method | Purpose |
-|--------|---------|
-| `blank_field_counts(fields)` | Count blank cells per column across all rows |
-| `completeness_score()` | Critical field fill rate (0-100%) based on `schema_config.critical_fields` |
-| `stale_items(audit_entries, threshold)` | Items inactive for N days based on audit log timestamps |
-| `consistency_checks(valid_emails)` | 4 logical contradiction detection rules |
+| Function | File | Sheets calls |
+|---|---|---|
+| `get_header_row` | `meta.py:45-52` | 1 — strips every cell (`:52`) |
+| `get_sheet_id` | `meta.py:34-42` | 1 |
+| `find_row_num` | `read.py:28-47` | 1 — full ID-column scan |
+| `get_row` | `read.py:126-153` | 3 — `find_row_num` + row fetch + headers |
+| `get_row_raw` | `read.py:50-77` | 3 — same shape |
+| `search_rows` | `read.py:156-241` | 2 — headers + ≤2001 rows |
+| `summarize` | `read.py:244-402` | 2 |
+| `run_data_quality_check` | `read.py:405-452` | 2 |
+| `update_cell` | `write.py:10-67` | 3 — `find_row_num` + headers + one `batchUpdate` |
+| `bulk_update` | `write.py:70-175` | 2 + **one `find_row_num` per target ID** (`:126-134`) |
+| `add_row` | `write.py:178-233` | 1 + headers, `values().append` |
+| `format_row` | `format.py:18-93` | `spreadsheets().batchUpdate` `repeatCell` |
 
-### Consistency Rules
+`next_ricefw_id` (`meta.py:79-114`) computes max+1 over parsed IDs, formatted `%03d`;
+`switch_module` (`meta.py:117-154`) optionally verifies the tab exists then updates
+`sessions.active_tab`.
 
-1. Items with status="Completed" but missing Sign-Off Date
-2. Items with status="Completed" but missing Completion Date
-3. Items with type in [R,I,C,E,F,W] but blank Dev Status
-4. Assigned user email not found in registered audit trail emails
-
-### Invocation
-
-Called via the `data_quality` tool through `run_data_quality_check()` in `sheets/read.py`, which:
-1. Fetches headers and all rows from the spreadsheet
-2. Instantiates `DataQualityChecker(headers, rows, schema_config)`
-3. Queries audit log for staleness evaluation
-4. Returns `{completeness_score, alerts, stale_items}`
-
----
-
-## 13. Next.js Frontend — Complete Component Audit
-
-### Technology Stack
-
-| Concern | Choice | Version |
-|---------|--------|---------|
-| Framework | Next.js (App Router) | 16.2.9 |
-| Runtime | React | 19.2.4 |
-| Styling | Tailwind CSS | v4 |
-| Auth | NextAuth.js | v5.0.0-beta.31 |
-| State | Zustand | 5.0.14 |
-| Charts | Recharts | 2.15.0 |
-| Icons | Lucide React | 0.468.0 |
-| Animation | Framer Motion | 12.42.0 (imported but unused in current pages) |
-| WebSocket | Native WebSocket + custom hook | — |
-
-### Routes
-
-| Route | File | Auth | Description |
-|-------|------|------|-------------|
-| `/` | `app/page.tsx` | Public | Landing page with Google sign-in, feature cards, animated blobs |
-| `/chat` | `app/chat/page.tsx` | User | Main chat interface with WS, project/tab selectors |
-| `/admin` | `app/admin/page.tsx` | Admin | Overview dashboard with 4 metrics + 2 charts |
-| `/admin/projects` | `app/admin/projects/page.tsx` | Admin | Project CRUD + Auto-Detect Wizard + schema JSON editor |
-| `/admin/users` | `app/admin/users/page.tsx` | Admin | User permission assignment (role, fields, denied ops) |
-| `/admin/audit` | `app/admin/audit/page.tsx` | Admin | Filterable, paginated audit log table |
-| `/api/auth/*` | `app/api/auth/[...nextauth]/route.ts` | — | NextAuth API endpoints |
-
-### Chat Page Architecture (`chat/page.tsx`)
-
-- **State:** Zustand store (`useChatStore`) for projects, messages, connection status, active tab
-- **WebSocket:** Custom `useWebSocket` hook manages connection lifecycle, message dispatch, reconnection
-- **Project selector:** Dropdown populated from `/api/projects` (backend REST)
-- **Module tabs:** Reads from `activeProject.schema_config.tabs` keys; falls back to `schema_config.global.valid_modules`; hardcoded fallback `["SD", "MM", "FI", "CO", "PP", "QM"]`
-- **Tab switching:** Sends natural language "Switch active module to {tab}" via WS
-- **Tool visualization:** Each assistant message can have `toolCalls[]` with `running`/`completed`/`failed` status indicators
-- **Toast notifications:** Listens for `queue_update` CustomEvents from WebSocket hook
-
-### Admin Dashboard Architecture (`admin/page.tsx`)
-
-- **Data sources:** Fetches from `/api/admin/projects`, `/api/admin/permissions`, `/api/admin/audits?limit=500`
-- **Metrics cards:** Active Projects, Authorized Users, Audit Entries, Failed Operations
-- **Charts:**
-  - Area chart: Operations over time (success vs failed, last 7 active days)
-  - Bar chart: Tool distribution (count by tool_name)
-- **Chart library:** Recharts with custom dark-theme tooltips
-
-### Admin Projects Page (`admin/projects/page.tsx`)
-
-- **Modes:** Auto-Detect Wizard (default for create) and Manual Mode
-- **Auto-Detect flow:**
-  1. Admin enters Google Sheet URL
-  2. Clicks "Analyze" → `POST /api/admin/projects/detect-metadata`
-  3. Returns detected tabs with per-tab schema configs
-  4. Tabs displayed as checkboxes — admin can select/deselect
-  5. Generates JSON schema config automatically
-  6. Admin fills project name, company prefix, default tab
-  7. Save → `POST /api/admin/projects` + `PUT /api/admin/projects/:id` (schema update)
-- **Manual Mode:** Direct JSON schema editor textarea
-
-### Design System (globals.css)
-
-- **Color palette:** Deep space black (`#030014`), dark indigo (`#0b0726`), indigo/cyan/purple accents
-- **Glass effects:** `glass-panel` (blur 16px), `glass-card` (blur 12px)
-- **Chat bubbles:** User = gradient indigo→purple, Agent = subtle glass with border
-- **Animations:** `animate-pulse-slow` (4s), `animate-slide-up` (0.3s), `animate-blob` (7s)
-- **Scrollbar:** Custom thin dark scrollbar
+> **⚠ Compounding read cost on bulk paths.** `get_bulk_rows_raw` calls `get_row_raw` once per
+> target ID (`read.py:119-122`), and each of those is three Sheets calls — so the audit pre-read
+> alone costs ~3N calls, before `bulk_update` then spends another N on `find_row_num`
+> (`write.py:127`). A 50-row bulk update is on the order of 200 API calls against a quota-limited
+> endpoint, throttled at one job/second by the worker.
 
 ---
 
-## 14. WebSocket Protocol
+## 12. Audit Logging
 
-### Message Types
+`audit_logs` rows are written only by `_write_audit_record` (`audit.py:10-47`), which opens its own
+`AsyncSessionLocal` (`:29`) rather than joining the caller's transaction and swallows every
+exception (`:46-47`) so an audit failure cannot fail a mutation. Its only caller is the worker
+(`worker.py:18`).
 
-```jsonc
-// Client → Server
-{"type": "message", "content": "Set SD-045 status to Done"}
-{"type": "ping"}
+| Tool | Rows | Citation |
+|---|---|---|
+| `update_cell` | one per updated field | `worker.py:71-88` |
+| `bulk_update` | one per succeeded **and** per failed ID | `worker.py:106-121`, `:124-140` |
+| `format_row` | one, `field="Color"` | `worker.py:160-173` |
+| `add_row` | one, `field="ID"` | `worker.py:217-230` |
+| exception | one, `field="Mutation"` | `worker.py:239-252` |
 
-// Server → Client
-{"type": "connection_ok", "user_email": "...", "project_name": "...", "active_tab": "SD"}
-{"type": "assistant", "content": "...", "done": true}
-{"type": "tool_start", "tool": "update_cell", "args": {...}}
-{"type": "tool_result", "tool": "update_cell", "result": {...}}
-{"type": "queue_update", "job_id": "...", "status": "completed"}
-{"type": "error", "message": "Permission denied: ..."}
-{"type": "pong"}
-```
+`old_value` comes from the live pre-read at dispatch time (`tool_dispatch.py:76`, `:79`). Read-only
+tools produce no audit rows.
 
-### Connection Lifecycle
-
-1. Client opens WebSocket with `?token=<JWT>&project_id=<id>`
-2. Server authenticates JWT, creates session in DB
-3. Server sends `connection_ok` with user context
-4. Client starts 30-second ping heartbeat
-5. On disconnect (non-auth): client auto-reconnects after 3 seconds
-6. Auth failures (code 1008) and clean closes (code 1000): no reconnect
+`log_audit` (`audit.py:50-82`), a fire-and-forget `create_task` wrapper, is never called.
 
 ---
 
-## 15. Deployment Architecture
+## 13. Data Quality Engine
 
-### Docker Compose Stack (6 services)
+`DataQualityChecker` (`core/data_quality.py`) takes headers, a row matrix, and a tab schema,
+building a case-insensitive header index at construction and resolving schema-named columns through
+`_get_col_idx`.
 
-| Service | Image | Port | Purpose |
-|---------|-------|------|---------|
-| `postgres` | postgres:16 | 5433:5432 | Data store (pgdata volume) |
-| `redis` | redis:7-alpine | 6379 | Write queue |
-| `backend` | ./backend | 8000 | FastAPI API server (uvicorn) |
-| `worker` | ./backend | — | Queue consumer (`python -m app.queue.worker`) |
-| `frontend` | ./frontend | 3000 | Next.js app (standalone, non-root user) |
-| `caddy` | caddy:2-alpine | 80/443 | Reverse proxy + auto-HTTPS (Let's Encrypt) |
+| Method | Behaviour |
+|---|---|
+| `blank_field_counts` | blank count per named column; missing column counts as fully blank |
+| `stale_items` | latest mutation per ID from audit rows, excluding done statuses; no history → `"Never (no logs)"`, `days_inactive: 999` |
+| `consistency_checks` | four rules — completed-without-signoff, completed-without-completion-date, required-with-blank-status, assignee-not-in-known-emails (`:108-209`) |
+| `completeness_score` | fill rate across `critical_fields`; `100.0` when no rows or no resolvable columns (`:211-241`) |
 
-### Caddy Routing (Caddyfile)
+`run_data_quality_check` (`read.py:405-452`) reads headers and ≤2001 rows live, sources "known
+emails" from `SELECT DISTINCT audit_logs.user_email` (`:430-431`), and pulls audit timestamps scoped
+to the spreadsheet and tab (`:439-443`).
 
-```
-migrationbot.duckdns.org {
-    route {
-        /api/auth/* → frontend:3000   (NextAuth endpoints — HIGHEST priority)
-        /api/*      → backend:8000    (FastAPI REST)
-        /ws*        → backend:8000    (WebSocket)
-        *           → frontend:3000   (Catch-all)
-    }
-}
-```
+> **⚠ Falsy-index bug.** `if not self._get_col_idx(assignee_col)` (`data_quality.py:122`, repeated
+> `:216`) tests truthiness of a column index. Index `0` is falsy, so a sheet whose assignee column
+> is the **first** column silently falls back to `"Assigned To"`, dropping the unregistered-assignee
+> check and skewing the completeness score. The correct test is `is None`, used correctly elsewhere
+> in the same class (`:134`, `:227-228`).
 
-### Volumes
-
-- `pgdata`: PostgreSQL persistent data
-- `caddy_data`: TLS certificates
-- `caddy_config`: Caddy configuration cache
+> **⚠ "Registered users" is drawn from the audit log**, not `users` or `permissions`
+> (`read.py:430-431`) — a legitimate user who has never performed a write is reported as
+> unregistered.
 
 ---
 
-## 16. CI/CD Pipeline
+## 14. Frontend Application
 
-### CI Pipeline (`.github/workflows/ci.yml`)
+Next.js 16 App Router, `output: "standalone"` (`next.config.ts:4`), `SessionProvider` at the root
+layout.
 
-**Triggers:** Push/PR to `main`, `develop`, `phase3` branches.
+| Route | File | Purpose |
+|---|---|---|
+| `/` | `app/page.tsx` | landing, `signIn` |
+| `/chat` | `app/chat/page.tsx` | main chat UI |
+| `/admin` | `app/admin/page.tsx` | dashboard; four parallel fetches, Recharts |
+| `/admin/projects` | `app/admin/projects/page.tsx` | project CRUD + tab detection; sends Google token headers |
+| `/admin/users` | `app/admin/users/page.tsx` | permission upsert/delete |
+| `/admin/audit` | `app/admin/audit/page.tsx` | filtered audit browser |
 
-| Job | Steps |
-|-----|-------|
-| `lint-and-test` | Python 3.12, Postgres 16 service, Redis 7 service → `pip install` → `pytest -v` |
-| `frontend-build` | Node 20 → `npm ci` → `npm run build` |
+State lives in one Zustand store (`useChatStore.ts:49-95`) holding `projects`, `activeProject`,
+`activeTab`, `isConnected`, `messages`, `ws`, and session metadata.
 
-### CD Pipeline (`.github/workflows/deploy.yml`)
+> **⚠ Tab switching is optimistic and prompt-driven.** `handleTabChange` sets `activeTab` locally
+> and then asks the *model* to perform the switch by sending the string `Switch active module to
+> {tab}` (`chat/page.tsx:143-148`). If the model declines to call `switch_module`, or the tool's
+> existence check fails (`meta.py:136-137`), the highlighted tab no longer reflects
+> `sessions.active_tab`. Only `connection_ok` — sent once per connection — ever corrects it.
 
-**Triggers:** Push to `main` or `phase3` branches.
-
-**Deployment:** SSH to VPS via `appleboy/ssh-action@v1.0.3`:
-```bash
-cd ~/migrationbot && git pull origin main
-docker compose down && docker compose up --build -d
-```
-
----
-
-## 17. Performance Architecture
-
-- **Batch operations:** `bulk_update()` uses `values.batchUpdate` for O(1) API calls; falls back to individual writes on failure
-- **Full range scans:** `search_rows()` and `summarize()` download up to 2000 rows in one GET, filtering in Python
-- **Write throttling:** Worker enforces 1-second `asyncio.sleep()` between Sheets API writes
-- **Retry with backoff:** `_with_retry()` handles 429/500/503 with exponential backoff (1s, 2s, 4s, 8s)
-- **Connection pooling:** SQLAlchemy async engine with `pool_pre_ping=True`
-- **WebSocket heartbeat:** 30-second ping prevents connection timeouts through Caddy/proxy
+> **⚠ Stale-closure hazard.** `connect` reads `ws` (`useWebSocket.ts:13`) to close a prior socket,
+> but `ws` is absent from its dependency array (`:154`), as is `setSessionInfo` (used at `:136`).
+> On `apiToken`/`projectId` change the effect re-runs (`:156-163`) with a possibly stale socket
+> reference and may fail to close the previous connection.
 
 ---
 
-## 18. Feature Interaction Map
+## 15. Deployment, CI/CD & Tests
 
-```text
-Schema Auto-Detection (schema_detect.py)
-        ├── depends on: sheets/meta.py headers + sample data + LLM
-        ├── WIRED into admin detect-metadata endpoint
-        ├── NOT auto-triggered on project create (requires explicit "Analyze" click)
-        └── feeds into: projects.schema_config JSON
+### 15.1 Compose topology
 
-Column Mapping (column_mapper.py)
-        ├── static COLUMN_ALIASES (72 entries) as fallback
-        ├── LLM 2-pass build_column_map() available, used in schema detection
-        ├── resolve_column() used by: sheets/read.py, sheets/write.py, sheets/format.py
-        └── BUG: write.py and format.py call resolve_column() without column_map
+| Service | Build | Command | Ports |
+|---|---|---|---|
+| `postgres` | `postgres:16` | default | `5433:5432` |
+| `redis` | `redis:7-alpine` | default | `6379:6379` |
+| `backend` | `./backend` | `uvicorn app.main:app --host 0.0.0.0 --port 8000` | `8000:8000` |
+| `worker` | `./backend` | `python -m app.queue.worker` | none |
+| `frontend` | `./frontend` | `node server.js` | `3000:3000` |
+| `caddy` | `caddy:2-alpine` | default | `80:80`, `443:443` |
 
-RBAC (core/permissions.py)
-        ├── ADMIN_EMAILS env var → admin bypass
-        ├── PostgreSQL permissions table → editor/viewer roles
-        ├── field-level enforcement for update_cell/bulk_update
-        └── enforced in: agentic_loop.py per tool_call
+`backend` and `worker` both load `.env` via `env_file` (`docker-compose.yml:27-28`, `:43-44`) with
+`DATABASE_URL`/`REDIS_URL` overridden to compose service names (`:30-31`, `:46-47`). Volumes:
+`pgdata`, `caddy_data`, `caddy_config` — **Redis has none**, so the write queue is memory-only.
 
-Frontend Admin Guard
-        ├── HARDCODED email substring check (rohai/ruhail/admin)
-        ├── ALSO queries /api/me for is_admin flag
-        └── CONFLICT: two admin detection systems active simultaneously
+Caddy routes in order (`Caddyfile:2-17`): `/api/me` → backend (carved out before the NextAuth
+wildcard), `/api/auth/*` → frontend, `/api/*` → backend, `/ws*` → backend, `*` → frontend.
 
-Agentic Loop (core/agentic_loop.py)
-        ├── depends on: all 9 tool schemas, LLM router, permission checker
-        ├── dispatches to: tool_dispatch.py
-        ├── streams results via: WebSocket send_msg callback
-        └── DSML leakage guard forces deepseek-chat fallback
+### 15.2 CI/CD
 
-Queue Worker (queue/worker.py)
-        ├── consumes: Redis migrationbot:write_queue
-        ├── executes: sheets/write.py, sheets/format.py, sheets/meta.py
-        ├── logs: core/audit.py _write_audit_record (per field/per ID)
-        └── NO WebSocket feedback to client (queue_update never sent)
+`ci.yml` runs two jobs on push/PR to `main`/`develop`/`phase3`: `lint-and-test` (Postgres + Redis
+service containers, `pytest -v` from `backend/` with `DATABASE_URL` pointed at `migrationbot_test`
+and `CORS_ORIGINS`/`ADMIN_EMAILS`/`DEFAULT_SPREADSHEET_ID` supplied at `:59-61`) and
+`frontend-build` (`npm ci && npm run build`). Despite the job name there is **no linter** in either.
 
-Audit Logger (core/audit.py)
-        ├── asyncio.create_task pattern available for non-blocking writes
-        ├── _write_audit_record() used directly by worker
-        └── 4 convenience wrappers defined but NEVER CALLED (dead code)
-```
+`deploy.yml` SSHes to a VPS on push to `main`/`phase3`, then `git fetch origin main`,
+`git reset --hard origin/main`, `docker compose down`, `build --no-cache`, `up -d`, `image prune`.
 
----
+> **⚠ Deploy pipeline risks.** Full downtime on every merge (`down` before a from-scratch rebuild).
+> The workflow triggers on `phase3` but hard-resets to `origin/main`, so a `phase3` push redeploys
+> main's code. Both an SSH key and a password are passed where one would do. `.env` itself survives
+> — it is gitignored (`.gitignore:7`) and `git reset --hard` does not touch ignored files — but any
+> *other* untracked file in the repo directory is discarded silently.
 
-## 19. Resolved Issues & Recent Architecture Enhancements (Phases 6–9)
+### 15.3 Tests
 
-### Resolved Critical Issues (Phase 6–9 Implementation)
+20 tests across `tests/test_db.py` (4), `tests/test_core/test_core_logic.py` (5),
+`tests/test_sheets/test_sheets_logic.py` (8), `tests/integration/test_integration_logic.py` (3).
+`test_db.py` and the integration suite each define their own `setup_*` and `db_session` fixtures
+locally, both autouse (`test_db.py:15`, `test_integration_logic.py:22`).
 
-1. **[FIXED] Hardcoded Admin Detection:**
-   - Removed hardcoded email checks (`["rohai", "ruhail", "admin"]`) in `chat/page.tsx` and `admin/layout.tsx`.
-   - Replaced with dynamic `/api/me` queries returning case-insensitive `is_admin` flags.
+**Both are now gated (Phase 0).** `require_test_database()` (`tests/conftest.py:9-26`) parses the
+database name out of `settings.DATABASE_URL` and raises `RuntimeError` unless it contains `"test"`
+(case-insensitive) — the convention `ci.yml:55` already uses (`migrationbot_test`). It is called
+from `setup_test_db` (`test_db.py:16`) and `setup_integration_db` (`test_integration_logic.py:23`)
+before either touches `drop_db()`. Verified directly: pointing `DATABASE_URL` at
+`.../migrationbot` — the exact shape of this repo's real `.env` — is refused with a clear error
+rather than attempting a connection; pointing it at `.../migrationbot_test` collects and runs
+normally.
 
-2. **[FIXED] Hardcoded Module Tabs Fallback:**
-   - Removed static fallback array `["SD", "MM", "FI", "CO", "PP", "QM"]` in `chat/page.tsx`. Module tabs now dynamically reflect the active project's discovered schema configuration (`schema_config.tabs`).
-
-3. **[FIXED] Non-Blocking Google API Retry Execution:**
-   - Refactored `_with_retry()` in `backend/app/sheets/retry.py` using `ThreadPoolExecutor` so Google API call retries do not block FastAPI's async event loop.
-
-4. **[FIXED] Dynamic Column Aliasing in Write & Format Operations:**
-   - Updated `write.py` and `format.py` to accept and pass `column_map` explicitly, ensuring natural language field aliases map correctly during data mutations.
-
-5. **[FIXED] Strict CORS Configuration:**
-   - Updated `backend/app/config.py` default `CORS_ORIGINS` to `https://migrationbot.duckdns.org,http://localhost:3000`.
-
-6. **[FIXED] Zero-Config Google Sheets Onboarding:**
-   - Added `ProjectDetectRequest` and `detect_all_tabs` endpoint in `backend/app/api/admin.py`.
-   - Added auto-detect tab wizard UI in `frontend/src/app/admin/projects/page.tsx`.
-
-7. **[FIXED] Admin Project Manager Modal Layout Overflow:**
-   - Updated modal container in `frontend/src/app/admin/projects/page.tsx` to handle flex positioning (`my-auto max-h-[85vh] overflow-y-auto`), ensuring fields and submit controls remain fully visible and centered on all viewports.
-
-8. **[ADDED] Multi-Step Agentic Planner & Session Context Memory:**
-   - Created `backend/app/core/planner.py` (`AgenticPlanner`) and `backend/app/core/memory.py` (`SessionMemory`).
-   - Integrated auto-recovery prompt hints in `backend/app/core/agentic_loop.py` on tool failure.
+`requirements.txt` is now pinned to exact versions (Phase 0) rather than `>=` floors, and `pandas`
+— unused anywhere in `backend/` — was dropped.
 
 ---
 
-## 20. Known Bugs, Discrepancies & Technical Debt
+## 16. Known Issues & Technical Debt
 
-### Critical (P0)
+Ordered by severity. Items marked **(verified)** were reproduced by executing code. Items resolved
+by the remediation plan are removed from this list, not annotated — see git history for what
+changed and when.
 
-1. **Schema detection not auto-triggered on project creation:**
-   - `admin.py:create_project()` creates projects with `schema_config = {}`.
-   - The "Analyze" button exists in the UI but is a manual step. New projects created via the API directly will have empty schemas.
-   - Impact: Chat agent cannot function without schema_config — all column lookups will use hardcoded defaults.
+### 16.1 Read tools cannot address trailing-space columns — **(verified)**
+**Severity: high.** `read.py:179` builds `col_idx = {h: i}` from stripped headers (`meta.py:52`)
+and `read.py:186` tests the unstripped canonical name verbatim. Running the real `resolve_column`
+against a realistic header list: `"technical resource"`, `"developer"`, `"abaper"` all resolve to
+`"Technical Resource "` and are **not** found; `"color"`, `"flag"` resolve to `"Color "` and are
+**not** found; `"status"` → `"Dev Status"` is found. The miss becomes a hard error
+(`read.py:186-187`), and the same guard exists in all three `summarize` branches (`:285-286`,
+`:309-310`, `:333-334`). The write path is unaffected because it normalises both sides
+(`write.py:34`/`:43`). Users can write to these columns but cannot search, filter, or group by
+them. Fix: normalise `col_idx` keys and the lookup on the read side, matching `write.py`.
 
-2. **`data_quality` tool missing from RBAC tool sets:**
-   - `permissions.py` defines `READ_ONLY_TOOLS` and `WRITE_TOOLS` but `data_quality` is absent from both.
-   - `tool_dispatch.py` routes it as a read tool, but RBAC will reject it for Viewers since it's not in `READ_ONLY_TOOLS`.
+### 16.2 Hitting the iteration cap tells the user nothing — **(verified)**
+**Severity: high.** The `for` loop at `agentic_loop.py:44` has no `else:` branch; scanning
+44–182 shows only `return messages[1:]` at `:182` after the loop. Exhausting all 8 iterations
+returns without emitting an `assistant` or `error` frame. The client has already seeded an empty
+assistant bubble (`useWebSocket.ts:173-179`) and renders a spinner while content is empty, so the
+UI hangs indefinitely on a request the server has abandoned. Fix: add a `for…else` that emits an
+`error`.
 
-3. **`resolve_column()` called without `column_map` in write operations:**
-   - `write.py:update_cell()` line 42: `resolve_column(field, column_map)` where `column_map` is extracted from tab_schema but may be `None`.
-   - `write.py:bulk_update()` line 95: Same pattern.
-   - `format.py:format_row()` line 53: `resolve_column("Color", column_map)` where `column_map` comes from schema but may be `None`.
-   - Impact: LLM-generated dynamic aliases are ignored during write operations, falling back to static aliases only.
+### 16.3 `data_quality` ignores `check_type`
+**Severity: medium.** The schema declares `check_type` **required** with five values
+(`tool_schemas.py:351-366`, `:389`) and the system prompt teaches the model to choose among them
+(`:444-448`), but `run_data_quality_check` (`read.py:405-452`) never reads it — it always runs
+consistency + completeness + stale. `scope_module` and `fields` are likewise unread, and
+`DataQualityChecker.blank_field_counts` is never called.
 
-4. **Hardcoded admin detection in frontend (TWO conflicting systems):**
-   - `chat/page.tsx` line 161: `isAdmin = isAdminState || email.includes("rohai")...` — hybrid check.
-   - `admin/layout.tsx` line 28: `isAdmin = ["rohai", "ruhail", "admin"].some(key => email.includes(key))` — pure hardcoded.
-   - Should exclusively query `/api/me` for `is_admin` flag from the backend.
+### 16.4 `summarize` ignores `overdue_status_exclusions`
+**Severity: medium.** Declared at `tool_schemas.py:298-305`; the overdue branch uses a hard-coded
+set instead (`read.py:368`).
 
-5. **Hardcoded module tabs fallback in chat:**
-   - `chat/page.tsx` line 208: Falls back to `["SD", "MM", "FI", "CO", "PP", "QM"]` when `schema_config.tabs` and `schema_config.global.valid_modules` are both missing.
-   - No tabs should be shown when no project is loaded or schema is empty.
+### 16.5 Falsy-index bug in `DataQualityChecker`
+**Severity: medium.** `data_quality.py:122`, `:216` — see §13.
 
-### High (P1)
+### 16.6 The WebSocket heartbeat is swallowed
+**Severity: medium.** Client sends `{"type":"ping"}` every 30 s (`useWebSocket.ts:37`); the server
+reads only `packet.get("content", "")` (`chat.py:191`), gets `""`, and `continue`s (`:195-196`).
+`pong` (`:198-199`) fires only if a user literally types "ping". The client's `pong` handler
+(`:143-144`) is consequently dead. Frames still traverse the connection so idle-proxy keep-alive
+survives, but the protocol-level ack does not. Fix: route on `packet["type"]`.
 
-6. **No queue job status feedback to client:**
-   - Worker processes jobs but never sends `queue_update` WS messages back.
-   - The `queue_update` event handler in the frontend (chat/page.tsx lines 103-125) is wired but never triggered.
-   - Impact: Users get no feedback when writes complete or fail.
+### 16.7 Tool failures render as successes
+**Severity: medium.** `useWebSocket.ts:104-107` — see §9.2.
 
-7. **Blocking `_with_retry()` in async context:**
-   - `retry.py` line 15: `return fn()` calls the synchronous Google API client directly.
-   - `asyncio.sleep(delay)` is used for backoff, but the actual `fn()` call is synchronous.
-   - In an async FastAPI context, this blocks the event loop during Google API calls.
+### 16.8 CORS wildcard with credentials
+**Severity: medium.** `main.py:44-49` sets `allow_credentials=True` with origins split from
+`CORS_ORIGINS` (`:43`). `.env.example:14` ships `CORS_ORIGINS=*`. Starlette does not expand a
+literal `"*"` here, so credentialed cross-origin requests fail rather than being permitted — and
+the example file steers deployments toward exactly that value.
 
-8. **`datetime.utcnow()` deprecation:**
-   - `chat.py` line 204: `datetime.utcnow()` is deprecated in Python 3.12+.
-   - Should use `datetime.now(timezone.utc)`.
+### 16.9 `/api/projects` performs no authorisation filtering
+**Severity: medium.** `chat.py:265-277` — see §10.
 
-9. **`get_all_ids()` default Column B:**
-   - `meta.py:get_all_ids()` line 55: `primary_id_pos` parameter defaults to `"B"` but callers should always pass the schema value.
-   - Similarly `find_row_num()` defaults to `"B"`.
+### 16.10 RBAC is fail-open
+**Severity: medium.** `permissions.py:88`, `:113` — see §6.2.
 
-10. **No Alembic migrations:**
-    - Schema changes require manual table drops. `init_db()` only creates tables that don't exist; it cannot modify existing columns.
-    - Risk: Data loss on schema evolution in production.
+### 16.11 Auth bypass and default `JWT_SECRET`
+**Severity: medium.** `deps.py:34`, `chat.py:44`, `config.py:14` — see §4.2.
 
-11. **Frontend projects fetch hits chat API route:**
-    - `chat/page.tsx` fetches `/api/projects` which is defined in `chat.py`, not `admin.py`.
-    - This is a REST endpoint on the chat router, mixing concerns.
+### 16.12 Queue has no durability, retry, or dead-letter path
+**Severity: medium.** A plain Redis list (`producer.py:53-57`) on a volume-less container
+(`docker-compose.yml:17-22`). `BLPOP` removes the job before processing (`worker.py:278`), so a
+crash mid-`process_job` loses the write with no record beyond an audit row that is only written if
+the exception was caught (`:235-252`), not if the process dies. No retry, no dead-letter list, and
+no job-state key — the `job_id` returned to the user (`tool_dispatch.py:98`) is stored nowhere and
+cannot be queried after the fact.
 
-### Medium (P2)
+### 16.13 OAuth access tokens are serialised into the queue
+**Severity: medium.** `WriteJobPayload` carries `google_access_token` as a plain field
+(`queue/schemas.py:11`), JSON-serialised into the Redis entry (`producer.py:48-57`) so the worker
+can rebuild a client (`worker.py:41`). Live user credentials sit in a Redis instance with no auth
+and port 6379 published to the host (`docker-compose.yml:20-21`) for as long as the job is queued.
+Inherent to the OAuth-only design plus the queue boundary; noted, not solved.
 
-12. **`updateLastMessage` race condition:**
-    - Multiple rapid WS messages (assistant content + tool_start) can interleave in `useChatStore`.
-    - The `updateLastMessage` updater function operates on `messages[length-1]` which may not be the intended message.
+### 16.14 Optimistic write result misleads the model
+**Severity: medium.** `dispatch_tool` returns `{"ok": true, "status": "queued"}` before Sheets is
+touched (`tool_dispatch.py:95-100`), and that is what the loop feeds back to the model
+(`agentic_loop.py:158`). The model therefore reports the write as done. The `queue_update` toast
+does eventually tell the truth (§5.1), but the chat transcript still contains a premature success
+claim. Fix: have the system prompt teach `status: "queued"` as pending, not complete.
 
-13. **Audit convenience wrappers are dead code:**
-    - `log_update_cell()`, `log_bulk_update()`, `log_format_row()`, `log_add_row()` in `core/audit.py` are defined but never called from any code path.
+### 16.15 Silent 2001-row ceiling on every scan
+**Severity: low-medium.** `read.py:197`, `:263`, `:422` request `{start}:{start+2000}`. A tracker
+larger than that is silently truncated — `search_rows` reports fewer matches, `summarize`
+percentages are computed over a partial denominator, and `data_quality` scores a subset, all with
+no indication to the user.
 
-14. **No CORS domain restriction in production:**
-    - `main.py` sets `allow_origins` from `CORS_ORIGINS` env var, which defaults to `"*"` in config.py.
-    - `.env.example` also has `CORS_ORIGINS=*`.
-    - Must be locked down for production deployment.
+### 16.16 `summarize.blank_fields` silently falls back to column 0
+**Severity: low.** `read.py:338` — `id_idx = col_idx.get(id_col, 0)`. If `primary_id_column` is
+missing or misnamed, the report returns values from whatever column happens to be first, labelled
+as IDs.
 
-15. **Default Zustand store tab is hardcoded "SD":**
-    - `useChatStore.ts` line 49: `activeTab: "SD"` as default.
-    - Should be empty or derived from the active project's `default_tab`.
+### 16.17 Seven copies of the schema-shape branch
+**Severity: low (maintenance).** `read.py:14-17`, `write.py:23`, `:82`, `:193`, `worker.py:185`,
+`chat.py:222`, `agentic_loop.py:32-35`. Per-key defaults are similarly scattered.
 
-16. **`connection_ok` handler incomplete:**
-    - `useWebSocket.ts` handles `connection_ok` to set `activeTab`, but doesn't update project context, user role, or other session metadata sent by the server.
+### 16.18 `add_row` reads arguments the model cannot supply
+**Severity: low.** `worker.py:178` reads `args.get("prefix")` and `:189` reads
+`args.get("ricefw_id")`, neither declared in the `add_row` schema (`tool_schemas.py:79-100`). Both
+always take their absent-value branch.
 
-### Low (P3)
+### 16.19 Dead code
+**Severity: low.** `core/planner.py` and `core/memory.py` (never imported); `column_mapper.py:151`
+`build_column_map` and `:143` `get_column_map_json` (never called — §7.3); `audit.py:50`
+`log_audit`; `permissions.py:9` `WRITE_TOOLS`; `permissions.py:25-26` `is_admin()`;
+`meta.py:10` `_detect_header_row` (imported by `read.py:5`, called nowhere);
+`models/audit_log.py` `created_month` (no partitioning exists).
 
-17. **LLM client base_url heuristic is fragile:**
-    - `chat.py` uses API key pattern matching to determine DeepSeek vs OpenAI base URL.
-    - Should be an explicit environment variable.
+### 16.20 Startup `init_db()` failure is non-fatal, and readiness doesn't fully cover it
+**Severity: low.** `init_db()` failures are caught and execution continues (`main.py:26-28`).
+`GET /api/ready` (`health.py:16-47`, added in Phase 0) narrows this but does not close it: it runs
+a live `SELECT 1` (`health.py:28`), which succeeds against a reachable Postgres regardless of
+whether `init_db()` ever created the application's tables — `SELECT 1` needs no table. So the
+probe catches "Postgres is down" (which is what caused the 2026-08-06 outage — see §3) but not
+"Postgres is up with an empty schema". Closing that gap needs `main.py`'s startup handler to record
+`init_db()`'s outcome and have `/api/ready` report unready when it failed.
 
-18. **`tests/` directory potentially gitignored:**
-    - `.gitignore` may include `tests/` — test code may not be version controlled.
+---
 
-19. **No header row caching:**
-    - `get_header_row()` is called on every read/write operation.
-    - Original implementation plan specified Redis-based header caching (TTL 5 min) but it was never implemented.
+## 17. Appendix — Environment Variables
 
-20. **No RICEFW ID-to-row caching:**
-    - `find_row_num()` scans the entire ID column on every call.
-    - Original plan specified Redis caching but it was never implemented.
-
-21. **`framer-motion` imported but unused:**
-    - Package is in `package.json` dependencies but not imported in any current page component.
-
-22. **`jose` library used in frontend but not in `package.json`:**
-    - `auth.ts` imports from `jose` (SignJWT), but `jose` is not listed in `package.json` — it's likely a transitive dependency of `next-auth`.
+| Variable | Consumed by | Default |
+|---|---|---|
+| `DATABASE_URL` | `db/engine.py:9` | `…@localhost:5433/migrationbot` (`config.py:7`) |
+| `REDIS_URL` | `producer.py:12`, `events.py:14`, `worker.py:269`, `chat.py:157` | `redis://localhost:6379` (`config.py:8`) |
+| `DEEPSEEK_API_KEY` | `chat.py:31` | `"mock-deepseek-key"` (`config.py:11`) |
+| `GOOGLE_CLIENT_ID` / `_SECRET` | `sheets/client.py:15-16`, `auth.ts:48-49` | mock values (`config.py:12-13`) |
+| `JWT_SECRET` | `deps.py:25`, `chat.py:39`, `auth.ts:5` | `"mock-jwt-secret-…"` (`config.py:14`) |
+| **`CORS_ORIGINS`** | `main.py:43` | **required — no default** (`config.py:24`) |
+| **`ADMIN_EMAILS`** | `config.py:29` | **required — no default** (`config.py:23`) |
+| **`DEFAULT_SPREADSHEET_ID`** | declared `config.py:18` | **required — no default**; referenced nowhere in `backend/app/` |
+| `DEFAULT_SHEET_TAB` / `_LABEL` | declared `config.py:19-20` | defaults present; referenced nowhere in `backend/app/` |
+| `NEXTAUTH_SECRET` / `NEXTAUTH_URL` | `auth.ts:114`, `docker-compose.yml:59-60` | secret falls back to `JWT_SECRET` |
+| `DB_PASSWORD` | `docker-compose.yml:10`, `:30`, `:46` | none — compose only |
+| `NEXT_PUBLIC_WS_URL` | `useWebSocket.ts:23` | empty in compose (`docker-compose.yml:58`) |
+| `VPS_HOST` / `VPS_USER` / `VPS_SSH_KEY` / `VPS_PASSWORD` | `deploy.yml:14-17` | GitHub secrets |
