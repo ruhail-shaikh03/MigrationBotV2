@@ -1,7 +1,7 @@
 import json
 import logging
 from difflib import get_close_matches
-from typing import List, Dict, Optional, Any
+from typing import List, Dict, Optional
 from openai import AsyncOpenAI
 
 logger = logging.getLogger("column_mapper")

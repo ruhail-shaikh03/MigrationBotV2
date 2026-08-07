@@ -1,6 +1,5 @@
 import logging
 from typing import Dict, Any, List, Optional
-from uuid import UUID
 
 logger = logging.getLogger("session_memory")
 

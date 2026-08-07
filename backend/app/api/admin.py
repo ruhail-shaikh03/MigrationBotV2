@@ -2,14 +2,14 @@ from typing import List, Dict, Any, Optional
 import logging
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, update, delete, desc
+from sqlalchemy import select, desc
 from app.deps import get_current_user, get_db, get_google_auth
 from app.models.user import User
 from app.models.project import Project
 from app.models.permission import Permission
 from app.models.audit_log import AuditLog
 from app.config import settings
-from pydantic import BaseModel, HttpUrl
+from pydantic import BaseModel
 from app.sheets.client import build_sheets_service
 from app.core.schema_detect import parse_spreadsheet_url, detect_all_tabs
 from app.api.chat import llm_client
@@ -360,7 +360,7 @@ async def list_audits(
 @router.get("/analytics/summary", dependencies=[Depends(require_admin)])
 async def get_analytics_summary(db: AsyncSession = Depends(get_db)):
     """Compute high-level system analytics metrics."""
-    from datetime import datetime, timezone, timedelta
+    from datetime import datetime, timezone
     from sqlalchemy import func
 
     proj_res = await db.execute(select(func.count(Project.id)))

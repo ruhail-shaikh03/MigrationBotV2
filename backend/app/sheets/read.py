@@ -2,7 +2,7 @@ import logging
 from typing import List, Dict, Any, Optional
 from datetime import datetime
 from app.sheets.retry import _with_retry
-from app.sheets.meta import _detect_header_row, get_header_row
+from app.sheets.meta import get_header_row
 from app.core.column_mapper import resolve_column
 from app.core.data_quality import DataQualityChecker
 from app.models.audit_log import AuditLog
@@ -92,9 +92,6 @@ async def get_bulk_rows_raw(
     column_map = column_map or tab_schema.get("column_map") or schema_config.get("column_map") or {}
 
     schema_config = tab_schema
-    data_start_row = schema_config.get("data_start_row", 3)
-    header_row_num = data_start_row - 1
-    primary_id_pos = schema_config.get("primary_id_position", "B")
     primary_id_col = schema_config.get("primary_id_column", "RICEFW ID")
 
     target_ids = args.get("ricefw_ids") or []
