@@ -9,6 +9,7 @@ class WriteJobPayload(BaseModel):
     """
     user_email: str
     google_access_token: str = "mock-google-access-token"
+    google_refresh_token: Optional[str] = None
     session_id: Optional[UUID] = None
     tool_name: str
     spreadsheet_id: str

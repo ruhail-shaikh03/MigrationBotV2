@@ -2,7 +2,13 @@ import NextAuth from "next-auth"
 import Google from "next-auth/providers/google"
 import { SignJWT } from "jose"
 
-const JWT_SECRET = process.env.JWT_SECRET || "mock-jwt-secret-at-least-32-characters-long"
+// No fallback: a shared, publicly-known default here is exactly what let a deployment
+// that forgot to set this accept tokens forged against that known string (see
+// backend/app/config.py's JWT_SECRET, which is required for the same reason).
+const JWT_SECRET = process.env.JWT_SECRET
+if (!JWT_SECRET) {
+  throw new Error("JWT_SECRET environment variable is required and has no default.")
+}
 
 /**
  * Refresh the Google access token using the stored refresh token.
@@ -101,6 +107,10 @@ export const { handlers, signIn, signOut, auth } = NextAuth({
           picture: token.picture,
           sub: token.sub,
           google_access_token: token.googleAccessToken,
+          // Lets WS-path Sheets clients self-refresh instead of dying ~1h into a
+          // long-lived socket when this JWT (valid 24h) outlives the Google token it
+          // carries. Only the admin REST path had this before, via a separate header.
+          google_refresh_token: token.googleRefreshToken,
           exp: Math.floor(Date.now() / 1000) + 24 * 60 * 60 // 1 day
         }
         

@@ -58,6 +58,13 @@ class PermissionUpsert(BaseModel):
     allowed_fields: Optional[List[str]] = ["*"]
     denied_operations: Optional[List[str]] = []
 
+class BulkGrantRequest(BaseModel):
+    project_id: int
+    role: str = "editor"
+    user_emails: Optional[List[str]] = None  # omit = every known user
+    allowed_fields: Optional[List[str]] = ["*"]
+    denied_operations: Optional[List[str]] = []
+
 
 # --- Projects CRUD ---
 
@@ -301,6 +308,51 @@ async def upsert_permission(payload: PermissionUpsert, db: AsyncSession = Depend
 
     await db.commit()
     return {"status": "success", "message": "Permissions updated successfully."}
+
+
+@router.post("/permissions/bulk-grant", dependencies=[Depends(require_admin)])
+async def bulk_grant_permissions(payload: BulkGrantRequest, db: AsyncSession = Depends(get_db)):
+    """Grant one role to many users on one project at once — e.g. onboarding the
+    existing user base onto a newly created project without upserting one at a time.
+    Upserts per user: an existing (user, project) row is updated, not duplicated."""
+    proj_res = await db.execute(select(Project).where(Project.id == payload.project_id))
+    if not proj_res.scalar():
+        raise HTTPException(status_code=404, detail="Project not found.")
+
+    role_clean = payload.role.lower().strip()
+
+    if payload.user_emails is not None:
+        emails_clean = [e.lower().strip() for e in payload.user_emails]
+        user_res = await db.execute(select(User).where(User.email.in_(emails_clean)))
+    else:
+        user_res = await db.execute(select(User))
+    users = user_res.scalars().all()
+
+    existing_res = await db.execute(
+        select(Permission).where(Permission.project_id == payload.project_id)
+    )
+    existing_by_user = {p.user_id: p for p in existing_res.scalars().all()}
+
+    granted, updated = 0, 0
+    for user in users:
+        perm = existing_by_user.get(user.id)
+        if perm:
+            perm.role = role_clean
+            perm.allowed_fields = payload.allowed_fields
+            perm.denied_operations = payload.denied_operations
+            updated += 1
+        else:
+            db.add(Permission(
+                user_id=user.id,
+                project_id=payload.project_id,
+                role=role_clean,
+                allowed_fields=payload.allowed_fields,
+                denied_operations=payload.denied_operations
+            ))
+            granted += 1
+
+    await db.commit()
+    return {"status": "success", "granted": granted, "updated": updated, "project_id": payload.project_id}
 
 
 @router.delete("/permissions/{permission_id}", dependencies=[Depends(require_admin)])

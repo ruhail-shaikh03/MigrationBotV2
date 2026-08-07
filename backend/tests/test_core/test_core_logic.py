@@ -4,7 +4,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from jose import jwt
 from app.config import settings
 from app.core.llm_router import select_model
-from app.core.permissions import PermissionChecker
+from app.core.permissions import PermissionChecker, get_user_permissions
 from app.core import audit
 from app.core.agentic_loop import run_agentic_loop
 from app.core.data_quality import DataQualityChecker
@@ -321,3 +321,37 @@ async def test_agentic_loop_flags_queued_write_as_pending():
     assert "not yet applied" in tool_messages[0]["content"]
     # A failure-recovery note must never appear alongside a successful queued result.
     assert "[System Recovery Note]" not in tool_messages[0]["content"]
+
+
+# 8. Regression for TDD §16.3 (Phase 4): a caller get_user_permissions can't place —
+# here, no project_id — must fail closed to settings.DEFAULT_ROLE ("viewer"), not the
+# old hardcoded "editor" fallback.
+@pytest.mark.asyncio
+async def test_get_user_permissions_fails_closed_without_project_id():
+    """No project_id short-circuits before any DB access, so db=None is safe here."""
+    assert settings.DEFAULT_ROLE == "viewer"
+
+    checker = await get_user_permissions(db=None, email="nobody@example.com", project_id=None)
+
+    assert checker.role == "viewer"
+    allowed, reason = checker.can_execute("update_cell", {})
+    assert allowed is False
+    assert reason
+
+
+# 9. Regression for TDD §16.4 (Phase 4): the mock-token/'@' dev-auth fallback must not
+# authenticate when ALLOW_DEV_AUTH is off (the default).
+@pytest.mark.asyncio
+async def test_dev_auth_bypass_gated_behind_allow_dev_auth():
+    from fastapi import HTTPException
+    from app.deps import get_current_user
+
+    assert settings.ALLOW_DEV_AUTH is False
+
+    class FakeCredentials:
+        credentials = "someone@example.com"  # not a valid JWT; contains '@'
+
+    with pytest.raises(HTTPException) as exc_info:
+        await get_current_user(credentials=FakeCredentials(), db=AsyncMock())
+
+    assert exc_info.value.status_code == 401

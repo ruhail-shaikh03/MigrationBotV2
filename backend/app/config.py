@@ -11,7 +11,22 @@ class Settings(BaseSettings):
     DEEPSEEK_API_KEY: str = "mock-deepseek-key"
     GOOGLE_CLIENT_ID: str = "mock-google-id"
     GOOGLE_CLIENT_SECRET: str = "mock-google-secret"
-    JWT_SECRET: str = "mock-jwt-secret-at-least-32-characters-long"
+
+    # No default: a shared, publicly-known fallback here would let any deployment that
+    # forgets to set this accept tokens forged against that known string. Required like
+    # the three below.
+    JWT_SECRET: str
+
+    # Off by default. When true, get_current_user/authenticate_ws_user accept any
+    # 'mock-'-prefixed or '@'-containing bearer token as that identity with no signature
+    # check — needed for local dev and the test suite, but must never be reachable in a
+    # deployment that isn't explicitly opted in.
+    ALLOW_DEV_AUTH: bool = False
+
+    # Fail-closed default role for a caller with no explicit permissions row (§6.2 in
+    # TDD.md). "viewer" so an unknown grant surface can never write; override only if a
+    # deployment genuinely wants the old fail-open behavior.
+    DEFAULT_ROLE: str = "viewer"
 
     # Default project sheet parameters — no built-in fallback; each deployment must
     # provide its own spreadsheet, admin list, and allowed origins via .env.
@@ -42,7 +57,7 @@ except ValidationError as exc:
     missing = ", ".join(sorted({str(err["loc"][0]) for err in exc.errors() if err["type"] == "missing"}))
     raise RuntimeError(
         "Missing required environment variable(s): "
-        f"{missing or exc}. Set ADMIN_EMAILS, CORS_ORIGINS, and DEFAULT_SPREADSHEET_ID "
-        "in your .env file — these no longer fall back to hardcoded production values. "
-        "See .env.example for the expected format."
+        f"{missing or exc}. Set ADMIN_EMAILS, CORS_ORIGINS, DEFAULT_SPREADSHEET_ID, and "
+        "JWT_SECRET in your .env file — these no longer fall back to hardcoded production "
+        "values. See .env.example for the expected format."
     ) from exc

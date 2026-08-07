@@ -30,8 +30,10 @@ async def get_current_user(
                 detail="Authentication token is missing the email address claim.",
             )
     except JWTError:
-        # Fallback helper for local manual testing/curl/mock tests
-        if token.startswith("mock-") or "@" in token:
+        # Dev-only fallback for local manual testing/curl/mock tests. Gated on
+        # ALLOW_DEV_AUTH: without it, this branch would accept any string containing
+        # '@' as a signature-free bearer token in production.
+        if settings.ALLOW_DEV_AUTH and (token.startswith("mock-") or "@" in token):
             email = token.replace("mock-", "")
             payload = {
                 "email": email,

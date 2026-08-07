@@ -1,7 +1,7 @@
 import json
 import uuid
 import logging
-from typing import Any
+from typing import Any, Optional
 import redis.asyncio as aioredis
 from app.config import settings
 from app.queue.schemas import WriteJobPayload
@@ -26,17 +26,19 @@ async def enqueue_write_job(
     spreadsheet_id: str,
     sheet_tab: str,
     args: dict,
-    old_values: dict
+    old_values: dict,
+    google_refresh_token: Optional[str] = None
 ) -> EnqueuedJob:
     """
     Serializes and pushes a write action request to the Redis queue.
     Generates a unique job ID to trace execution.
     """
     job_id = str(uuid.uuid4())
-    
+
     payload = WriteJobPayload(
         user_email=user_email,
         google_access_token=google_access_token,
+        google_refresh_token=google_refresh_token,
         session_id=session_id,
         tool_name=tool_name,
         spreadsheet_id=spreadsheet_id,

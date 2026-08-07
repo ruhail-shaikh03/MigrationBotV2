@@ -376,3 +376,32 @@ async def test_data_quality_check_type_blank_fields_only():
     assert "completeness_score" not in result
     assert "stale_items" not in result
     assert not mock_db.execute.called
+
+
+# 13. Regression for TDD §4.1 (Phase 4): the Google refresh token must reach the queued
+# job payload, not just the access token — otherwise a worker that picks up the job
+# after the ~1h access token expires can't rebuild a self-refreshing Sheets client.
+@pytest.mark.asyncio
+async def test_write_job_carries_refresh_token():
+    """Verify enqueue_write_job serializes google_refresh_token into the job payload."""
+    mock_redis = AsyncMock()
+
+    with patch("app.queue.producer.redis_client", mock_redis):
+        job = await enqueue_write_job(
+            user_email="test@example.com",
+            google_access_token="access-tok",
+            google_refresh_token="refresh-tok",
+            session_id=None,
+            tool_name="update_cell",
+            spreadsheet_id="sheet-123",
+            sheet_tab="SD",
+            args={"ricefw_id": "SD-002", "updates": [{"field": "Dev Status", "value": "Done"}]},
+            old_values={}
+        )
+
+    assert job.id is not None
+    args, _ = mock_redis.rpush.call_args
+    _, raw_payload = args
+    payload_dict = json.loads(raw_payload)
+    assert payload_dict["payload"]["google_access_token"] == "access-tok"
+    assert payload_dict["payload"]["google_refresh_token"] == "refresh-tok"

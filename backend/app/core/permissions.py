@@ -79,13 +79,15 @@ async def get_user_permissions(db: AsyncSession, email: str, project_id: Optiona
     Query database to resolve PermissionChecker configuration for the user context.
     """
     email_clean = email.lower().strip()
-    
+
     # 1. Admin config match
     if email_clean in settings.admin_emails_list:
         return PermissionChecker(email_clean, role="admin", allowed_fields=["*"], denied_operations=[])
 
-    # Default fallback: Editor with full access
-    default_checker = PermissionChecker(email_clean, role="editor", allowed_fields=["*"], denied_operations=[])
+    # Fail-closed default: settings.DEFAULT_ROLE ("viewer" unless overridden). A caller
+    # this function can't place — no project_id, no matching user row, no permissions
+    # row — gets the safe default rather than full write access.
+    default_checker = PermissionChecker(email_clean, role=settings.DEFAULT_ROLE, allowed_fields=["*"], denied_operations=[])
 
     if project_id is None:
         return default_checker
