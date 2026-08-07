@@ -11,7 +11,6 @@ from app.db.engine import get_db, AsyncSessionLocal
 from app.deps import get_current_user
 from app.models.user import User
 from app.models.project import Project
-from app.models.permission import Permission
 from app.models.session import Session as UserSession
 from app.core.permissions import get_user_permissions
 from app.core.agentic_loop import run_agentic_loop

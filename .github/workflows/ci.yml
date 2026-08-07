@@ -2,13 +2,14 @@ name: CI Pipeline
 
 on:
   push:
-    branches: [ main, develop, phase3 ]
+    branches: [ main, develop ]
   pull_request:
-    branches: [ main, develop, phase3 ]
+    branches: [ main, develop ]
 
 jobs:
   lint-and-test:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
 
     services:
       postgres:
@@ -38,6 +39,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Matches backend/Dockerfile's base image (python:3.12-slim) so CI catches
+      # anything that would only break on the version actually deployed.
       - name: Set up Python 3.12
         uses: actions/setup-python@v5
         with:
@@ -48,7 +51,10 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r backend/requirements.txt
-          pip install pytest pytest-asyncio httpx
+          pip install ruff==0.16.1
+
+      - name: Lint (ruff)
+        run: ruff check backend/app
 
       - name: Run Pytest
         env:
@@ -56,15 +62,21 @@ jobs:
           REDIS_URL: redis://localhost:6379
           DEEPSEEK_API_KEY: mock-key
           JWT_SECRET: test-secret-32-characters-long-xx
-          CORS_ORIGINS: "*"
+          CORS_ORIGINS: "http://localhost:3000"
           ADMIN_EMAILS: "admin@example.com"
           DEFAULT_SPREADSHEET_ID: "test-spreadsheet-id"
         run: |
           cd backend
-          pytest -v --tb=short
+          pip install pytest-cov==7.0.0
+          pytest -v --tb=short --cov=app --cov-report=term-missing
+          # No --cov-fail-under yet: this is the first run with coverage wired up at
+          # all, and setting a floor blind (without having seen a real number from a
+          # live run against this DB/Redis) would either be toothless or break CI on
+          # sight. Once a baseline is visible in this job's logs, ratchet a floor in.
 
   frontend-build:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
 
@@ -79,6 +91,17 @@ jobs:
         run: |
           cd frontend
           npm ci
+
+      - name: Lint (eslint)
+        # Advisory only for now: the frontend has ~49 pre-existing lint errors
+        # (mostly @typescript-eslint/no-explicit-any) that predate this workflow
+        # change and are a real cleanup task, not a CI infra one. This makes lint
+        # output visible on every run without turning every unrelated PR red.
+        # Flip to blocking once that backlog is paid down.
+        continue-on-error: true
+        run: |
+          cd frontend
+          npm run lint
 
       - name: Build Next.js app
         run: |

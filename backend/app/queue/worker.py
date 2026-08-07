@@ -1,10 +1,8 @@
 import json
 import asyncio
 import logging
-from typing import Dict, Any, Optional
 import redis
 import redis.asyncio as aioredis
-from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
 from app.config import settings
@@ -47,7 +45,6 @@ async def process_job(job_id: str, payload_dict: dict) -> None:
 
     result_ok = False
     error_msg = None
-    result_data = {}
 
     try:
         if tool == "update_cell":
@@ -65,7 +62,6 @@ async def process_job(job_id: str, payload_dict: dict) -> None:
             )
             result_ok = res.get("ok", False)
             error_msg = res.get("error")
-            result_data = res
 
             # Log audit records for each updated field
             for item in updates:
@@ -97,7 +93,6 @@ async def process_job(job_id: str, payload_dict: dict) -> None:
             )
             result_ok = res.get("ok", False)
             error_msg = res.get("error")
-            result_data = res
 
             set_field = args.get("set_field", "")
             set_value = args.get("set_value", "")
@@ -155,7 +150,6 @@ async def process_job(job_id: str, payload_dict: dict) -> None:
             )
             result_ok = res.get("ok", False)
             error_msg = res.get("error")
-            result_data = res
 
             await _write_audit_record(
                 user_email=payload.user_email,
@@ -212,7 +206,6 @@ async def process_job(job_id: str, payload_dict: dict) -> None:
             )
             result_ok = res.get("ok", False)
             error_msg = res.get("error")
-            result_data = res
 
             await _write_audit_record(
                 user_email=payload.user_email,

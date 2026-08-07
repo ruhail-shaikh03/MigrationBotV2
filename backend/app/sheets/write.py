@@ -1,7 +1,7 @@
 import logging
-from typing import List, Dict, Any, Optional
+from typing import List, Any, Optional
 from app.sheets.retry import _with_retry
-from app.sheets.meta import get_header_row, get_sheet_id
+from app.sheets.meta import get_header_row
 from app.sheets.read import find_row_num, idx_to_col_letter, search_rows
 from app.core.column_mapper import resolve_column
 

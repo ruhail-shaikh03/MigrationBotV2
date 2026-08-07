@@ -1,6 +1,6 @@
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from pydantic import ValidationError
-from typing import List, Optional
+from typing import List
 
 class Settings(BaseSettings):
     # Database and Caching

@@ -4,3 +4,15 @@ asyncio_default_fixture_loop_scope = "session"
 asyncio_default_test_loop_scope = "session"
 pythonpath = ["."]
 testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+
+[tool.ruff.lint]
+# Scoped to genuine defects (undefined names, unused imports/variables, syntax
+# errors) rather than style/modernization rules — this is ruff's first rollout on
+# a codebase that's never been linted, and a broad default selection (pyupgrade,
+# bugbear, bandit, etc.) surfaces ~300 pre-existing style findings that would make
+# every future PR red for reasons unrelated to what it changed. Widen deliberately.
+select = ["E9", "F"]

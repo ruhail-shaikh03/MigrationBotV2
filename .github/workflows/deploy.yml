@@ -1,12 +1,21 @@
 name: CD Pipeline
 
+# Gated on CI Pipeline finishing successfully on main, rather than triggering
+# independently on the same push event — previously this workflow ran regardless of
+# whether tests passed, so a push straight to main (bypassing a PR) could deploy code
+# CI would have failed on. A PR merge still lands as a push to main, so the normal
+# merge-to-main flow triggers this exactly as before, just one step later.
 on:
-  push:
-    branches: [ main, phase3 ]
+  workflow_run:
+    workflows: ["CI Pipeline"]
+    types: [completed]
+    branches: [main]
 
 jobs:
   deploy:
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - name: Deploy to VPS via SSH
         uses: appleboy/ssh-action@v1.0.3
@@ -16,7 +25,9 @@ jobs:
           key: ${{ secrets.VPS_SSH_KEY }}
           password: ${{ secrets.VPS_PASSWORD }}
           port: 22
+          command_timeout: 12m
           script: |
+            set -e
             echo "Syncing latest code from origin/main..."
             if [ -d "/root/migrationbot" ]; then
               cd /root/migrationbot
@@ -28,12 +39,46 @@ jobs:
             fi
             git fetch origin main
             git reset --hard origin/main
-            echo "Stopping old containers..."
-            docker compose down
-            echo "Rebuilding all containers from scratch..."
-            docker compose build --no-cache
-            echo "Starting fresh containers..."
+
+            # Build new images while the old containers are still serving traffic —
+            # previously this was `down` (stop everything) THEN `build --no-cache`,
+            # so the app was fully offline for the entire rebuild, not just the swap.
+            # --no-cache is dropped too: backend/requirements.txt has been exact-pinned
+            # since Phase 0, so a cached build is just as reproducible and much faster.
+            echo "Building new images..."
+            docker compose build
+
+            echo "Swapping to new containers..."
             docker compose up -d
+
+            # Verify the deploy actually worked before declaring success. This is the
+            # exact gap that let the 2026-08-06 CORS_ORIGINS outage run for ~21 hours
+            # unnoticed — `docker compose up -d` returning 0 only means the containers
+            # were *started*, not that they stayed up or that the app is functional.
+            echo "Verifying deployment health..."
+            sleep 10
+            if docker compose ps | grep -qi "restarting"; then
+              echo "One or more containers are stuck restarting. Deployment failed."
+              docker compose ps
+              docker compose logs --tail=80
+              exit 1
+            fi
+
+            READY=""
+            for i in $(seq 1 15); do
+              if curl -fsS http://localhost:8000/api/ready > /dev/null 2>&1; then
+                READY="yes"
+                break
+              fi
+              sleep 5
+            done
+            if [ -z "$READY" ]; then
+              echo "Backend did not report ready within 75s. Deployment failed."
+              docker compose logs --tail=80 backend
+              exit 1
+            fi
+
+            echo "Backend is healthy."
             echo "Pruning old images..."
             docker image prune -f
             echo "Deployment finished successfully."
