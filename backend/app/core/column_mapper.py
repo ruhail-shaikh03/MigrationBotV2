@@ -142,10 +142,12 @@ def resolve_column(user_term: str, column_map: Optional[dict] = None) -> Optiona
 
 def get_column_map_json(column_map: Optional[dict] = None) -> str:
     """
-    Return the active column map as indented JSON for system prompt injection.
+    Return the active column map as compact JSON for system prompt injection.
+    Compact (not indented) since this is injected into every LLM call — see
+    agentic_loop.py's compact-prompt swap on iteration > 0 for the same concern.
     """
     active_map = column_map or COLUMN_ALIASES
-    return json.dumps(active_map, indent=2)
+    return json.dumps(active_map, ensure_ascii=False)
 
 
 async def build_column_map(header_row: List[str], client: AsyncOpenAI) -> dict:

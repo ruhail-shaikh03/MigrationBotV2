@@ -372,9 +372,13 @@ every active project *before* the new code deployed — otherwise everyone relyi
 fail-open default would have lost write access the moment it shipped. `admin.py:bulk_grant_permissions`
 is the ongoing equivalent for onboarding a user base onto a newly created project.
 
-> **⚠ `WRITE_TOOLS` is never read.** Defined at `permissions.py:WRITE_TOOLS` but `can_execute` only
-> tests `READ_ONLY_TOOLS` (`permissions.py:PermissionChecker.can_execute`). Classification is by
-> exclusion, so a new read tool omitted from that set is silently denied to viewers.
+`can_execute` (`permissions.py:PermissionChecker.can_execute`) classifies explicitly: any
+non-admin caller requesting a `tool_name` in neither `READ_ONLY_TOOLS` nor `WRITE_TOOLS` is denied
+with a "not a recognized tool" error before role logic runs at all — previously `WRITE_TOOLS` was
+defined but never consulted, so classification was by exclusion from `READ_ONLY_TOOLS` alone: an
+editor could reach the bottom-of-function `return True, ""` for any unclassified tool name, and a
+legitimate new read tool omitted from `READ_ONLY_TOOLS` would be silently denied to viewers with a
+misleading "read-only access" message rather than a "not recognized" one (§16 history).
 
 ---
 
@@ -384,10 +388,11 @@ is the ongoing equivalent for onboarding a user base onto a newly created projec
 
 JSONB defaulting to `{}` (`models/project.py:Project`), in one of two shapes distinguished by a
 top-level `"tabs"` key: multi-tab (`{"tabs": {...}, "global": {...}}`, what `detect_all_tabs`
-produces — `schema_detect.py:detect_all_tabs`) or flat. The disambiguation is reimplemented in
-`read.py:_get_tab_schema`, `write.py:update_cell`, `write.py:bulk_update`, `write.py:add_row`,
-`worker.py:process_job`, `chat.py:websocket_chat_endpoint`, and `agentic_loop.py:run_agentic_loop`
-— seven copies, one of them (`read.py`) a private `_get_tab_schema` function the others don't share.
+produces — `schema_detect.py:detect_all_tabs`) or flat. The disambiguation has one implementation,
+`core/schema.py:get_tab_schema` (plus `core/schema.py:get_valid_modules` for the system-prompt
+module list) — previously it was copy-pasted at seven call sites (`read.py`, `write.py` ×3,
+`worker.py`, `chat.py`, `agentic_loop.py`), one of them a private `_get_tab_schema` the others
+didn't share (§16 history).
 
 Per-tab defaults are applied inline at each use: `data_start_row` → `3`, `primary_id_position` →
 `"B"`, `primary_id_column` → `"RICEFW ID"`, `assignee_column` → `"Technical Resource "` (with
@@ -423,9 +428,14 @@ are skipped; `data_start_row` = `header_row_index + 2`. On LLM failure a hard-co
 returned with `is_tracker_sheet: True` — so an outage registers every tab, including cover pages,
 as a tracker.
 
-`build_column_map` (`column_mapper.py:build_column_map`), a two-pass LLM alias generator, is never
-called from anywhere in `backend/`; `detect_all_tabs` writes no `column_map` key. Every deployment
-therefore runs on the static `COLUMN_ALIASES` unless an admin hand-edits `schema_config`.
+`build_column_map` (`column_mapper.py:build_column_map`), a two-pass LLM alias generator, is now
+called from `schema_detect.py:detect_all_tabs` for every tracker tab it detects — it generates an
+alias map from that tab's own real headers and attaches it as `column_map` in the tab's schema,
+rather than every deployment silently running on the static `COLUMN_ALIASES` fallback (hardcoded to
+one customer's sheet — §16 history) unless an admin hand-edited `schema_config`. `build_column_map`
+falls back to `COLUMN_ALIASES` itself on any LLM failure, so this can't make detection worse than
+before. `get_column_map_json` (`column_mapper.py:get_column_map_json`) is the system-prompt
+serializer for whichever map ends up active, called from `agentic_loop.py:run_agentic_loop`.
 
 ---
 
@@ -533,8 +543,12 @@ Admin routes (all gated by `require_admin`, `admin.py:require_admin`):
 
 Non-admin: `GET /api/health` (`health.py:health_check`, liveness — static literal, no dependency
 probing), `GET /api/ready` (`health.py:readiness_check`, added in Phase 0 of the remediation plan
-— live `SELECT 1` against Postgres and `PING` against the shared `producer.redis_client`, `503`
-with a per-service `detail` dict when either fails; verified against unreachable dependencies),
+— live `SELECT 1` against Postgres, `PING` against the shared `producer.redis_client`, and a check
+of `request.app.state.db_initialized` (set in `main.py:lifespan` from `init_db()`'s real outcome);
+`503` with a per-service `detail` dict when any of the three fails; verified against unreachable
+dependencies and against a startup where `init_db()` failed but Postgres itself stayed reachable —
+a live `SELECT 1` alone can't tell "Postgres is down" apart from "Postgres is up with no tables
+ever created" (§16 history)),
 `GET /api/me` (`api/auth.py:get_current_profile`, mounted directly in `main.py`),
 `GET /api/projects` (`chat.py:list_user_projects`), and `GET /api/jobs/{job_id}`
 (`api/jobs.py:get_job_status`, added Phase 5 — queries the job-state key a write job's `job_id`
@@ -777,29 +791,6 @@ Threading the refresh token through was a deliberate Phase 4 tradeoff — the al
 writes dying whenever the access token expires before the worker gets to them) was worse — but it
 does widen what's exposed here, and a token-reference indirection (store tokens server-side, pass
 the queue only an opaque reference) remains the real fix, not attempted here.
-
-### 16.2 Seven copies of the schema-shape branch
-**Severity: low (maintenance).** `read.py:_get_tab_schema`, `write.py:update_cell`,
-`write.py:bulk_update`, `write.py:add_row`, `worker.py:process_job`,
-`chat.py:websocket_chat_endpoint`, `agentic_loop.py:run_agentic_loop`. Per-key defaults are
-similarly scattered.
-
-### 16.3 Dead code
-**Severity: low.** `core/planner.py` and `core/memory.py` (never imported);
-`column_mapper.py:build_column_map` and `column_mapper.py:get_column_map_json` (never called —
-§7.3); `audit.py:log_audit`; `permissions.py:WRITE_TOOLS`; `permissions.py:PermissionChecker.is_admin`;
-`meta.py:_detect_header_row` (defined, never called from anywhere — the one unused import of it,
-in `read.py`, was itself dead and has been removed); `models/audit_log.py:AuditLog.created_month`
-(no partitioning exists).
-
-### 16.4 Startup `init_db()` failure is non-fatal, and readiness doesn't fully cover it
-**Severity: low.** `init_db()` failures are caught and execution continues
-(`main.py:lifespan`). `GET /api/ready` (`health.py:readiness_check`, added in Phase 0) narrows
-this but does not close it: it runs a live `SELECT 1`, which succeeds against a reachable Postgres
-regardless of whether `init_db()` ever created the application's tables — `SELECT 1` needs no
-table. So the probe catches "Postgres is down" (which is what caused the 2026-08-06 outage — see
-§3) but not "Postgres is up with an empty schema". Closing that gap needs `main.py:lifespan` to
-record `init_db()`'s outcome and have `health.py:readiness_check` report unready when it failed.
 
 ---
 

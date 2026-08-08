@@ -355,3 +355,141 @@ async def test_dev_auth_bypass_gated_behind_allow_dev_auth():
         await get_current_user(credentials=FakeCredentials(), db=AsyncMock())
 
     assert exc_info.value.status_code == 401
+
+
+# 10. Regression for TDD §16.11 (Phase 6): WRITE_TOOLS was defined but can_execute never
+# read it — classification was by exclusion, so an editor could run any unclassified tool
+# name (fell through to the bottom `return True, ""`), and a legitimate new read tool
+# omitted from READ_ONLY_TOOLS would be silently denied to viewers with a misleading
+# "read-only access" message instead of a "not recognized" one.
+def test_permissions_unclassified_tool_fails_closed_for_editor_and_viewer():
+    editor = PermissionChecker("editor@example.com", role="editor", allowed_fields=["*"], denied_operations=[])
+    allowed, reason = editor.can_execute("delete_everything", {})
+    assert allowed is False
+    assert "not a recognized tool" in reason
+
+    viewer = PermissionChecker("viewer@example.com", role="viewer", allowed_fields=["*"], denied_operations=[])
+    allowed, reason = viewer.can_execute("delete_everything", {})
+    assert allowed is False
+    assert "not a recognized tool" in reason
+
+    # Row admin still bypasses classification entirely, per §6.2.
+    admin = PermissionChecker("admin@example.com", role="admin", allowed_fields=["*"], denied_operations=[])
+    allowed, reason = admin.can_execute("delete_everything", {})
+    assert allowed is True
+
+
+# 11. Regression for TDD §16.20 (Phase 6): the "tabs" in schema_config disambiguation was
+# copy-pasted at seven call sites. core/schema.py is now the one implementation.
+def test_get_tab_schema_and_valid_modules_resolve_both_shapes():
+    from app.core.schema import get_tab_schema, get_valid_modules
+
+    flat_schema = {"data_start_row": 3, "primary_id_position": "B", "valid_modules": ["SD", "FI"]}
+    assert get_tab_schema(flat_schema, "SD") == flat_schema
+    assert get_valid_modules(flat_schema) == ["SD", "FI"]
+
+    multi_tab_schema = {
+        "tabs": {"SD": {"data_start_row": 3}, "FI": {"data_start_row": 4}},
+        "global": {"valid_modules": ["SD", "FI"]}
+    }
+    assert get_tab_schema(multi_tab_schema, "SD") == {"data_start_row": 3}
+    assert get_tab_schema(multi_tab_schema, "MISSING") == {}
+    assert get_valid_modules(multi_tab_schema) == ["SD", "FI"]
+
+    # No explicit "global.valid_modules" — falls back to the tab names themselves.
+    multi_tab_no_global = {"tabs": {"SD": {}, "FI": {}}}
+    assert set(get_valid_modules(multi_tab_no_global)) == {"SD", "FI"}
+
+
+# 12. Regression for TDD §16.23 (Phase 6): init_db() failures are swallowed at boot
+# (main.py:lifespan) so the process keeps serving for debuggability — but a live SELECT 1
+# alone can't distinguish "Postgres is down" from "Postgres is up with no tables ever
+# created". app.state.db_initialized closes that gap.
+@pytest.mark.asyncio
+async def test_readiness_check_reports_unready_when_db_schema_never_initialized():
+    from fastapi import HTTPException
+    from app.api.health import readiness_check
+
+    mock_session = MagicMock()
+    mock_session.__aenter__.return_value = mock_session
+    mock_session.__aexit__.return_value = None
+    mock_session.execute = AsyncMock(return_value=None)
+
+    class FakeState:
+        db_initialized = False
+
+    class FakeApp:
+        state = FakeState()
+
+    class FakeRequest:
+        app = FakeApp()
+
+    with patch("app.api.health.AsyncSessionLocal", return_value=mock_session), \
+         patch("app.queue.producer.redis_client.ping", AsyncMock(return_value=True)):
+        with pytest.raises(HTTPException) as exc_info:
+            await readiness_check(request=FakeRequest())
+
+    assert exc_info.value.status_code == 503
+    assert "db_schema" in exc_info.value.detail
+    # Postgres and Redis are themselves healthy — only the schema-init flag fails, which
+    # is exactly the case a live SELECT 1 alone can't detect.
+    assert exc_info.value.detail["postgres"] == "ok"
+    assert exc_info.value.detail["redis"] == "ok"
+
+
+@pytest.mark.asyncio
+async def test_readiness_check_passes_when_db_initialized():
+    from app.api.health import readiness_check
+
+    mock_session = MagicMock()
+    mock_session.__aenter__.return_value = mock_session
+    mock_session.__aexit__.return_value = None
+    mock_session.execute = AsyncMock(return_value=None)
+
+    class FakeState:
+        db_initialized = True
+
+    class FakeApp:
+        state = FakeState()
+
+    class FakeRequest:
+        app = FakeApp()
+
+    with patch("app.api.health.AsyncSessionLocal", return_value=mock_session), \
+         patch("app.queue.producer.redis_client.ping", AsyncMock(return_value=True)):
+        result = await readiness_check(request=FakeRequest())
+
+    assert result["status"] == "ready"
+
+
+# 13. Regression for TDD §7.3 / §16.3 (Phase 6): build_column_map (a complete two-pass
+# LLM alias generator) was defined but never called from anywhere, so every deployment
+# ran on the static COLUMN_ALIASES fallback — hardcoded to one customer's real sheet
+# headers, and the root cause of the whitespace-column class of bugs (§16.2) for anyone
+# else's tracker. detect_all_tabs must now generate and attach a per-tab column_map.
+@pytest.mark.asyncio
+async def test_detect_all_tabs_wires_in_build_column_map():
+    from app.core.schema_detect import detect_all_tabs
+
+    mock_service = MagicMock()
+    mock_service.spreadsheets.return_value.get.return_value.execute.return_value = {
+        "sheets": [{"properties": {"title": "SD"}}]
+    }
+    mock_service.spreadsheets.return_value.values.return_value.get.return_value.execute.return_value = {
+        "values": [["RICEFW ID", "Module", "Dev Status"]]
+    }
+
+    fake_tab_schema = {
+        "is_tracker_sheet": True,
+        "header_row_index": 0,
+        "primary_id_column": "RICEFW ID",
+    }
+    fake_column_map = {"RICEFW ID": ["id", "ricefw"]}
+
+    with patch("app.core.schema_detect.detect_schema_config", AsyncMock(return_value=fake_tab_schema)), \
+         patch("app.core.schema_detect.build_column_map", AsyncMock(return_value=fake_column_map)) as mock_build_map:
+        result = await detect_all_tabs(mock_service, "sheet-123", client=AsyncMock())
+
+    assert mock_build_map.called
+    assert mock_build_map.call_args.args[0] == ["RICEFW ID", "Module", "Dev Status"]
+    assert result["tabs"]["SD"]["column_map"] == fake_column_map

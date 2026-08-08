@@ -1,6 +1,6 @@
-from datetime import datetime, date
+from datetime import datetime
 from uuid import UUID
-from sqlalchemy import String, DateTime, Boolean, Text, Computed, Date, func
+from sqlalchemy import String, DateTime, Boolean, Text, func
 from sqlalchemy.dialects.postgresql import JSONB, UUID as PG_UUID
 from sqlalchemy.orm import Mapped, mapped_column
 from app.db.engine import Base
@@ -22,12 +22,6 @@ class AuditLog(Base):
     args_json: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
     result_ok: Mapped[bool] = mapped_column(Boolean, default=True, server_default="true")
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
-
-    # Generated column for partitioning-ready queries
-    created_month: Mapped[date] = mapped_column(
-        Date,
-        Computed("(DATE_TRUNC('month', timestamp AT TIME ZONE 'UTC'))::date", persisted=True)
-    )
 
     def __repr__(self) -> str:
         return f"<AuditLog id={self.id} user={self.user_email} tool={self.tool_name} ok={self.result_ok}>"

@@ -6,6 +6,8 @@ from app.core.llm_router import select_model
 from app.core.tool_schemas import TOOLS, get_system_prompt, get_system_prompt_compact
 from app.core.permissions import PermissionChecker
 from app.core.tool_dispatch import dispatch_tool
+from app.core.schema import get_valid_modules
+from app.core.column_mapper import get_column_map_json
 
 logger = logging.getLogger("agentic_loop")
 
@@ -30,11 +32,8 @@ async def run_agentic_loop(
     Executes the multi-turn agentic loop. Receives user queries, interacts with DeepSeek,
     enforces RBAC permissions, routes tool requests to the dispatcher, and streams replies.
     """
-    if "tabs" in schema_config:
-        valid_modules = schema_config.get("global", {}).get("valid_modules") or list(schema_config.get("tabs", {}).keys())
-    else:
-        valid_modules = schema_config.get("valid_modules", [])
-    column_map_json = json.dumps(column_map, ensure_ascii=False)
+    valid_modules = get_valid_modules(schema_config)
+    column_map_json = get_column_map_json(column_map)
     
     # Generate initial full system prompt
     system_prompt = get_system_prompt(valid_modules, column_map_json)

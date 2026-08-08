@@ -1,4 +1,3 @@
-import asyncio
 import logging
 from uuid import UUID
 from typing import Optional, Dict, Any
@@ -45,38 +44,3 @@ async def _write_audit_record(
             await db.commit()
     except Exception as e:
         logger.error(f"[AUDIT WRITE FAILED] {e}")
-
-
-def log_audit(
-    user_email: str,
-    session_id: Optional[UUID],
-    tool_name: str,
-    spreadsheet_id: Optional[str],
-    sheet_tab: Optional[str],
-    ricefw_id: Optional[str] = "",
-    field: Optional[str] = "",
-    old_value: Optional[str] = "",
-    new_value: Optional[str] = "",
-    args: Optional[Dict[str, Any]] = None,
-    result_ok: bool = True,
-    error: Optional[str] = "",
-) -> None:
-    """
-    Schedule a non-blocking background task to write an audit row.
-    """
-    asyncio.create_task(
-        _write_audit_record(
-            user_email=user_email,
-            session_id=session_id,
-            tool_name=tool_name,
-            spreadsheet_id=spreadsheet_id,
-            sheet_tab=sheet_tab,
-            ricefw_id=ricefw_id,
-            field=field,
-            old_value=old_value,
-            new_value=new_value,
-            args=args,
-            result_ok=result_ok,
-            error=error
-        )
-    )

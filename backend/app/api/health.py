@@ -1,5 +1,5 @@
 import logging
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, HTTPException, Request, status
 from sqlalchemy import select
 from app.db.engine import AsyncSessionLocal
 
@@ -14,7 +14,7 @@ async def health_check():
 
 
 @router.get("/ready")
-async def readiness_check():
+async def readiness_check(request: Request):
     """
     Readiness check. Probes Postgres (SELECT 1) and Redis (PING) directly rather
     than trusting the process being up — /health returns a static literal and
@@ -23,6 +23,14 @@ async def readiness_check():
     """
     checks: dict[str, str] = {}
     ok = True
+
+    # main.py:lifespan swallows init_db() failures so the process can still boot for
+    # debugging — but that means a live SELECT 1 below can't tell "Postgres is down"
+    # apart from "Postgres is up, schema was never created" (TDD §16.23). This flag
+    # closes that gap.
+    if not getattr(request.app.state, "db_initialized", False):
+        checks["db_schema"] = "init_db() failed or has not completed yet — see startup logs"
+        ok = False
 
     try:
         async with AsyncSessionLocal() as db:

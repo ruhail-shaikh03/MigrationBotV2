@@ -15,6 +15,7 @@ from app.sheets.client import build_sheets_service
 from app.sheets.write import update_cell, bulk_update, add_row
 from app.sheets.format import format_row
 from app.core.audit import _write_audit_record
+from app.core.schema import get_tab_schema
 
 # Configure logging format
 logging.basicConfig(
@@ -257,7 +258,7 @@ async def process_job(job_id: str, payload_dict: dict) -> None:
             # computed here, sequentially, right before the write. That's deliberate:
             # doing it server-side avoids the race a client-computed ID would hit
             # under concurrent adds.
-            tab_schema = schema_config.get("tabs", {}).get(payload.sheet_tab, {}) if "tabs" in schema_config else schema_config
+            tab_schema = get_tab_schema(schema_config, payload.sheet_tab)
             data_start_row = tab_schema.get("data_start_row", 3)
             primary_id_pos = tab_schema.get("primary_id_position", "B")
             ricefw_id = await next_ricefw_id(

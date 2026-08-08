@@ -22,9 +22,6 @@ class PermissionChecker:
         self.allowed_fields = allowed_fields or ["*"]
         self.denied_ops = set(denied_operations or [])
 
-    def is_admin(self) -> bool:
-        return self.role == "admin"
-
     def can_execute(self, tool_name: str, args: dict) -> Tuple[bool, str]:
         """
         Evaluate if tool can run.
@@ -33,6 +30,14 @@ class PermissionChecker:
         """
         if self.role == "admin":
             return True, ""
+
+        # Classify explicitly rather than by exclusion: a tool that is in neither set
+        # fails closed and loudly here, instead of an editor silently being allowed to
+        # run it (the old bottom-of-function `return True, ""`) or a legitimate new
+        # read tool being denied to viewers with a misleading "read-only access"
+        # message (TDD §16.11 — WRITE_TOOLS was defined but never actually read).
+        if tool_name not in READ_ONLY_TOOLS and tool_name not in WRITE_TOOLS:
+            return False, f"`{tool_name}` is not a recognized tool and cannot be executed."
 
         if self.role == "viewer":
             if tool_name not in READ_ONLY_TOOLS:
