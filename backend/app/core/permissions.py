@@ -76,6 +76,33 @@ class PermissionChecker:
                     f"Your allowed fields are: {', '.join(self.allowed_fields)}."
                 )
 
+        # Field-level restriction check for add_row's free-form `fields` dict. The
+        # module/type/description/assigned_to base params are structural — required to
+        # create any row at all — and aren't gated; only the escape-hatch extra columns
+        # a caller can attach via `fields` are, since that's the part that let a
+        # field-restricted user write to an arbitrary column that update_cell/
+        # bulk_update would have refused.
+        if tool_name == "add_row" and self.allowed_fields != ["*"]:
+            extra_fields = args.get("fields") or {}
+            blocked = [f for f in extra_fields if f not in self.allowed_fields]
+            if blocked:
+                fields = ", ".join(blocked)
+                return False, (
+                    f"You don't have write access to: **{fields}**. "
+                    f"Your allowed fields are: {', '.join(self.allowed_fields)}."
+                )
+
+        # Field-level restriction check for format_row. It always writes to the
+        # sheet's Color/highlight column regardless of `scope` (worker.py:process_job
+        # records every format_row audit row with field="Color"), so it's gated the
+        # same way a single-field write would be.
+        if tool_name == "format_row" and self.allowed_fields != ["*"]:
+            if "Color" not in self.allowed_fields:
+                return False, (
+                    "You don't have write access to **Color**. "
+                    f"Your allowed fields are: {', '.join(self.allowed_fields)}."
+                )
+
         return True, ""
 
 

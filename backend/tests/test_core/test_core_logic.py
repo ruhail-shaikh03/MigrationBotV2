@@ -493,3 +493,58 @@ async def test_detect_all_tabs_wires_in_build_column_map():
     assert mock_build_map.called
     assert mock_build_map.call_args.args[0] == ["RICEFW ID", "Module", "Dev Status"]
     assert result["tabs"]["SD"]["column_map"] == fake_column_map
+
+
+# 14. Field-level RBAC previously covered only update_cell and bulk_update — add_row's
+# free-form `fields` dict and format_row (which always writes the Color column) were
+# ungated, so a user restricted to a specific column could still write anywhere via
+# either tool.
+def test_field_restricted_editor_add_row_extra_fields_gated():
+    field_editor = PermissionChecker("editor@example.com", role="editor", allowed_fields=["Dev Status"], denied_operations=[])
+
+    # module/type/description/assigned_to are structural, not gated by allowed_fields.
+    allowed, reason = field_editor.can_execute("add_row", {
+        "module": "SD", "type": "R", "description": "New object", "assigned_to": "dev@example.com"
+    })
+    assert allowed is True
+
+    # An allowed extra column passes.
+    allowed, reason = field_editor.can_execute("add_row", {
+        "module": "SD", "type": "R", "description": "New object",
+        "fields": {"Dev Status": "Ready for Dev"}
+    })
+    assert allowed is True
+
+    # A disallowed extra column is the escape hatch this closes.
+    allowed, reason = field_editor.can_execute("add_row", {
+        "module": "SD", "type": "R", "description": "New object",
+        "fields": {"Business Owner": "Alex"}
+    })
+    assert allowed is False
+    assert "don't have write access to: **Business Owner**" in reason
+
+
+def test_field_restricted_editor_format_row_gated_on_color():
+    field_editor = PermissionChecker("editor@example.com", role="editor", allowed_fields=["Dev Status"], denied_operations=[])
+    allowed, reason = field_editor.can_execute("format_row", {"ricefw_id": "SD-012", "color": "green", "scope": "entire_row"})
+    assert allowed is False
+    assert "don't have write access to **Color**" in reason
+
+    color_editor = PermissionChecker("editor@example.com", role="editor", allowed_fields=["Color"], denied_operations=[])
+    allowed, reason = color_editor.can_execute("format_row", {"ricefw_id": "SD-012", "color": "green", "scope": "color_column_only"})
+    assert allowed is True
+
+
+def test_unrestricted_editor_still_allowed_add_row_and_format_row():
+    """allowed_fields == ["*"] (the default) must remain fully permissive — this fix
+    should only add friction for accounts an admin has deliberately restricted."""
+    editor = PermissionChecker("editor@example.com", role="editor", allowed_fields=["*"], denied_operations=[])
+
+    allowed, _ = editor.can_execute("add_row", {
+        "module": "SD", "type": "R", "description": "New object",
+        "fields": {"Business Owner": "Alex"}
+    })
+    assert allowed is True
+
+    allowed, _ = editor.can_execute("format_row", {"ricefw_id": "SD-012", "color": "red", "scope": "entire_row"})
+    assert allowed is True

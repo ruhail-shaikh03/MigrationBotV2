@@ -355,11 +355,20 @@ WRITE_TOOLS     = {"update_cell", "bulk_update", "format_row", "add_row"}
 |---|---|---|---|---|
 | **Config admin** | all | all | none | not consulted |
 | **Row admin** | all | all | none — short-circuits in `PermissionChecker.can_execute` | **not consulted** |
-| **Editor** | all | all not in `denied_ops` | `update_cell`, `bulk_update` only, both in `PermissionChecker.can_execute` | honoured |
+| **Editor** | all | all not in `denied_ops` | all four write tools, in `PermissionChecker.can_execute` | honoured |
 | **Viewer** (default, §16 history) | all | none (`PermissionChecker.can_execute`) | n/a | **not consulted** |
 
-Field enforcement is skipped entirely when `allowed_fields == ["*"]` (`permissions.py:PermissionChecker.can_execute`),
-and covers only those two tools — `add_row`'s free-form `fields` dict and `format_row` are ungated.
+Field enforcement is skipped entirely when `allowed_fields == ["*"]` (`permissions.py:PermissionChecker.can_execute`).
+When it isn't, all four write tools are covered: `update_cell` and `bulk_update` check the field(s)
+named in `args`; `add_row` checks the keys of its free-form `fields` dict against `allowed_fields`
+(the `module`/`type`/`description`/`assigned_to` base params are structural — required to create
+any row at all — and aren't gated, only the escape-hatch extra columns a caller can attach via
+`fields` are); `format_row` checks that the literal string `"Color"` is in `allowed_fields`, since it
+always writes the sheet's Color/highlight column regardless of `scope` — `worker.py:process_job`
+records every `format_row` audit row with `field="Color"`, so it's gated the same way a single-field
+write would be. Previously only `update_cell`/`bulk_update` were checked — a user restricted to one
+column could still write to any column via `add_row`'s `fields` dict, or recolor any row via
+`format_row` (§16 history).
 
 **RBAC is fail-closed.** `get_user_permissions` returns `settings.DEFAULT_ROLE` (`config.py:Settings`,
 default `"viewer"`) with `["*"]` when no `project_id` is given, when no `users` row matches, and
