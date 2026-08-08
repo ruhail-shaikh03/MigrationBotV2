@@ -1,10 +1,11 @@
 import json
 import uuid
 import logging
+from datetime import datetime, timezone
 from typing import Any, Optional
 import redis.asyncio as aioredis
 from app.config import settings
-from app.queue.schemas import WriteJobPayload
+from app.queue.schemas import WriteJobPayload, JOB_STATE_PREFIX, JOB_STATE_TTL_SECONDS
 
 logger = logging.getLogger("queue_producer")
 
@@ -54,8 +55,28 @@ async def enqueue_write_job(
 
     queue_key = "migrationbot:write_queue"
     logger.info(f"Enqueuing write job {job_id} for tool {tool_name} to Redis.")
-    
+
     # LPUSH/RPUSH to treat Redis list as a FIFO queue (RPUSH to enqueue, BLPOP/LPOP to dequeue)
     await redis_client.rpush(queue_key, json.dumps(envelope, ensure_ascii=False))
-    
+
+    # Makes job_id queryable (see api/jobs.py) from the moment it's returned to the
+    # caller, not just once the worker picks it up.
+    try:
+        state = {
+            "job_id": job_id,
+            "status": "queued",
+            "tool_name": tool_name,
+            "user_email": user_email,
+            "spreadsheet_id": spreadsheet_id,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+        await redis_client.set(
+            f"{JOB_STATE_PREFIX}:{job_id}",
+            json.dumps(state, ensure_ascii=False),
+            ex=JOB_STATE_TTL_SECONDS
+        )
+    except Exception as e:
+        logger.warning(f"Failed to set initial job state for {job_id}: {e}")
+
     return EnqueuedJob(job_id)

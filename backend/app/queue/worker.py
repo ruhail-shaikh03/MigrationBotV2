@@ -1,6 +1,7 @@
 import json
 import asyncio
 import logging
+from datetime import datetime, timezone
 import redis
 import redis.asyncio as aioredis
 from sqlalchemy import select
@@ -8,7 +9,7 @@ from sqlalchemy import select
 from app.config import settings
 from app.db.engine import AsyncSessionLocal
 from app.models.project import Project
-from app.queue.schemas import WriteJobPayload
+from app.queue.schemas import WriteJobPayload, JOB_STATE_PREFIX, JOB_STATE_TTL_SECONDS
 from app.queue.events import publish_queue_update
 from app.sheets.client import build_sheets_service
 from app.sheets.write import update_cell, bulk_update, add_row
@@ -21,6 +22,83 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
 )
 logger = logging.getLogger("queue_worker")
+
+QUEUE_KEY = "migrationbot:write_queue"
+# BLMOVE atomically relocates a job here on pickup, so a worker that dies between
+# pickup and the LREM at the end of a clean pass leaves the job here, not gone —
+# recover_stale_jobs() re-queues (or dead-letters) anything still here on the next
+# worker startup, which is also what happens automatically after a Docker restart
+# (docker-compose.yml: worker has restart: unless-stopped).
+PROCESSING_KEY = "migrationbot:write_queue:processing"
+DEAD_LETTER_KEY = "migrationbot:write_queue:dead_letter"
+MAX_ATTEMPTS = 3
+
+
+async def _set_job_state(redis_client, job_id: str, **fields) -> None:
+    """Merge fields into the job's state hash so the job_id already returned to the
+    caller (tool_dispatch.py:dispatch_tool) stays queryable after the fact, not just
+    while the write is in flight."""
+    if not job_id:
+        return
+    key = f"{JOB_STATE_PREFIX}:{job_id}"
+    try:
+        existing = await redis_client.get(key)
+        state = json.loads(existing) if existing else {}
+        state.update(fields)
+        state["updated_at"] = datetime.now(timezone.utc).isoformat()
+        await redis_client.set(key, json.dumps(state, ensure_ascii=False), ex=JOB_STATE_TTL_SECONDS)
+    except Exception as e:
+        # Job-state tracking is observability, not correctness — never let it block
+        # or fail the write it's describing.
+        logger.warning(f"Failed to update job state for {job_id}: {e}")
+
+
+async def recover_stale_jobs(redis_client) -> int:
+    """Run once at worker startup. Anything still in PROCESSING_KEY was picked up by
+    a previous run that never reached a clean completion (crash, OOM kill, forced
+    container restart mid-job) — BLMOVE puts it there atomically on pickup, and only
+    a clean pass removes it. Re-queues under MAX_ATTEMPTS; dead-letters and notifies
+    the user past that, rather than retrying forever or silently losing the write."""
+    recovered = 0
+    while True:
+        raw = await redis_client.lpop(PROCESSING_KEY)
+        if raw is None:
+            break
+
+        try:
+            envelope = json.loads(raw)
+        except Exception:
+            logger.error(f"Dropping unparseable stale job during recovery: {raw!r}")
+            continue
+
+        job_id = envelope.get("job_id")
+        payload = envelope.get("payload", {}) or {}
+        attempt = envelope.get("attempt", 0) + 1
+        envelope["attempt"] = attempt
+        recovered += 1
+
+        if attempt > MAX_ATTEMPTS:
+            logger.error(f"Job {job_id} exceeded {MAX_ATTEMPTS} attempts after worker crash(es); dead-lettering.")
+            await redis_client.rpush(DEAD_LETTER_KEY, json.dumps(envelope, ensure_ascii=False))
+            await _set_job_state(redis_client, job_id, status="dead_letter", attempt=attempt)
+            try:
+                await publish_queue_update(
+                    user_email=payload.get("user_email", ""),
+                    job_id=job_id,
+                    status="failed",
+                    tool_name=payload.get("tool_name", ""),
+                    args=payload.get("args", {}),
+                    session_id=payload.get("session_id"),
+                    error=f"Write did not complete after {MAX_ATTEMPTS} attempts (worker restarted mid-job each time)."
+                )
+            except Exception:
+                pass
+        else:
+            logger.warning(f"Recovering stale job {job_id} (attempt {attempt}/{MAX_ATTEMPTS}) left by a crashed worker.")
+            await redis_client.rpush(QUEUE_KEY, json.dumps(envelope, ensure_ascii=False))
+            await _set_job_state(redis_client, job_id, status="queued", attempt=attempt)
+
+    return recovered
 
 
 async def process_job(job_id: str, payload_dict: dict) -> None:
@@ -260,35 +338,53 @@ async def start_worker():
     """Loops indefinitely, consuming write job entries from Redis list queue."""
     logger.info(f"Connecting to Redis at {settings.REDIS_URL}...")
     redis_client = aioredis.from_url(settings.REDIS_URL, decode_responses=True)
-    queue_key = "migrationbot:write_queue"
-    
+
+    recovered = await recover_stale_jobs(redis_client)
+    if recovered:
+        logger.warning(f"Recovered {recovered} job(s) left behind by a previous worker crash.")
+
     logger.info("Worker is running and listening for queue updates...")
-    
+
     try:
         while True:
-            # BLPOP blocks asynchronously until a job is pushed into the queue list
+            # BLMOVE blocks like BLPOP but atomically relocates the job into
+            # PROCESSING_KEY on pickup instead of just removing it — see
+            # recover_stale_jobs()'s docstring for why that matters.
             try:
-                pop_res = await redis_client.blpop(queue_key, timeout=10)
-                if not pop_res:
+                raw_data = await redis_client.blmove(QUEUE_KEY, PROCESSING_KEY, timeout=10, src="LEFT", dest="RIGHT")
+                if raw_data is None:
                     continue
             except (TimeoutError, redis.exceptions.TimeoutError):
                 continue
 
-            _, raw_data = pop_res
+            job_id = None
             try:
                 envelope = json.loads(raw_data)
                 job_id = envelope.get("job_id")
                 payload_dict = envelope.get("payload")
-                
-                # Execute the spreadsheet update
+
+                await _set_job_state(redis_client, job_id, status="processing")
+                # process_job has its own try/except around the actual mutation, so
+                # reaching the line below means a terminal outcome was recorded
+                # (audit row + queue_update), success or a real business failure —
+                # either way the job is done, not crashed.
                 await process_job(job_id, payload_dict)
-                
+                await _set_job_state(redis_client, job_id, status="done")
             except Exception as e:
                 logger.error(f"Error parsing or processing raw queue message: {e}")
-            
+                if job_id:
+                    await _set_job_state(redis_client, job_id, status="error", error=str(e))
+                # Left in PROCESSING_KEY deliberately: this except firing means
+                # something outside process_job's own error handling went wrong
+                # (envelope/payload malformed, or a bug), so we can't be sure what
+                # state the write is in. recover_stale_jobs() retries it (bounded)
+                # on the next worker start rather than silently dropping it here.
+            else:
+                await redis_client.lrem(PROCESSING_KEY, 1, raw_data)
+
             # Enforce 1-second interval rate limiting throttle to protect Google API quotas
             await asyncio.sleep(1.0)
-            
+
     except asyncio.CancelledError:
         logger.info("Worker cancel signal received. Stopping worker loop.")
     finally:

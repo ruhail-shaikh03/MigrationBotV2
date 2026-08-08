@@ -1,8 +1,8 @@
 import logging
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 from datetime import datetime
 from app.sheets.retry import _with_retry
-from app.sheets.meta import get_header_row
+from app.sheets.meta import get_header_row, get_id_row_map
 from app.core.column_mapper import resolve_column
 from app.core.data_quality import DataQualityChecker
 from app.models.audit_log import AuditLog
@@ -23,6 +23,39 @@ def idx_to_col_letter(idx: int) -> str:
         result = chr(idx % 26 + ord("A")) + result
         idx = idx // 26 - 1
     return result
+
+# Sanity ceiling well above any real WRICEF tracker — guards _fetch_all_rows against
+# runaway pagination on a misconfigured schema (e.g. a data_start_row that lands on a
+# row that never actually goes blank). No real deployment should ever hit this.
+_MAX_SCAN_ROWS = 20000
+
+
+async def _fetch_all_rows(
+    service: Any, spreadsheet_id: str, active_tab: str, data_start_row: int, page_size: int = 2000
+) -> Tuple[List[List[str]], bool]:
+    """Reads every data row from data_start_row onward, paging in page_size-row
+    chunks instead of one fixed-size window. Previously search_rows/summarize/
+    run_data_quality_check each did a single `{start}:{start+2000}` fetch, so a
+    tracker larger than that was silently truncated (§16 history) — search_rows
+    reported fewer matches, summarize computed percentages over a partial
+    denominator, and data_quality scored a subset, all with no indication to the
+    caller. Returns (rows, truncated); truncated is only True if _MAX_SCAN_ROWS is
+    hit, which is a safety valve, not the normal path."""
+    all_rows: List[List[str]] = []
+    start = data_start_row
+    while True:
+        result = await _with_retry(lambda s=start: service.spreadsheets().values().get(
+            spreadsheetId=spreadsheet_id,
+            range=f"{active_tab}!{s}:{s + page_size - 1}"
+        ).execute())
+        page = result.get("values", [])
+        all_rows.extend(page)
+
+        if len(all_rows) >= _MAX_SCAN_ROWS:
+            return all_rows[:_MAX_SCAN_ROWS], True
+        if len(page) < page_size:
+            return all_rows, False
+        start += page_size
 
 
 async def find_row_num(
@@ -85,13 +118,21 @@ async def get_bulk_rows_raw(
     service: Any,
     column_map: Optional[dict] = None
 ) -> Dict[str, Dict[str, str]]:
-    """Helper to fetch multiple rows' current values for auditing in bulk updates."""
+    """Helper to fetch multiple rows' current values for auditing in bulk updates.
+    Previously this cost ~3 Sheets calls per target ID (find_row_num's own full
+    ID-column scan, the row fetch, and a header re-fetch, all inside get_row_raw) —
+    a 50-row bulk update's audit pre-read alone was ~150 calls. Now: one ID-column
+    scan, one header fetch, and one batchGet covering every resolved row, regardless
+    of how many targets there are."""
     tab_schema = _get_tab_schema(schema_config, active_tab)
     # Resolve the same column map the write path uses (see write.py:bulk_update), so a
     # filter_by targeting a natural-language field name resolves to the identical rows.
     column_map = column_map or tab_schema.get("column_map") or schema_config.get("column_map") or {}
 
     schema_config = tab_schema
+    data_start_row = schema_config.get("data_start_row", 3)
+    header_row_num = data_start_row - 1
+    primary_id_pos = schema_config.get("primary_id_position", "B")
     primary_id_col = schema_config.get("primary_id_column", "RICEFW ID")
 
     target_ids = args.get("ricefw_ids") or []
@@ -111,12 +152,35 @@ async def get_bulk_rows_raw(
         )
         target_ids = [str(r.get(primary_id_col)) for r in search_res.get("rows", [])]
 
-    # Pre-read the current cell values
-    results = {}
+    if not target_ids:
+        return {}
+
+    headers = await get_header_row(service, spreadsheet_id, active_tab, header_row_num)
+    id_row_map = await get_id_row_map(service, spreadsheet_id, active_tab, data_start_row, primary_id_pos)
+
+    resolved: Dict[str, int] = {}
     for rid in target_ids:
-        val = await get_row_raw(spreadsheet_id, active_tab, rid, [set_field], schema_config, service)
-        if val:
-            results[rid] = val
+        row_num = id_row_map.get(rid.strip().upper())
+        if row_num is not None:
+            resolved[rid] = row_num
+
+    if not resolved:
+        return {}
+
+    ranges = [f"{active_tab}!{row_num}:{row_num}" for row_num in resolved.values()]
+    batch_result = await _with_retry(lambda: service.spreadsheets().values().batchGet(
+        spreadsheetId=spreadsheet_id,
+        ranges=ranges
+    ).execute())
+    value_ranges = batch_result.get("valueRanges", [])
+
+    results: Dict[str, Dict[str, str]] = {}
+    for rid, value_range in zip(resolved.keys(), value_ranges):
+        values = value_range.get("values", [[]])
+        row_values = values[0] if values else []
+        row_data = {h: (row_values[i] if i < len(row_values) else "") for i, h in enumerate(headers)}
+        results[rid] = {set_field: str(row_data.get(set_field, ""))}
+
     return results
 
 
@@ -194,13 +258,7 @@ async def search_rows(
             "match_type": f.get("match_type", "exact")
         })
 
-    # Read up to 2000 rows in one bulk get
-    result = await _with_retry(lambda: service.spreadsheets().values().get(
-        spreadsheetId=spreadsheet_id,
-        range=f"{active_tab}!{data_start_row}:{data_start_row + 2000}"
-    ).execute())
-    
-    all_rows = result.get("values", [])
+    all_rows, truncated = await _fetch_all_rows(service, spreadsheet_id, active_tab, data_start_row)
     matches = []
 
     for row in all_rows:
@@ -240,7 +298,8 @@ async def search_rows(
         "ok": True,
         "count": len(matches),
         "rows": matches,
-        "capped": len(matches) == limit
+        "capped": len(matches) == limit,
+        "truncated": truncated
     }
 
 
@@ -266,11 +325,7 @@ async def summarize(
     def _col(name: str):
         return col_idx.get(name.lower().strip()) if name else None
 
-    result = await _with_retry(lambda: service.spreadsheets().values().get(
-        spreadsheetId=spreadsheet_id,
-        range=f"{active_tab}!{data_start_row}:{data_start_row + 2000}"
-    ).execute())
-    all_rows = result.get("values", [])
+    all_rows, truncated = await _fetch_all_rows(service, spreadsheet_id, active_tab, data_start_row)
 
     # Filter by module if scope_module is supplied
     scope_module = args.get("scope_module")
@@ -306,6 +361,7 @@ async def summarize(
             "field": canonical,
             "scope": scope_module or "all modules",
             "total_rows": total,
+            "truncated": truncated,
             "breakdown": [{"value": v, "count": c} for v, c in sorted_counts]
         }
 
@@ -329,6 +385,7 @@ async def summarize(
             "target_value": comp_val,
             "scope": scope_module or "all modules",
             "total_rows": total,
+            "truncated": truncated,
             "completed": done,
             "not_completed": total - done,
             "blank": blank,
@@ -354,6 +411,7 @@ async def summarize(
             "field": canonical,
             "scope": scope_module or "all modules",
             "total_rows": total,
+            "truncated": truncated,
             "blank_count": len(blanks),
             "blank_pct": round(len(blanks) / total * 100, 1) if total else 0,
             "ids": blanks[:50]
@@ -411,6 +469,7 @@ async def summarize(
             "report": "overdue",
             "scope": scope_module or "all modules",
             "total_rows": total,
+            "truncated": truncated,
             "overdue_count": len(overdue),
             "items": overdue[:30]
         }
@@ -433,12 +492,7 @@ async def run_data_quality_check(
 
     headers = await get_header_row(service, spreadsheet_id, active_tab, header_row_num)
 
-    result = await _with_retry(lambda: service.spreadsheets().values().get(
-        spreadsheetId=spreadsheet_id,
-        range=f"{active_tab}!{data_start_row}:{data_start_row + 2000}"
-    ).execute())
-
-    rows = result.get("values", [])
+    rows, truncated = await _fetch_all_rows(service, spreadsheet_id, active_tab, data_start_row)
 
     # Optional module scoping, same normalized-lookup pattern as summarize()
     scope_module = args.get("scope_module")
@@ -458,7 +512,12 @@ async def run_data_quality_check(
     if check_type not in valid_check_types:
         return {"ok": False, "error": f"Unknown check_type: {check_type}"}
 
-    report: Dict[str, Any] = {"ok": True, "check_type": check_type, "scope": scope_module or "all modules"}
+    report: Dict[str, Any] = {
+        "ok": True,
+        "check_type": check_type,
+        "scope": scope_module or "all modules",
+        "truncated": truncated
+    }
 
     if check_type in ("blank_fields", "all"):
         fields = args.get("fields") or schema_config.get("critical_fields") or [
