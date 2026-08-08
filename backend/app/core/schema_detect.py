@@ -3,6 +3,7 @@ import logging
 import re
 from typing import List, Dict, Any, Optional
 from openai import AsyncOpenAI
+from app.core.column_mapper import build_column_map
 
 logger = logging.getLogger("schema_detect")
 
@@ -62,6 +63,16 @@ async def detect_all_tabs(
             header_row_idx = tab_schema.get("header_row_index", 0)
             # data_start_row is 1-based index of row right after header row
             tab_schema["data_start_row"] = header_row_idx + 2
+
+            # Generate this tab's own alias map from its real headers, rather than
+            # leaving every deployment on the static COLUMN_ALIASES fallback (hardcoded
+            # to one customer's sheet — TDD §7.3, and the root of the §16.2 whitespace
+            # bug class). build_column_map falls back to COLUMN_ALIASES itself on any
+            # LLM failure, so this can't make detection worse than before.
+            if header_row_idx < len(rows):
+                header_row = [str(c).strip() for c in rows[header_row_idx]]
+                tab_schema["column_map"] = await build_column_map(header_row, client)
+
             consolidated_config[tab] = tab_schema
             if tab not in valid_modules:
                 valid_modules.append(tab)

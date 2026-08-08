@@ -23,11 +23,16 @@ async def lifespan(app: FastAPI):
     logger.info("Initializing database schemas on startup...")
     try:
         await init_db()
+        app.state.db_initialized = True
         logger.info("Database schemas initialized successfully.")
     except Exception as e:
+        app.state.db_initialized = False
         logger.error(f"Failed to auto-create database tables on boot: {e}")
-        # Non-fatal error during startup; let execution continue so tests/devs can debug
-    
+        # Non-fatal error during startup; let execution continue so tests/devs can
+        # debug — but /api/ready (health.py:readiness_check) reports this as unready,
+        # since a live SELECT 1 alone can't tell "Postgres is down" apart from
+        # "Postgres is up with no tables" (TDD §16.23).
+
     yield
     logger.info("Shutting down MigrationBot API backend server.")
 
@@ -39,6 +44,7 @@ app = FastAPI(
     version="1.0.0",
     lifespan=lifespan
 )
+app.state.db_initialized = False
 
 # Configure CORS Middleware
 origins = [origin.strip() for origin in settings.CORS_ORIGINS.split(",") if origin.strip()]

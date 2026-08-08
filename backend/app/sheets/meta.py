@@ -7,30 +7,6 @@ from app.sheets.retry import _with_retry
 
 logger = logging.getLogger("sheets_meta")
 
-async def _detect_header_row(service: Any, spreadsheet_id: str, sheet_name: str) -> int:
-    """
-    Scan the first 5 rows of the active tab to detect the header row.
-    Looks for canonical markers like 'RICEFW ID', 'Module', 'Description', 'Type'.
-    Requires >= 2 matches. Returns the 1-indexed row number.
-    """
-    try:
-        result = await _with_retry(lambda: service.spreadsheets().values().get(
-            spreadsheetId=spreadsheet_id,
-            range=f"{sheet_name}!A1:Z5"
-        ).execute())
-        rows = result.get("values", [])
-        canonical_markers = {"ricefw id", "module", "description", "type"}
-        
-        for i, row in enumerate(rows):
-            normalized_row = {str(cell).strip().lower() for cell in row if cell}
-            if len(canonical_markers.intersection(normalized_row)) >= 2:
-                return i + 1  # 1-indexed row number
-        return 1
-    except Exception as e:
-        logger.warning(f"Failed to detect header row: {e}. Defaulting to row 1.")
-        return 1
-
-
 async def get_sheet_id(service: Any, spreadsheet_id: str, sheet_name: str) -> int:
     """Get the internal sheetId integer for formatting operations."""
     meta = await _with_retry(lambda: service.spreadsheets().get(

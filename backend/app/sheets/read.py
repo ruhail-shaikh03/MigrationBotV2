@@ -5,16 +5,12 @@ from app.sheets.retry import _with_retry
 from app.sheets.meta import get_header_row, get_id_row_map
 from app.core.column_mapper import resolve_column
 from app.core.data_quality import DataQualityChecker
+from app.core.schema import get_tab_schema
 from app.models.audit_log import AuditLog
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 logger = logging.getLogger("sheets_read")
-
-def _get_tab_schema(schema_config: dict, active_tab: str) -> dict:
-    if "tabs" in schema_config:
-        return schema_config.get("tabs", {}).get(active_tab, {})
-    return schema_config
 
 def idx_to_col_letter(idx: int) -> str:
     """Helper to convert a 0-based column index to an A-Z sheet column letter."""
@@ -89,7 +85,7 @@ async def get_row_raw(
     service: Any
 ) -> Dict[str, str]:
     """Helper to fetch a single row's current values for auditing."""
-    schema_config = _get_tab_schema(schema_config, active_tab)
+    schema_config = get_tab_schema(schema_config, active_tab)
     data_start_row = schema_config.get("data_start_row", 3)
     header_row_num = data_start_row - 1
     primary_id_pos = schema_config.get("primary_id_position", "B")
@@ -124,7 +120,7 @@ async def get_bulk_rows_raw(
     a 50-row bulk update's audit pre-read alone was ~150 calls. Now: one ID-column
     scan, one header fetch, and one batchGet covering every resolved row, regardless
     of how many targets there are."""
-    tab_schema = _get_tab_schema(schema_config, active_tab)
+    tab_schema = get_tab_schema(schema_config, active_tab)
     # Resolve the same column map the write path uses (see write.py:bulk_update), so a
     # filter_by targeting a natural-language field name resolves to the identical rows.
     column_map = column_map or tab_schema.get("column_map") or schema_config.get("column_map") or {}
@@ -193,7 +189,7 @@ async def get_row(
     service: Any
 ) -> dict:
     """Fetch all values mapped to headers for a single RICEFW object ID."""
-    schema_config = _get_tab_schema(schema_config, active_tab)
+    schema_config = get_tab_schema(schema_config, active_tab)
     data_start_row = schema_config.get("data_start_row", 3)
     header_row_num = data_start_row - 1
     primary_id_pos = schema_config.get("primary_id_position", "B")
@@ -225,7 +221,7 @@ async def search_rows(
     service: Any
 ) -> dict:
     """Scans the spreadsheet and filters rows based on a set of criteria (AND matching)."""
-    schema_config = _get_tab_schema(schema_config, active_tab)
+    schema_config = get_tab_schema(schema_config, active_tab)
     data_start_row = schema_config.get("data_start_row", 3)
     header_row_num = data_start_row - 1
     headers = await get_header_row(service, spreadsheet_id, active_tab, header_row_num)
@@ -312,7 +308,7 @@ async def summarize(
     service: Any
 ) -> dict:
     """Calculates report figures, counts, and completion metrics across a sheet."""
-    schema_config = _get_tab_schema(schema_config, active_tab)
+    schema_config = get_tab_schema(schema_config, active_tab)
     report_type = args.get("report_type")
     data_start_row = schema_config.get("data_start_row", 3)
     header_row_num = data_start_row - 1
@@ -486,7 +482,7 @@ async def run_data_quality_check(
     service: Any
 ) -> dict:
     """Executes the DataQualityChecker rules engine against spreadsheet data."""
-    schema_config = _get_tab_schema(schema_config, active_tab)
+    schema_config = get_tab_schema(schema_config, active_tab)
     data_start_row = schema_config.get("data_start_row", 3)
     header_row_num = data_start_row - 1
 

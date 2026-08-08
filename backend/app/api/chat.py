@@ -16,6 +16,7 @@ from app.models.session import Session as UserSession
 from app.core.permissions import get_user_permissions
 from app.core.agentic_loop import run_agentic_loop
 from app.core.column_mapper import COLUMN_ALIASES
+from app.core.schema import get_tab_schema
 from app.queue.events import queue_events_channel
 from app.sheets.client import build_sheets_service
 from app.sheets.meta import switch_module
@@ -271,7 +272,7 @@ async def websocket_chat_endpoint(
 
                 # Resolve tab-specific schema if using the new multi-tab format
                 proj_schema = current_project.schema_config
-                active_tab_schema = proj_schema.get("tabs", {}).get(current_sess.active_tab, {}) if "tabs" in proj_schema else proj_schema
+                active_tab_schema = get_tab_schema(proj_schema, current_sess.active_tab)
                 
                 # Fetch or map dynamic columns
                 column_map = active_tab_schema.get("column_map") or proj_schema.get("column_map") or COLUMN_ALIASES

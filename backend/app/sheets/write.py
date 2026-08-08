@@ -4,6 +4,7 @@ from app.sheets.retry import _with_retry
 from app.sheets.meta import get_header_row, get_id_row_map
 from app.sheets.read import find_row_num, idx_to_col_letter, search_rows
 from app.core.column_mapper import resolve_column
+from app.core.schema import get_tab_schema
 
 logger = logging.getLogger("sheets_write")
 
@@ -20,7 +21,7 @@ async def update_cell(
     Groups updates into a single batchUpdate operation to minimize API latency and quota consumption.
     """
     # Resolve tab-specific schema if using the new multi-tab format
-    tab_schema = schema_config.get("tabs", {}).get(sheet_tab, {}) if "tabs" in schema_config else schema_config
+    tab_schema = get_tab_schema(schema_config, sheet_tab)
     data_start_row = tab_schema.get("data_start_row", 3)
     header_row_num = data_start_row - 1
     primary_id_pos = tab_schema.get("primary_id_position", "B")
@@ -79,7 +80,7 @@ async def bulk_update(
     Targets items either by direct list of IDs or via filtering matching rows.
     """
     # Resolve tab-specific schema if using the new multi-tab format
-    tab_schema = schema_config.get("tabs", {}).get(sheet_tab, {}) if "tabs" in schema_config else schema_config
+    tab_schema = get_tab_schema(schema_config, sheet_tab)
     data_start_row = tab_schema.get("data_start_row", 3)
     header_row_num = data_start_row - 1
     primary_id_pos = tab_schema.get("primary_id_position", "B")
@@ -193,7 +194,7 @@ async def add_row(
     """Appends a new WRICEF tracker object to the sheet under the correct columns."""
     raw_schema = schema_config or {}
     # Resolve tab-specific schema if using the new multi-tab format
-    schema = raw_schema.get("tabs", {}).get(sheet_tab, {}) if "tabs" in raw_schema else raw_schema
+    schema = get_tab_schema(raw_schema, sheet_tab)
     data_start_row = schema.get("data_start_row", 3)
     header_row_num = data_start_row - 1
 
