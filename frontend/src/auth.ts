@@ -1,5 +1,6 @@
 import NextAuth from "next-auth"
 import Google from "next-auth/providers/google"
+import type { JWT } from "next-auth/jwt"
 import { SignJWT } from "jose"
 
 /**
@@ -63,6 +64,63 @@ async function refreshGoogleAccessToken(token: any) {
   }
 }
 
+const API_TOKEN_TTL_SECONDS = 24 * 60 * 60
+// Re-mint an hour before expiry so a client holding the previous value always has a
+// usable token, rather than one that dies between two session fetches.
+const API_TOKEN_RENEW_BEFORE_MS = 60 * 60 * 1000
+
+/**
+ * Mint the backend JWT, or reuse the cached one, and cache it on the NextAuth token.
+ *
+ * This used to be minted inline in the `session` callback on *every* invocation, with
+ * `exp` computed from `Date.now()` — so each call produced a different `exp`, hence a
+ * different signature, hence a different string. `session.apiToken` therefore changed
+ * identity on every session fetch, and SessionProvider refetches on window focus. On
+ * the client that value is a dependency of the chat WebSocket (useWebSocket), so simply
+ * alt-tabbing back to the tab tore down and rebuilt the connection — and since
+ * `message_history` lives per-connection in chat.py:websocket_chat_endpoint, it silently
+ * discarded the conversation context.
+ *
+ * Caching has to happen here in the `jwt` callback rather than in `session`: only the
+ * value returned from `jwt` is re-encoded into the session cookie, so a field set in
+ * `session` would not survive to the next request.
+ */
+async function withApiToken(token: JWT): Promise<JWT> {
+  const cachedExpires = (token.apiTokenExpires as number) || 0
+  const stillFresh = Date.now() < cachedExpires - API_TOKEN_RENEW_BEFORE_MS
+  // googleAccessTokenExpires is rewritten every time refreshGoogleAccessToken() succeeds,
+  // so it doubles as a compact generation marker for "the embedded Google token changed".
+  // Comparing that number avoids stashing a third copy of the access token in the cookie.
+  const embedsCurrentGoogleToken = token.apiTokenIssuedFor === token.googleAccessTokenExpires
+
+  if (token.apiToken && stillFresh && embedsCurrentGoogleToken) {
+    return token
+  }
+
+  const expSeconds = Math.floor(Date.now() / 1000) + API_TOKEN_TTL_SECONDS
+  const secretKey = new TextEncoder().encode(getJwtSecret())
+
+  token.apiToken = await new SignJWT({
+    email: token.email,
+    name: token.name,
+    picture: token.picture,
+    sub: token.sub,
+    google_access_token: token.googleAccessToken,
+    // Lets WS-path Sheets clients self-refresh instead of dying ~1h into a
+    // long-lived socket when this JWT (valid 24h) outlives the Google token it
+    // carries. Only the admin REST path had this before, via a separate header.
+    google_refresh_token: token.googleRefreshToken,
+    exp: expSeconds
+  })
+    .setProtectedHeader({ alg: "HS256" })
+    .sign(secretKey)
+
+  token.apiTokenExpires = expSeconds * 1000
+  token.apiTokenIssuedFor = token.googleAccessTokenExpires
+
+  return token
+}
+
 export const { handlers, signIn, signOut, auth } = NextAuth({
   providers: [
     Google({
@@ -88,20 +146,23 @@ export const { handlers, signIn, signOut, auth } = NextAuth({
         if (account.refresh_token) {
           token.googleRefreshToken = account.refresh_token
         }
-        return token
+        return await withApiToken(token)
       }
 
       // Subsequent calls: check if access token is still valid
       // Refresh 5 minutes before actual expiry to avoid edge-case failures
       const expiresAt = (token.googleAccessTokenExpires as number) || 0
       if (Date.now() < expiresAt - 5 * 60 * 1000) {
-        // Token is still fresh
-        return token
+        // Token is still fresh — withApiToken reuses the cached backend JWT here, which
+        // is what keeps session.apiToken byte-identical across session fetches.
+        return await withApiToken(token)
       }
 
-      // Token has expired (or is about to) — refresh it
+      // Token has expired (or is about to) — refresh it. The refreshed token carries a
+      // new googleAccessTokenExpires, so withApiToken re-mints to embed the new Google
+      // access token rather than handing the backend a dead one.
       if (token.googleRefreshToken) {
-        return await refreshGoogleAccessToken(token)
+        return await withApiToken(await refreshGoogleAccessToken(token))
       }
 
       // No refresh token available — can't recover
@@ -113,25 +174,11 @@ export const { handlers, signIn, signOut, auth } = NextAuth({
         session.googleRefreshToken = token.googleRefreshToken
         session.user.id = token.sub
         session.error = token.error // Surface token errors to the client
-        
-        // Generate standard signed HS256 JWT for our FastAPI backend
-        const secretKey = new TextEncoder().encode(getJwtSecret())
-        const payload = {
-          email: token.email,
-          name: token.name,
-          picture: token.picture,
-          sub: token.sub,
-          google_access_token: token.googleAccessToken,
-          // Lets WS-path Sheets clients self-refresh instead of dying ~1h into a
-          // long-lived socket when this JWT (valid 24h) outlives the Google token it
-          // carries. Only the admin REST path had this before, via a separate header.
-          google_refresh_token: token.googleRefreshToken,
-          exp: Math.floor(Date.now() / 1000) + 24 * 60 * 60 // 1 day
-        }
-        
-        session.apiToken = await new SignJWT(payload)
-          .setProtectedHeader({ alg: "HS256" })
-          .sign(secretKey)
+
+        // Hand back the JWT minted and cached by withApiToken() in the `jwt` callback.
+        // Deliberately not minted here: this callback runs on every session fetch, so
+        // signing per call is what made the value change identity each time.
+        session.apiToken = token.apiToken
       }
       return session
     }

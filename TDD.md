@@ -177,14 +177,29 @@ now a startup error instead of a runtime surprise (§16 history).
    token (`auth.ts:callbacks.jwt`). Later calls treat the token as fresh while
    `Date.now() < expiresAt - 5*60*1000`; otherwise `refreshGoogleAccessToken()` performs a refresh
    grant, preserving the existing refresh token when Google returns none.
-3. **Backend token** — the `session` callback signs a fresh HS256 JWT on every session read
-   (`auth.ts:callbacks.session`) carrying `email`, `name`, `picture`, `sub`,
-   `google_access_token`, and `exp` = now + 24 h, exposed as `session.apiToken`.
+3. **Backend token** — `withApiToken()` (`auth.ts:withApiToken`) mints an HS256 JWT carrying
+   `email`, `name`, `picture`, `sub`, `google_access_token`, `google_refresh_token`, and
+   `exp` = now + 24 h, and caches it on the NextAuth token; the `session` callback
+   (`auth.ts:callbacks.session`) exposes that cached value as `session.apiToken`.
 
-The backend JWT has a 24-hour `exp` (`auth.ts:callbacks.session`) but embeds a Google access token
+Minting lives in the `jwt` callback rather than `session` deliberately. `session` runs on **every**
+session read and `exp` was computed from `Date.now()`, so each read produced a different `exp` → a
+different signature → a different string. `SessionProvider` refetches on window focus and
+`session.apiToken` feeds the chat socket (`useWebSocket.ts:useWebSocket`), so alt-tabbing back into
+the tab rebuilt the connection and silently discarded the per-connection `message_history` (§4.3).
+The cache has to sit on the `jwt` callback's return value because only that is re-encoded into the
+session cookie — a field set in `session` would not survive to the next request. `withApiToken`
+re-mints only when there is no cached token, when it is within an hour of its 24 h expiry, or when
+the embedded Google access token has rotated (detected by comparing `apiTokenIssuedFor` against
+`googleAccessTokenExpires`, which `refreshGoogleAccessToken()` rewrites on every success — using
+that number as a generation marker avoids stashing a third copy of the access token in the cookie).
+A Google rotation therefore still costs one reconnect, roughly hourly, since the backend should
+receive a live access token; that replaces a reconnect on every window focus.
+
+The backend JWT has a 24-hour `exp` (`auth.ts:withApiToken`) but embeds a Google access token
 that lives about an hour. The WebSocket extracts both tokens once at connect time
 (`chat.py:authenticate_ws_user`) and holds them for the connection's life — but as of Phase 4,
-`auth.ts:callbacks.session` signs `google_refresh_token` into the payload alongside
+`auth.ts:withApiToken` signs `google_refresh_token` into the payload alongside
 `google_access_token`, threaded through `chat.py:websocket_chat_endpoint` →
 `agentic_loop.py:run_agentic_loop` → `tool_dispatch.py:dispatch_tool` →
 `sheets/client.py:build_sheets_service`, and into `queue/schemas.py:WriteJobPayload` for queued
@@ -205,10 +220,22 @@ As of Phase 4, that fallback (`deps.py:get_current_user`, mirrored at
 (`config.py:Settings`, default `False`) — previously it was reachable in any deployment, so any
 string containing `@` that failed signature verification was accepted as that identity, including
 the admin address (`admin.py:require_admin` decides admin status purely by email membership).
-`JWT_SECRET` is now required with no default on both sides (`config.py:Settings`; `auth.ts`, the
-`JWT_SECRET` constant, throws if unset) — previously both fell back to the same publicly-known
-string independently, so a deployment that forgot to set it on either side still verified tokens
-correctly using the shared default.
+`JWT_SECRET` is now required with no default on both sides (`config.py:Settings`;
+`auth.ts:getJwtSecret`, which throws if unset) — previously both fell back to the same
+publicly-known string independently, so a deployment that forgot to set it on either side still
+verified tokens correctly using the shared default.
+
+That check is deliberately **lazy** — evaluated inside `getJwtSecret()` at request time, not at
+module scope. `next build` imports every route handler during "Collecting page data" to assemble
+the route manifest, and `app/api/auth/[...nextauth]/route.ts` re-exports `handlers` from `auth.ts`,
+so a module-scope `throw` failed the Docker builder stage, which has no env vars set. CI stayed
+green throughout because `frontend-build` supplies a dummy `JWT_SECRET` (§15.2), which is why this
+only ever surfaced at image build. Note that the `secret:` option in the NextAuth config reads
+`process.env` directly instead of going through `getJwtSecret()`: that object literal is evaluated
+at module scope, so routing it through the validating getter would reintroduce the exact build-time
+throw. Passing `undefined` is safe — `setEnvDefaults()` only assigns defaults at import, while the
+`MissingSecret` check runs per request inside `Auth()`, so a genuinely unset secret in production
+still fails, at the first auth request rather than at import.
 
 ### 4.3 WebSocket authentication and project resolution
 
@@ -531,6 +558,21 @@ indefinitely. `connect` tracks the live socket in a ref (`wsRef`, `useWebSocket.
 the Zustand `ws` state, so a reconnect always closes the actual current socket regardless of which
 render's closure is running (§14).
 
+Every deliberate close goes through `useWebSocket.ts:teardownSocket`, which nulls all four handlers
+*before* calling `close(1000, …)`. Without that, replacing a socket left the old one's `onclose`
+attached, and a bare `close()` reports `1005` ("no status received") — which passes the retry guard
+above. The socket closed on purpose therefore scheduled a reconnect 3 s later, which closed the
+healthy socket that had just replaced it, which scheduled another: a self-sustaining flap with a
+period of exactly 3000 ms. It began on **every** page load, production included, because
+`useWebSocket` is called with `activeProject?.id || null` (`chat/page.tsx`), so `projectId` flips
+`null` → id once the projects fetch resolves and the effect re-runs. Each cycle cleared
+`isConnected` — which disables the composer — and reset the per-connection `message_history` (§4.3),
+so the assistant silently lost conversation context every 3 seconds. `onopen`/`onclose` additionally
+guard on `wsRef.current !== socket`, since `onclose` fires asynchronously and could otherwise land
+after the replacement's `onopen` and stomp `isConnected` back to false over a live socket. The
+effect cleanup tears the socket down as well; it previously cleared only the timers, leaking a live
+connection when navigating away from `/chat`.
+
 ---
 
 ## 10. REST Surface
@@ -706,7 +748,10 @@ before the switch is known to have succeeded.
 `connect` tracks the live socket in a ref (`wsRef`, `useWebSocket.ts:useWebSocket`) rather than
 reading the Zustand `ws` state through its own closure, so a reconnect from `onclose`'s
 `setTimeout` or an effect re-run always closes the actual current socket — not a value captured at
-whatever render created that particular `connect` closure.
+whatever render created that particular `connect` closure. Replacement and unmount both route
+through `useWebSocket.ts:teardownSocket`, which detaches handlers before closing so an intentional
+close can never schedule a reconnect (§9.3). `setWs` is called from `onopen` rather than at
+construction, so the store never advertises a socket still in `CONNECTING`.
 
 ---
 
@@ -741,6 +786,15 @@ unrelated to any given change — then `pytest -v` from `backend/` with coverage
 `npm run lint` — advisory only, `continue-on-error: true`, since the frontend carries ~49
 pre-existing lint errors of its own — then `npm run build`). No coverage floor is enforced yet;
 the first run's own numbers are the honest baseline to ratchet from.
+
+`frontend/Dockerfile`'s builder stage sets `ARG JWT_SECRET=build-placeholder` / `ENV
+JWT_SECRET=$JWT_SECRET` as defence in depth against a future module-scope env read anywhere in a
+route's import chain (§4.2) — it is not what fixes the lazy-validation case, which the `auth.ts`
+change already covers on its own. Builder stage only: the runtime secret is injected into the
+runner by `docker-compose.yml`'s `frontend` service `environment:`, and the placeholder was verified
+not to be inlined into the server bundle (Next.js statically replaces only `NEXT_PUBLIC_*`, so
+`process.env.JWT_SECRET` survives as a runtime lookup and the injected value wins). A real secret
+must never be passed via `ARG` — build args are recorded in the image history.
 
 `deploy.yml` no longer triggers on push directly — it's a `workflow_run` gated on `ci.yml`
 ("CI Pipeline") completing with `conclusion == 'success'` on `main`, so a push straight to main
@@ -811,7 +865,7 @@ the queue only an opaque reference) remains the real fix, not attempted here.
 | `REDIS_URL` | `producer.py:enqueue_write_job`, `events.py:publish_queue_update`, `worker.py:start_worker`, `chat.py:forward_queue_updates` | `redis://localhost:6379` (`config.py:Settings`) |
 | `DEEPSEEK_API_KEY` | `chat.py:llm_client` | `"mock-deepseek-key"` (`config.py:Settings`) |
 | `GOOGLE_CLIENT_ID` / `_SECRET` | `sheets/client.py:build_sheets_service`, `auth.ts` (`GoogleProvider` config) | mock values (`config.py:Settings`) |
-| **`JWT_SECRET`** | `deps.py:get_current_user`, `chat.py:authenticate_ws_user`, `auth.ts` (the `JWT_SECRET` constant) | **required — no default on either side** (`config.py:Settings`; `auth.ts` throws if unset) |
+| **`JWT_SECRET`** | `deps.py:get_current_user`, `chat.py:authenticate_ws_user`, `auth.ts:getJwtSecret` (and the `secret:` option, read from `process.env` directly — §4.2) | **required — no default on either side** (`config.py:Settings`; `auth.ts:getJwtSecret` throws if unset, at request time) |
 | `ALLOW_DEV_AUTH` | `deps.py:get_current_user`, `chat.py:authenticate_ws_user` | `false` (`config.py:Settings`) — only set true for local dev/tests |
 | `DEFAULT_ROLE` | `permissions.py:get_user_permissions` | `"viewer"` (`config.py:Settings`) — fail-closed default when no permissions row applies |
 | **`CORS_ORIGINS`** | `main.py` (`CORSMiddleware` registration) | **required — no default** (`config.py:Settings`) |
