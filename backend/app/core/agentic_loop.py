@@ -6,7 +6,7 @@ from app.core.llm_router import select_model
 from app.core.tool_schemas import TOOLS, get_system_prompt, get_system_prompt_compact
 from app.core.permissions import PermissionChecker
 from app.core.tool_dispatch import dispatch_tool
-from app.core.schema import get_valid_modules
+from app.core.schema import get_available_tabs
 from app.core.column_mapper import get_column_map_json
 
 logger = logging.getLogger("agentic_loop")
@@ -32,11 +32,11 @@ async def run_agentic_loop(
     Executes the multi-turn agentic loop. Receives user queries, interacts with DeepSeek,
     enforces RBAC permissions, routes tool requests to the dispatcher, and streams replies.
     """
-    valid_modules = get_valid_modules(schema_config)
+    available_tabs = get_available_tabs(schema_config)
     column_map_json = get_column_map_json(column_map)
-    
+
     # Generate initial full system prompt
-    system_prompt = get_system_prompt(valid_modules, column_map_json)
+    system_prompt = get_system_prompt(available_tabs, column_map_json)
     
     # Reconstruct messages context for the LLM
     messages = [{"role": "system", "content": system_prompt}] + message_history + [{"role": "user", "content": user_message}]
@@ -44,7 +44,7 @@ async def run_agentic_loop(
     for iteration in range(max_iterations):
         # Swap compact system prompt for iterations > 0 to save tokens
         if iteration > 0:
-            messages[0] = {"role": "system", "content": get_system_prompt_compact(valid_modules)}
+            messages[0] = {"role": "system", "content": get_system_prompt_compact(available_tabs)}
             
         model = select_model(iteration, messages)
         logger.info(f"Iteration {iteration}: Routing to model {model}")

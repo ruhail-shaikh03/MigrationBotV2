@@ -6,7 +6,11 @@ from openai import AsyncOpenAI
 
 logger = logging.getLogger("column_mapper")
 
-# Static aliases fallback map
+# Legacy last-resort alias map, modelled on one specific customer's WRICEF tracker —
+# including its real typos and trailing spaces. It is NOT a general default: on any other
+# sheet these headers do not exist. Only used when nothing whatsoever is known about a
+# sheet's columns (no stored column_map and no header row to read). Whenever real headers
+# are available, prefer build_column_map(), which falls back to _identity_map() over these.
 COLUMN_ALIASES: Dict[str, List[str]] = {
     # --- Core Object Details ---
     "Module":                        ["module", "sap module", "functional area"],
@@ -77,7 +81,7 @@ COLUMN_ALIASES: Dict[str, List[str]] = {
 }
 
 _PASS1_PROMPT = """\
-You are building a natural-language alias map for a Google Sheet used to track SAP S/4HANA migration objects (a WRICEF tracker).
+You are building a natural-language alias map for a Google Sheet used to track work items. The sheet could be anything a team tracks — a software migration backlog, a project plan, an issue log, a hiring pipeline. Infer the domain from the headers themselves; do not assume one.
 
 Below is the EXACT list of column headers from the sheet as a JSON array. Each header is reproduced verbatim — including any trailing spaces or typos — because the exact string is used for API calls.
 
@@ -86,19 +90,19 @@ Headers:
 
 Return a JSON object where:
 - Each KEY is one of the exact header strings from the list above (copy verbatim)
-- Each VALUE is an array of 3-6 lowercase strings a business user might say to refer to that column in plain English or SAP terminology
+- Each VALUE is an array of 3-6 lowercase strings a business user might say to refer to that column in plain English
 
 Rules:
 - Do NOT add keys that are not in the headers list above
 - Do NOT modify or trim the key strings in any way
 - Do NOT wrap the response in markdown code blocks
-- Focus on SAP/migration domain terms where relevant (e.g. BADI, enhancement exit, Z-table, tcode, RICEF, transport request)
+- Use the vocabulary the headers themselves imply. If they are domain-specific, include that domain's terms; if they are plain business English, keep the aliases plain. Do not import jargon from an unrelated domain.
 - For headers with typos (e.g. "Functinal Resource ") still produce meaningful aliases — the typo is intentional to match the sheet
 - Return ONLY valid JSON, nothing else\
 """
 
 _PASS2_PROMPT = """\
-Review this column alias map for a WRICEF migration tracker Google Sheet.
+Review this column alias map for a work-tracking Google Sheet.
 
 Original headers (exact, including spaces and typos):
 {headers_json}
@@ -109,7 +113,7 @@ Generated alias map:
 Check for ALL of the following:
 1. Headers from the original list that have no entry in the map — add them
 2. Aliases that are so generic they could match multiple columns (e.g. "type" appearing for both "Type" and "Enhancement Type") — make them more specific for the ambiguous column
-3. Obvious missing SAP terms (e.g. "badi", "user exit", "tcode", "z table", "abaper", "transport", "golive")
+3. Aliases borrowed from a domain this sheet is not about — remove them, and add the terms a user of THIS sheet would actually say
 
 Return a corrected JSON object with the same key/value structure.
 If nothing needs changing, return the original map unchanged.
@@ -150,12 +154,26 @@ def get_column_map_json(column_map: Optional[dict] = None) -> str:
     return json.dumps(active_map, ensure_ascii=False)
 
 
+def _identity_map(header_row: List[str]) -> dict:
+    """Map every real header to itself, lowercased, as its only alias.
+
+    The honest fallback when alias generation fails but we do know the sheet's headers.
+    resolve_column() still works through its exact and fuzzy passes, just without
+    natural-language synonyms. Previously these paths returned COLUMN_ALIASES — one
+    customer's WRICEF headers — which on any other sheet resolves user terms to columns
+    that do not exist there, producing tool calls that fail for reasons no one can see.
+    """
+    return {header: [header.lower().strip()] for header in header_row if str(header).strip()}
+
+
 async def build_column_map(header_row: List[str], client: AsyncOpenAI) -> dict:
     """
     Run the two-pass LLM analysis on a header row and return the alias dictionary.
-    Falls back to COLUMN_ALIASES if any step fails.
+    Falls back to an identity map built from the real headers if any step fails.
     """
     if not header_row:
+        # Nothing at all is known about this sheet — COLUMN_ALIASES is a guess, but it is
+        # the only guess available, and callers treat an empty map as "no map".
         return COLUMN_ALIASES
 
     headers_json = json.dumps(header_row, ensure_ascii=False)
@@ -171,12 +189,12 @@ async def build_column_map(header_row: List[str], client: AsyncOpenAI) -> dict:
         raw1 = r1.choices[0].message.content.strip()
         map1 = _parse_json_safely(raw1)
     except Exception as e:
-        logger.warning(f"Column map generation Pass 1 failed (using static fallback): {e}")
-        return COLUMN_ALIASES
+        logger.warning(f"Column map generation Pass 1 failed (using identity map from real headers): {e}")
+        return _identity_map(header_row)
 
     if not map1:
-        logger.warning("Column map generation returned invalid JSON in Pass 1 — using static fallback.")
-        return COLUMN_ALIASES
+        logger.warning("Column map generation returned invalid JSON in Pass 1 — using identity map from real headers.")
+        return _identity_map(header_row)
 
     # Sanity check: remove any hallucinated keys not in the actual header row
     header_set = set(header_row)

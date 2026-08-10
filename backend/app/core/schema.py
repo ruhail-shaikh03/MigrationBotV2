@@ -15,8 +15,18 @@ def get_tab_schema(schema_config: Dict[str, Any], active_tab: str) -> Dict[str, 
     return schema_config
 
 
-def get_valid_modules(schema_config: Dict[str, Any]) -> List[str]:
-    """Resolve the list of valid module/tab names for system-prompt injection."""
+def get_available_tabs(schema_config: Dict[str, Any]) -> List[str]:
+    """Resolve the tab names this project can switch between, for system-prompt injection.
+
+    Replaces the old get_valid_modules(). The rename is the point: that function returned
+    tab names but was injected into the prompt as "Valid modules: …", which the model then
+    enforced as an allowlist of ID prefixes. On a single-tab sheet it returned nothing, and
+    the prompt substituted a hardcoded SAP list, so an ID like SLCM-0586 was refused on a
+    sheet that had never heard of SAP modules. Tabs are a navigation concept (switch_module);
+    they are not a vocabulary of legal identifiers, and nothing derives one from the other.
+
+    A flat, single-tab config has nowhere to switch to, so it yields an empty list.
+    """
     if "tabs" in schema_config:
-        return schema_config.get("global", {}).get("valid_modules") or list(schema_config.get("tabs", {}).keys())
-    return schema_config.get("valid_modules", [])
+        return list(schema_config.get("tabs", {}).keys())
+    return []

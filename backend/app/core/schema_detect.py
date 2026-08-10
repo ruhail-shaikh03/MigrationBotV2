@@ -35,8 +35,8 @@ async def detect_all_tabs(
         raise ValueError(f"Could not access spreadsheet: {e}")
 
     consolidated_config = {}
-    valid_modules = []
-    
+    detected_tabs = []
+
     for tab in tab_names:
         try:
             # Range: read A1:Z10 (first 10 rows)
@@ -74,8 +74,8 @@ async def detect_all_tabs(
                 tab_schema["column_map"] = await build_column_map(header_row, client)
 
             consolidated_config[tab] = tab_schema
-            if tab not in valid_modules:
-                valid_modules.append(tab)
+            if tab not in detected_tabs:
+                detected_tabs.append(tab)
                 
         except Exception as te:
             logger.warning(f"Error auto-detecting schema for tab '{tab}': {te}")
@@ -84,7 +84,12 @@ async def detect_all_tabs(
     return {
         "tabs": consolidated_config,
         "global": {
-            "valid_modules": valid_modules,
+            # Tab names only. This used to be emitted as "valid_modules", which
+            # schema.py then fed into the prompt as an allowlist of legal ID prefixes —
+            # conflating "tabs you can switch to" with "identifiers that may exist".
+            # Consumers read tab names from `tabs` directly (schema.py:get_available_tabs);
+            # this stays purely informational.
+            "detected_tabs": detected_tabs,
             "company_prefix": ""
         }
     }
@@ -112,28 +117,34 @@ Your goals:
    - "type_column": Header for category/type (e.g., Type, RICEFW Type, Object Type, Category). Set to null if missing.
    - "date_columns": Object mapping "go_live", "signoff", "start", "completion" to their respective headers, or null if missing.
 
-Return ONLY a valid JSON object matching this exact structure:
+Every value below must be copied verbatim from THIS tab's header row, preserving exact
+spelling, casing and any trailing spaces. Never substitute a conventional name for what the
+sheet actually says. Do NOT emit lists of permitted identifiers, module codes or type codes:
+the sheet's data defines its own vocabulary, and an invented allowlist is later enforced as a
+constraint that rejects legitimate rows.
+
+The structure below is an illustrative shape only — its values come from an unrelated sheet
+and must not be copied:
 {{
   "is_tracker_sheet": true,
   "header_row_index": 0,
-  "primary_id_column": "RICEFW ID",
+  "primary_id_column": "Ticket Ref",
   "primary_id_position": "B",
-  "status_column": "Dev Status",
-  "module_column": "Module",
-  "assignee_column": "Technical Resource",
-  "description_column": "Description",
-  "type_column": "Type",
+  "status_column": "Current State",
+  "module_column": "Workstream",
+  "assignee_column": "Owner",
+  "description_column": "Summary",
+  "type_column": "Category",
   "date_columns": {{
-    "go_live": "Go-Live Date",
+    "go_live": "Target Date",
     "signoff": null,
-    "start": "Start Date",
+    "start": "Raised On",
     "completion": null
   }},
-  "critical_fields": ["RICEFW ID", "Module", "Type", "Description", "Dev Status"],
-  "valid_modules": ["FI", "MM", "SD"],
-  "valid_types": ["R", "I", "C", "E", "F", "W"]
+  "critical_fields": ["Ticket Ref", "Workstream", "Category", "Summary", "Current State"]
 }}
-"""
+
+Return ONLY a valid JSON object with those keys."""
 
 
 async def detect_schema_config(
@@ -175,26 +186,89 @@ async def detect_schema_config(
     except Exception as e:
         logger.error(f"Error during schema auto-detection for tab '{tab_name}': {e}")
 
-    # Structural fallback if LLM request fails
+    # Structural fallback if LLM request fails — derived from this sheet's own header row.
+    return _structural_fallback(raw_rows)
+
+
+def _column_letter(index: int) -> str:
+    """0-based column index -> A1 column letter (0 -> A, 26 -> AA)."""
+    letter = ""
+    index += 1
+    while index > 0:
+        index, rem = divmod(index - 1, 26)
+        letter = chr(65 + rem) + letter
+    return letter
+
+
+def _match_header(headers: List[str], keywords: List[str]) -> Optional[str]:
+    """First header containing any keyword (case-insensitive), else None."""
+    for header in headers:
+        lowered = header.lower()
+        if any(kw in lowered for kw in keywords):
+            return header
+    return None
+
+
+def _structural_fallback(raw_rows: List[List[Any]]) -> Dict[str, Any]:
+    """Best-effort schema from the sheet's actual headers, used when LLM detection fails.
+
+    This previously returned a hardcoded copy of one customer's WRICEF tracker — column
+    names like "RICEFW ID" and "Technical Resource ", SAP module codes, and WRICEF type
+    letters. On any other sheet every one of those columns is absent, so reads and writes
+    silently addressed columns that do not exist, and the invented `valid_modules` became
+    an allowlist that rejected legitimate IDs. Guessing from the real header row is worse
+    than a correct LLM detection but strictly better than describing a different sheet.
+
+    Deliberately omits `valid_modules`/`valid_types`: an unverified vocabulary is a
+    constraint the model will enforce, and no vocabulary at all is the honest default.
+    """
+    rows = raw_rows or []
+    # Header row = the earliest row with the most non-empty cells. Trackers routinely put
+    # a title or blank spacer above the real header, which is why this isn't just row 0.
+    header_idx = 0
+    best_filled = -1
+    for idx, row in enumerate(rows[:10]):
+        filled = sum(1 for cell in row if str(cell).strip())
+        if filled > best_filled:
+            best_filled = filled
+            header_idx = idx
+
+    headers = [str(c).strip() for c in rows[header_idx]] if header_idx < len(rows) else []
+    non_empty = [h for h in headers if h]
+
+    primary_id_column = non_empty[0] if non_empty else ""
+    primary_id_position = _column_letter(headers.index(primary_id_column)) if primary_id_column else "A"
+
+    status_column = _match_header(non_empty, ["status", "state", "progress", "stage"])
+    module_column = _match_header(non_empty, ["module", "workstream", "area", "team", "department", "function"])
+    type_column = _match_header(non_empty, ["type", "category", "kind", "class"])
+    assignee_column = _match_header(non_empty, ["assign", "owner", "resource", "responsible", "developer", "engineer"])
+    description_column = _match_header(non_empty, ["description", "desc", "summary", "title", "subject"])
+
+    date_columns = {
+        "go_live": _match_header(non_empty, ["go-live", "go live", "golive", "due", "target", "deadline"]),
+        "signoff": _match_header(non_empty, ["sign-off", "sign off", "signoff", "approved", "approval"]),
+        "start": _match_header(non_empty, ["start", "created", "opened"]),
+        "completion": _match_header(non_empty, ["completion", "completed", "closed", "finished", "end date"]),
+    }
+
+    critical = [c for c in (
+        primary_id_column, module_column, type_column,
+        description_column, status_column, assignee_column
+    ) if c]
+
     return {
         "is_tracker_sheet": True,
-        "header_row_index": 1,
-        "primary_id_column": "RICEFW ID",
-        "primary_id_position": "B",
-        "status_column": "Dev Status",
-        "module_column": "Module",
-        "assignee_column": "Technical Resource ",
-        "description_column": "Description",
-        "type_column": "Type",
-        "date_columns": {
-            "go_live": "Go-Live Date",
-            "signoff": "Sign-Off Date",
-            "start": "Start Date",
-            "completion": "Completion Date"
-        },
-        "critical_fields": ["RICEFW ID", "Module", "Type", "Description", "Dev Status", "Technical Resource "],
-        "valid_modules": ["FI", "MM", "SD", "PM", "QM", "PP", "TRM", "HCM", "IM", "CO", "FM", "PS"],
-        "valid_types": ["R", "I", "C", "E", "F", "W"]
+        "header_row_index": header_idx,
+        "primary_id_column": primary_id_column,
+        "primary_id_position": primary_id_position,
+        "status_column": status_column,
+        "module_column": module_column,
+        "assignee_column": assignee_column,
+        "description_column": description_column,
+        "type_column": type_column,
+        "date_columns": {k: v for k, v in date_columns.items() if v},
+        "critical_fields": critical,
     }
 
 

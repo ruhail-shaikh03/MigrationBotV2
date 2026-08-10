@@ -381,24 +381,86 @@ def test_permissions_unclassified_tool_fails_closed_for_editor_and_viewer():
 
 # 11. Regression for TDD §16.20 (Phase 6): the "tabs" in schema_config disambiguation was
 # copy-pasted at seven call sites. core/schema.py is now the one implementation.
-def test_get_tab_schema_and_valid_modules_resolve_both_shapes():
-    from app.core.schema import get_tab_schema, get_valid_modules
+def test_get_tab_schema_and_available_tabs_resolve_both_shapes():
+    from app.core.schema import get_tab_schema, get_available_tabs
 
-    flat_schema = {"data_start_row": 3, "primary_id_position": "B", "valid_modules": ["SD", "FI"]}
+    flat_schema = {"data_start_row": 3, "primary_id_position": "B"}
     assert get_tab_schema(flat_schema, "SD") == flat_schema
-    assert get_valid_modules(flat_schema) == ["SD", "FI"]
+    # A flat, single-tab config has nowhere to switch to.
+    assert get_available_tabs(flat_schema) == []
 
     multi_tab_schema = {
         "tabs": {"SD": {"data_start_row": 3}, "FI": {"data_start_row": 4}},
-        "global": {"valid_modules": ["SD", "FI"]}
+        "global": {"detected_tabs": ["SD", "FI"]}
     }
     assert get_tab_schema(multi_tab_schema, "SD") == {"data_start_row": 3}
     assert get_tab_schema(multi_tab_schema, "MISSING") == {}
-    assert get_valid_modules(multi_tab_schema) == ["SD", "FI"]
+    assert set(get_available_tabs(multi_tab_schema)) == {"SD", "FI"}
 
-    # No explicit "global.valid_modules" — falls back to the tab names themselves.
+    # Tab names come from `tabs` itself, so a config with no `global` block still works.
     multi_tab_no_global = {"tabs": {"SD": {}, "FI": {}}}
-    assert set(get_valid_modules(multi_tab_no_global)) == {"SD", "FI"}
+    assert set(get_available_tabs(multi_tab_no_global)) == {"SD", "FI"}
+
+
+# A legacy stored schema_config may still carry global.valid_modules from before the
+# rename. It must be inert: tab names come from `tabs`, and nothing may resurrect that
+# key as an allowlist of legal ID prefixes (the SLCM-0586 rejection).
+def test_legacy_valid_modules_key_is_ignored():
+    from app.core.schema import get_available_tabs
+
+    legacy = {
+        "tabs": {"Main Data Sheet": {"data_start_row": 3}},
+        "global": {"valid_modules": ["FI", "MM", "SD"]}
+    }
+    assert get_available_tabs(legacy) == ["Main Data Sheet"]
+
+
+# The prompt builders must never substitute a hardcoded module vocabulary. An empty tab
+# list means "single tab", not "here are twelve SAP module codes you must choose from".
+def test_system_prompts_carry_no_hardcoded_module_allowlist():
+    from app.core.tool_schemas import get_system_prompt, get_system_prompt_compact
+
+    full = get_system_prompt([], "{}")
+    compact = get_system_prompt_compact([])
+
+    for text in (full, compact):
+        assert "FI,MM,SD" not in text
+        assert "TRM" not in text
+        assert "single tab" in text
+
+    # Real tab names are passed through verbatim.
+    assert "Main Data Sheet" in get_system_prompt(["Main Data Sheet"], "{}")
+
+
+# The function-calling schemas are a harder constraint than prose: an `enum` or `pattern`
+# is something the model physically cannot emit around. SLCM-0586 failed get_row's id
+# pattern (4-letter prefix, 4-digit number) and every module enum.
+def test_tool_schemas_do_not_constrain_ids_or_categories():
+    import json as _json
+    from app.core.tool_schemas import TOOLS
+
+    by_name = {t["function"]["name"]: t["function"] for t in TOOLS}
+
+    assert "pattern" not in by_name["get_row"]["parameters"]["properties"]["ricefw_id"]
+
+    for tool, path in [
+        ("add_row", ["module"]),
+        ("add_row", ["type"]),
+        ("summarize", ["scope_module"]),
+        ("data_quality", ["scope_module"]),
+    ]:
+        prop = by_name[tool]["parameters"]["properties"]
+        for key in path:
+            prop = prop[key]
+        assert "enum" not in prop, f"{tool}.{'.'.join(path)} still constrains values"
+
+    filter_by = by_name["bulk_update"]["parameters"]["properties"]["filter_by"]
+    assert "enum" not in filter_by["properties"]["module"]
+
+    # No SAP module code should survive anywhere in the serialized schemas.
+    serialized = _json.dumps(TOOLS)
+    for code in ("TRM", "HCM", "WRICEF"):
+        assert code not in serialized
 
 
 # 12. Regression for TDD §16.23 (Phase 6): init_db() failures are swallowed at boot

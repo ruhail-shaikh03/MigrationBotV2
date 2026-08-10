@@ -1,19 +1,31 @@
 from typing import List, Dict, Any
 
-# Tool schemas available to DeepSeek in OpenAI function calling format
+# Tool schemas available to DeepSeek in OpenAI function calling format.
+#
+# These describe a generic row-tracking spreadsheet, NOT specifically an SAP WRICEF
+# tracker. Identifier shapes, category names and column names differ per sheet and come
+# from the project's detected schema_config (core/schema_detect.py) and column map
+# (core/column_mapper.py) — never from literals here. A `pattern` or `enum` in these
+# schemas is a hard constraint the model physically cannot emit around, so encoding one
+# customer's taxonomy here silently makes every other sheet unusable: `SLCM-0586` was
+# rejected outright by both the get_row id pattern and the module enums below.
 TOOLS: List[Dict[str, Any]] = [
     {
         "type": "function",
         "function": {
             "name": "get_row",
-            "description": "Read the current values of a WRICEF object by its ID.",
+            "description": "Read the current values of a single row by its unique ID.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "ricefw_id": {
                         "type": "string",
-                        "description": "The RICEFW ID, e.g. SD-045, FFC-SD-045, FI-012, PM-161.",
-                        "pattern": "^([A-Z]+-)?[A-Z]{2,3}-[0-9]{3}$"
+                        "description": (
+                            "The row's unique identifier, exactly as it appears in this "
+                            "sheet's primary ID column — e.g. SD-045, FFC-SD-045, "
+                            "SLCM-0586, TASK-1194, INC0042213. Pass it through verbatim; "
+                            "do not reformat it or assume a particular prefix or length."
+                        )
                     },
                     "fields": {
                         "type": "array",
@@ -29,7 +41,7 @@ TOOLS: List[Dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "update_cell",
-            "description": "Update one or more field values for a WRICEF object.",
+            "description": "Update one or more field values on a single row.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -77,17 +89,25 @@ TOOLS: List[Dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "add_row",
-            "description": "Append a new WRICEF object to the migration tracker.",
+            "description": "Append a new row to the active sheet.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "module": {
                         "type": "string",
-                        "enum": ["FI","MM","SD","PM","QM","PP","TRM","HCM","IM","CO","FM","PS"]
+                        "description": (
+                            "The row's category, as this sheet expresses it — whatever "
+                            "value belongs in its category/module column (e.g. SD, SLCM, "
+                            "Finance, Onboarding). Use a value consistent with existing "
+                            "rows; do not translate it into some other vocabulary."
+                        )
                     },
                     "type": {
                         "type": "string",
-                        "enum": ["R","I","C","E","F","W"]
+                        "description": (
+                            "The row's type/classification as this sheet expresses it. "
+                            "Match the convention already used in the sheet's type column."
+                        )
                     },
                     "description": {"type": "string"},
                     "assigned_to":  {"type": "string"},
@@ -105,11 +125,11 @@ TOOLS: List[Dict[str, Any]] = [
         "function": {
             "name": "bulk_update",
             "description": (
-                "Update one field to one value across multiple RICEFW objects at once. "
+                "Update one field to one value across multiple rows at once. "
                 "Use this when the user says things like 'mark all of these as done', "
                 "'set everyone on this list to Ready for Dev', or "
                 "'update SD-001 through SD-005 status to In Progress'. "
-                "Can also accept a filter (e.g. module + current field value) instead "
+                "Can also accept a filter (e.g. category + current field value) instead "
                 "of an explicit list of IDs."
             ),
             "parameters": {
@@ -119,23 +139,26 @@ TOOLS: List[Dict[str, Any]] = [
                         "type": "array",
                         "items": {"type": "string"},
                         "description": (
-                            "Explicit list of RICEFW IDs to update. "
-                            "Provide either this OR filter_by, not both."
+                            "Explicit list of row IDs to update, verbatim as they appear "
+                            "in the sheet. Provide either this OR filter_by, not both."
                         )
                     },
                     "filter_by": {
                         "type": "object",
                         "description": (
-                            "Instead of listing IDs, describe which rows to target. "
-                            "E.g. {\"module\": \"SD\", \"field\": \"Dev Status\", "
-                            "\"value\": \"In Progress\"}. "
+                            "Instead of listing IDs, describe which rows to target, using "
+                            "this sheet's own column names and values. Shape (illustrative "
+                            "only, not real column names): {\"module\": \"<category>\", "
+                            "\"field\": \"<column>\", \"value\": \"<current value>\"}. "
                             "All three sub-keys are required if filter_by is used."
                         ),
                         "properties": {
                             "module": {
                                 "type": "string",
-                                "enum": ["FI","MM","SD","PM","QM","PP",
-                                         "TRM","HCM","IM","CO","FM","PS"]
+                                "description": (
+                                    "Value to match in this sheet's category/module "
+                                    "column, using the sheet's own vocabulary."
+                                )
                             },
                             "field": {
                                 "type": "string",
@@ -165,12 +188,11 @@ TOOLS: List[Dict[str, Any]] = [
         "function": {
             "name": "search_rows",
             "description": (
-                "Search the migration tracker and return all RICEFW objects that match "
-                "one or more field criteria. Supports single-field and multi-field "
-                "filters. Use this when the user asks things like 'show me all SD "
-                "objects owned by Ahmed', 'which items are still not migrated?', "
-                "'find all FI reports with no dev status', or 'list everything "
-                "assigned to Sara'."
+                "Search the active sheet and return all rows that match one or more "
+                "field criteria. Supports single-field and multi-field filters. Use this "
+                "when the user asks things like 'show me all SD items owned by Ahmed', "
+                "'which items are still open?', 'find everything with no status', or "
+                "'list everything assigned to Sara'."
             ),
             "parameters": {
                 "type": "object",
@@ -215,9 +237,10 @@ TOOLS: List[Dict[str, Any]] = [
                         "type": "array",
                         "items": {"type": "string"},
                         "description": (
-                            "Which columns to include in each result row. "
-                            "If omitted, returns RICEFW ID, Module, Type, "
-                            "Description, Dev Status, and Assigned To."
+                            "Which columns to include in each result row, using this "
+                            "sheet's own column names. If omitted, returns the sheet's "
+                            "key columns (id, category, type, description, status, "
+                            "assignee) as resolved from its detected schema."
                         )
                     },
                     "limit": {
@@ -235,11 +258,11 @@ TOOLS: List[Dict[str, Any]] = [
         "function": {
             "name": "summarize",
             "description": (
-                "Aggregate and count data across the migration tracker. Use this for "
+                "Aggregate and count data across the active sheet. Use this for "
                 "questions like 'how many items are in each status?', 'what's our "
-                "overall completion rate?', 'how many SD objects are assigned to each "
-                "person?', 'which items have no dev status?', or "
-                "'how many are past their go-live date?'."
+                "overall completion rate?', 'how many items are assigned to each "
+                "person?', 'which items have no status?', or "
+                "'how many are past their due date?'."
             ),
             "parameters": {
                 "type": "object",
@@ -255,33 +278,33 @@ TOOLS: List[Dict[str, Any]] = [
                         "description": (
                             "'count_by_field': group rows by a field's values and count each group. "
                             "'completion_rate': what % of rows have a specific field set to a "
-                            "target value (e.g. Migrate? = Yes). "
+                            "target value. "
                             "'blank_fields': count rows where a field is empty. "
-                            "'overdue': rows where Go-Live Date is in the past and "
-                            "Dev Status is not a completion value."
+                            "'overdue': rows whose due/target date column is in the past and "
+                            "whose status column is not a completion value."
                         )
                     },
                     "group_by_field": {
                         "type": "string",
                         "description": (
-                            "Required for count_by_field. The column to group rows by. "
-                            "E.g. 'Dev Status', 'Module', 'Assigned To'."
+                            "Required for count_by_field. The column to group rows by, "
+                            "named as it appears in this sheet — consult the column "
+                            "reference guide rather than guessing a conventional name."
                         )
                     },
                     "scope_module": {
                         "type": "string",
-                        "enum": ["FI","MM","SD","PM","QM","PP",
-                                 "TRM","HCM","IM","CO","FM","PS"],
                         "description": (
-                            "Optional. Restrict the report to one SAP module. "
-                            "Omit to report across all modules."
+                            "Optional. Restrict the report to one value of this sheet's "
+                            "category/module column, using the sheet's own vocabulary. "
+                            "Omit to report across every row."
                         )
                     },
                     "completion_field": {
                         "type": "string",
                         "description": (
-                            "Required for completion_rate. The column to measure. "
-                            "E.g. 'Migrate?'."
+                            "Required for completion_rate. The column to measure, named "
+                            "as it appears in this sheet."
                         )
                     },
                     "completion_value": {
@@ -299,9 +322,9 @@ TOOLS: List[Dict[str, Any]] = [
                         "type": "array",
                         "items": {"type": "string"},
                         "description": (
-                            "For overdue report: Dev Status values that mean 'done' and "
-                            "should be excluded. Defaults to ['Complete', 'Done', 'Closed', "
-                            "'Go-Live', 'Retired']."
+                            "For overdue report: status values that mean 'done' and should "
+                            "be excluded, in this sheet's own wording. Defaults to "
+                            "['Complete', 'Done', 'Closed', 'Go-Live', 'Retired']."
                         )
                     }
                 },
@@ -314,17 +337,18 @@ TOOLS: List[Dict[str, Any]] = [
         "function": {
             "name": "switch_module",
             "description": (
-                "Switch the active tab/module inside the current spreadsheet. "
-                "Use this tool when the user asks a question about a different module "
-                "(e.g., you are on the SD tab, but the request is about HCM or FI), "
-                "or when a RICEFW ID's module prefix does not match the active tab."
+                "Switch the active tab inside the current spreadsheet. Use this when the "
+                "requested data lives on a different tab than the active one. Only call it "
+                "for a tab named in the available-tabs list; many sheets keep everything on "
+                "a single tab, in which case this tool is never needed. A row ID whose "
+                "prefix is unfamiliar is NOT evidence that a different tab is required."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "tab_name": {
                         "type": "string",
-                        "description": "The exact tab name or module code (e.g. HCM, SD, MM) to switch to."
+                        "description": "The exact tab name to switch to, from the available-tabs list."
                     }
                 },
                 "required": ["tab_name"]
@@ -342,7 +366,7 @@ TOOLS: List[Dict[str, Any]] = [
                 "'which items have no assigned dev?', 'find rows missing required fields', "
                 "'show me blank cells', 'any items completed but lacking a sign-off date?', "
                 "'are there stale items?', or 'what is our completeness score?'. "
-                "Also use for 'flag any [module] items past their go-live date' "
+                "Also use for 'flag any items past their due date' "
                 "(maps to overdue check_type)."
             ),
             "parameters": {
@@ -359,7 +383,8 @@ TOOLS: List[Dict[str, Any]] = [
                         ],
                         "description": (
                             "'blank_fields': count blank cells per critical column. "
-                            "'consistency': detect logical anomalies (e.g. Completed but no sign-off). "
+                            "'consistency': detect logical anomalies (e.g. marked complete "
+                            "but missing a sign-off/completion date). "
                             "'stale': items with no audit activity for threshold_days. "
                             "'completeness_score': 0-100 fill-rate across critical columns. "
                             "'all': run every check and return a combined report."
@@ -367,7 +392,10 @@ TOOLS: List[Dict[str, Any]] = [
                     },
                     "scope_module": {
                         "type": "string",
-                        "description": "Optional. Restrict checks to one SAP module (e.g. SD, FI)."
+                        "description": (
+                            "Optional. Restrict checks to one value of this sheet's "
+                            "category/module column, in the sheet's own vocabulary."
+                        )
                     },
                     "threshold_days": {
                         "type": "integer",
@@ -394,30 +422,35 @@ TOOLS: List[Dict[str, Any]] = [
 
 # Base prompt templates
 BASE_SYSTEM_PROMPT = """
-You are MigrationBot, a highly capable assistant for managing the S/4HANA WRICEF Migration
-Control Sheet in Google Sheets. You have nine strict tools: get_row, update_cell,
+You are MigrationBot, a highly capable assistant for managing tracking spreadsheets in
+Google Sheets. Sheets vary widely between teams — SAP migration trackers, project and task
+registers, issue logs, onboarding checklists. The active sheet's real structure is given by
+the column reference guide at the end of this prompt; treat that as the only authority on
+what exists. You have nine strict tools: get_row, update_cell,
 format_row, add_row, bulk_update, search_rows, summarize, switch_module, and data_quality.
 
 CRITICAL ANTI-PATTERNS (NEVER DO THESE):
-- NEVER call `get_row` iteratively in a loop for multiple items. `get_row` is strictly for reading a SINGLE specific RICEFW ID.
+- NEVER call `get_row` iteratively in a loop for multiple items. `get_row` is strictly for reading a SINGLE specific row ID.
 - NEVER try to fetch all rows to manually do math, aggregate, or search. The system will forcefully terminate you if you loop.
 - ALWAYS use the macro-tools (`search_rows`, `summarize`, `bulk_update`, `data_quality`) for ANY operation involving more than one row.
 
 RULES:
-1. Always extract the RICEFW ID from the user's message first. It follows the
-   pattern MODULE-NNN or PREFIX-MODULE-NNN (e.g. SD-045, FFC-SD-045, FI-012).
-   Valid modules: {valid_modules}. If the user omits the prefix, the system
-   will automatically resolve or prepend it as needed.
-2. Map natural-language field references to column names semantically:
-   "status" or "dev status"         → "Dev Status"
-   "migrate" or "should we migrate" → "Migrate?"
+1. Always extract the row ID from the user's message first, and pass it through
+   EXACTLY as written. Identifier formats differ per sheet — SD-045, FFC-SD-045,
+   SLCM-0586, TASK-1194, INC0042213 are all legitimate. Never reject, rewrite, or
+   question an ID because its prefix or length looks unfamiliar; you do not hold a
+   list of valid prefixes, and the sheet is the authority. If the ID genuinely is
+   not present, the tool will say so — let it.
+2. Map natural-language field references to column names semantically, resolving
+   against the column reference guide below rather than assuming conventional names:
+   "status"                         → whichever column tracks status here
+   "owner" / "who's on it"          → whichever column names a person
    "flag it" / "color column"       → format_row with color_column_only scope
    "highlight green"                → format_row, color=green, scope=entire_row
-   "job frequency" / "batch schedule" → "Job Frequency"
-3. If the RICEFW ID is ambiguous or missing, ask for clarification. Do NOT guess.
-4. Conditional commands ("if PM-161 is marked for migration, set frequency to Monthly"):
+3. If the row ID is ambiguous or missing, ask for clarification. Do NOT guess.
+4. Conditional commands ("if PM-161 is approved, set frequency to Monthly"):
    call get_row first, evaluate the result, then conditionally call update_cell.
-5. For add_row, the RICEFW ID is assigned automatically server-side in sequence — never
+5. For add_row, the row ID is assigned automatically server-side in sequence — never
    invent or guess one yourself, and do not ask the user for it.
 6. Never invent column names. If ambiguous, list three closest matches and ask.
 7. Confirmations: one sentence. Reads: compact key-value list.
@@ -432,14 +465,15 @@ RULES:
 10. REPORTING — use summarize when the user asks "how many", "what percentage",
     "completion rate", "overdue", or "which fields are empty". Always pick the
     most specific report_type. For "how complete is the SD workstream?" use
-    completion_rate. For "who has the most items?" use count_by_field on
-    Assigned To with scope_module omitted.
+    completion_rate. For "who has the most items?" use count_by_field on the
+    sheet's assignee column with scope_module omitted.
 11. Never call bulk_update without confirming the target set of rows in your
     reply.
-12. CROSS-MODULE — If the request (or the RICEFW ID) belongs to a different module
-    than the active tab, call switch_module(tab_name) first, then proceed with data
-    operations. Tab name = module code. Use the exact tab name from the
-    available tabs list.
+12. TABS — Available tabs: {available_tabs}. If the requested data lives on a
+    different tab than the active one, call switch_module(tab_name) first, using an
+    exact name from that list. Many sheets hold everything on one tab; if the list is
+    empty or has a single entry, never call switch_module. An unfamiliar ID prefix is
+    not a reason to switch tabs — prefixes are not tab names.
 13. DATA QUALITY — use data_quality when the user asks about data health,
     missing values, anomalies, stale items, validation issues, or completeness.
     Use check_type="all" for general "check data quality" requests.
@@ -451,7 +485,7 @@ RULES:
     return {{"status": "queued", ...}} the instant the request is accepted, before the
     change has actually reached the spreadsheet. NEVER say "Updated", "Done", "Set",
     or otherwise imply a write already succeeded. Phrase it as pending — e.g. "Queued
-    an update for SD-045's Dev Status to Done." The user is notified separately once
+    an update for SD-045's status to Done." The user is notified separately once
     the write actually completes or fails; you do not report that outcome yourself.
 
 Column reference guide:
@@ -459,12 +493,13 @@ Column reference guide:
 """
 
 BASE_SYSTEM_PROMPT_COMPACT = """
-You are MigrationBot managing an S/4HANA WRICEF Migration Control Sheet.
-Valid modules: {valid_modules}.
+You are MigrationBot managing a tracking spreadsheet in Google Sheets.
+Available tabs: {available_tabs}.
 You have nine tools: get_row, update_cell, format_row, add_row,
 bulk_update, search_rows, summarize, switch_module, and data_quality.
 
 CRITICAL REMINDER: NEVER call `get_row` iteratively for multiple items. Use `search_rows` or `summarize` for ANY multi-row query.
+Row IDs and column names belong to this sheet's own vocabulary — pass IDs through verbatim and never reject one for looking unfamiliar.
 
 The column reference guide is already present earlier in this conversation.
 Continue the task. Follow all previous rules. Respond with tool calls or a
@@ -472,13 +507,27 @@ final summary — do NOT re-explain what you are doing.
 """
 
 
-def get_system_prompt(valid_modules: List[str], column_map_json: str) -> str:
-    """Format and return the main system prompt with valid modules and active column map."""
-    modules_str = ",".join(valid_modules) if valid_modules else "FI,MM,SD,PM,QM,PP,TRM,HCM,IM,CO,FM,PS"
-    return BASE_SYSTEM_PROMPT.format(valid_modules=modules_str, column_map_json=column_map_json)
+def _format_tabs(available_tabs: List[str]) -> str:
+    """Render the available-tab list for prompt injection.
+
+    Deliberately has no hardcoded fallback. Both builders used to substitute the literal
+    "FI,MM,SD,PM,QM,PP,TRM,HCM,IM,CO,FM,PS" whenever the list was empty, and the prompt
+    presented it as "Valid modules", so a single-tab sheet — which legitimately has no tabs
+    to switch between — was told one customer's SAP module codes were the only legal
+    vocabulary. That is what made the model refuse SLCM-0586. An empty list now says so
+    plainly, which is both true and non-constraining.
+    """
+    return ",".join(available_tabs) if available_tabs else "(single tab — switch_module is not applicable)"
 
 
-def get_system_prompt_compact(valid_modules: List[str]) -> str:
-    """Format and return the compact system prompt with valid modules."""
-    modules_str = ",".join(valid_modules) if valid_modules else "FI,MM,SD,PM,QM,PP,TRM,HCM,IM,CO,FM,PS"
-    return BASE_SYSTEM_PROMPT_COMPACT.format(valid_modules=modules_str)
+def get_system_prompt(available_tabs: List[str], column_map_json: str) -> str:
+    """Format and return the main system prompt with available tabs and active column map."""
+    return BASE_SYSTEM_PROMPT.format(
+        available_tabs=_format_tabs(available_tabs),
+        column_map_json=column_map_json
+    )
+
+
+def get_system_prompt_compact(available_tabs: List[str]) -> str:
+    """Format and return the compact system prompt with available tabs."""
+    return BASE_SYSTEM_PROMPT_COMPACT.format(available_tabs=_format_tabs(available_tabs))
