@@ -2,12 +2,27 @@ import NextAuth from "next-auth"
 import Google from "next-auth/providers/google"
 import { SignJWT } from "jose"
 
-// No fallback: a shared, publicly-known default here is exactly what let a deployment
-// that forgot to set this accept tokens forged against that known string (see
-// backend/app/config.py's JWT_SECRET, which is required for the same reason).
-const JWT_SECRET = process.env.JWT_SECRET
-if (!JWT_SECRET) {
-  throw new Error("JWT_SECRET environment variable is required and has no default.")
+/**
+ * Resolve the backend JWT signing secret, at request time.
+ *
+ * Still no fallback: a shared, publicly-known default here is exactly what let a
+ * deployment that forgot to set this accept tokens forged against that known string
+ * (see backend/app/config.py's JWT_SECRET, which is required for the same reason).
+ *
+ * What changed is *when* the check runs. This used to be a module-scope `const` +
+ * `throw`, which fired during `next build`'s "Collecting page data" step: Next.js
+ * imports every route handler to build the route manifest, and
+ * app/api/auth/[...nextauth]/route.ts re-exports `handlers` from this module — so a
+ * Docker builder stage with no env vars failed the build outright. Validating inside
+ * the callback keeps importing this module side-effect-free while still failing loudly
+ * on the first real session request if the secret is genuinely missing.
+ */
+function getJwtSecret(): string {
+  const secret = process.env.JWT_SECRET
+  if (!secret) {
+    throw new Error("JWT_SECRET environment variable is required and has no default.")
+  }
+  return secret
 }
 
 /**
@@ -100,7 +115,7 @@ export const { handlers, signIn, signOut, auth } = NextAuth({
         session.error = token.error // Surface token errors to the client
         
         // Generate standard signed HS256 JWT for our FastAPI backend
-        const secretKey = new TextEncoder().encode(JWT_SECRET)
+        const secretKey = new TextEncoder().encode(getJwtSecret())
         const payload = {
           email: token.email,
           name: token.name,
@@ -121,7 +136,14 @@ export const { handlers, signIn, signOut, auth } = NextAuth({
       return session
     }
   },
-  secret: process.env.NEXTAUTH_SECRET || JWT_SECRET,
+  // Read straight from the environment rather than via getJwtSecret(): this object
+  // literal is evaluated at module scope, so calling the validating getter here would
+  // reintroduce the exact build-time throw this refactor removes. Passing `undefined`
+  // is safe — NextAuth's setEnvDefaults() only assigns defaults at import
+  // (next-auth/lib/env.js), and the MissingSecret check lives in assertConfig(), which
+  // runs per-request inside Auth() (@auth/core/index.js). A genuinely unset secret in
+  // production therefore still fails, at the first auth request rather than at import.
+  secret: process.env.NEXTAUTH_SECRET || process.env.JWT_SECRET,
   trustHost: true,
   session: {
     strategy: "jwt"
