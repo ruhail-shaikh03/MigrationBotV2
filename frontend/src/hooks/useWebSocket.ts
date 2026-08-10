@@ -1,6 +1,35 @@
 import { useEffect, useRef, useCallback } from "react"
 import { useChatStore } from "@/store/useChatStore"
 
+/**
+ * Detach every handler, then close cleanly with code 1000.
+ *
+ * Both halves matter. A socket we close deliberately must not be able to schedule a
+ * reconnect: `onclose` below retries on any code other than 1000/1008, and a bare
+ * `socket.close()` reports 1005 ("no status received"), which passes that guard. So
+ * replacing a socket used to fire the *old* socket's `onclose`, which queued a
+ * reconnect 3s later, which closed the healthy socket that had just replaced it —
+ * a self-sustaining 3-second flap that reset `isConnected` (and, server-side, the
+ * per-connection `message_history` in chat.py) on every cycle.
+ *
+ * Nulling the handlers also stops a superseded socket from writing store state for a
+ * connection that no longer exists: `onclose` fires asynchronously, so it could
+ * otherwise land *after* the replacement's `onopen` and stomp `isConnected` back to
+ * false, leaving the composer disabled with a live socket open.
+ */
+function teardownSocket(socket: WebSocket | null): void {
+  if (!socket) return
+  socket.onopen = null
+  socket.onclose = null
+  socket.onerror = null
+  socket.onmessage = null
+  try {
+    socket.close(1000, "client closing")
+  } catch (e) {
+    console.error(e)
+  }
+}
+
 export function useWebSocket(apiToken: string | null, projectId: number | null) {
   const { isConnected, setIsConnected, addMessage, updateLastMessage, setWs, setActiveTab, setSessionInfo } = useChatStore()
   // The canonical "current socket" reference. Read/write this, not the Zustand `ws` state,
@@ -14,14 +43,20 @@ export function useWebSocket(apiToken: string | null, projectId: number | null) 
   const connect = useCallback(() => {
     if (!apiToken) return
 
-    // Close any previous instance.
-    if (wsRef.current) {
-      try {
-        wsRef.current.close()
-      } catch (e) {
-        console.error(e)
-      }
+    // Drop any pending reconnect/heartbeat before standing up a new socket, so a timer
+    // queued by an earlier connection can't fire against this one.
+    if (reconnectTimeoutRef.current) {
+      clearTimeout(reconnectTimeoutRef.current)
+      reconnectTimeoutRef.current = null
     }
+    if (pingIntervalRef.current) {
+      clearInterval(pingIntervalRef.current)
+      pingIntervalRef.current = null
+    }
+
+    // Close any previous instance — handlers first, see teardownSocket.
+    teardownSocket(wsRef.current)
+    wsRef.current = null
 
     const protocol = typeof window !== 'undefined' && window.location.protocol === "https:" ? "wss:" : "ws:"
     const host = typeof window !== 'undefined' ? window.location.host : "localhost:3000"
@@ -30,10 +65,15 @@ export function useWebSocket(apiToken: string | null, projectId: number | null) 
 
     console.log("Connecting to WebSocket:", wsBaseUrl)
     const socket = new WebSocket(url)
+    // Claim the ref before attaching handlers so the `wsRef.current !== socket` guards
+    // below can tell "this is the live socket" from "this one was already replaced".
+    wsRef.current = socket
 
     socket.onopen = () => {
+      if (wsRef.current !== socket) return
       console.log("WebSocket connected successfully")
       setIsConnected(true)
+      setWs(socket)
 
       // Start ping heartbeat to keep connections open
       if (pingIntervalRef.current) clearInterval(pingIntervalRef.current)
@@ -45,15 +85,24 @@ export function useWebSocket(apiToken: string | null, projectId: number | null) 
     }
 
     socket.onclose = (event) => {
+      // A socket that's already been replaced must not touch shared state or queue a
+      // reconnect on the live one's behalf.
+      if (wsRef.current !== socket) return
+      wsRef.current = null
+
       console.log("WebSocket closed:", event)
       setIsConnected(false)
       setWs(null)
 
       if (pingIntervalRef.current) {
         clearInterval(pingIntervalRef.current)
+        pingIntervalRef.current = null
       }
 
-      // Reconnect on unexpected disconnects (exclude authentication/clean close errors)
+      // Reconnect only on genuinely unexpected drops. 1000 means we closed it ourselves
+      // (teardownSocket, or the effect cleanup on unmount) and a retry would fight the
+      // caller that asked for the close; 1008 is the server rejecting auth
+      // (chat.py:websocket_chat_endpoint), where retrying just loops on the same token.
       if (event.code !== 1008 && event.code !== 1000) {
         if (reconnectTimeoutRef.current) clearTimeout(reconnectTimeoutRef.current)
         reconnectTimeoutRef.current = setTimeout(() => {
@@ -162,18 +211,33 @@ export function useWebSocket(apiToken: string | null, projectId: number | null) 
       }
     }
 
-    wsRef.current = socket
-    setWs(socket)
+    // wsRef/setWs are assigned above (ref) and in onopen (store), not here — publishing
+    // a still-CONNECTING socket to the store let callers send on a socket that wasn't
+    // open yet.
   }, [apiToken, projectId, setIsConnected, setWs, addMessage, updateLastMessage, setActiveTab, setSessionInfo])
 
+  // `connect` already closes over apiToken/projectId, so depending on it alone covers
+  // a token or project change without re-running the effect twice for one change.
   useEffect(() => {
     connect()
 
     return () => {
-      if (reconnectTimeoutRef.current) clearTimeout(reconnectTimeoutRef.current)
-      if (pingIntervalRef.current) clearInterval(pingIntervalRef.current)
+      if (reconnectTimeoutRef.current) {
+        clearTimeout(reconnectTimeoutRef.current)
+        reconnectTimeoutRef.current = null
+      }
+      if (pingIntervalRef.current) {
+        clearInterval(pingIntervalRef.current)
+        pingIntervalRef.current = null
+      }
+      // Previously the socket itself was left open here, so unmounting (or navigating
+      // away from /chat) leaked a live connection that kept receiving frames.
+      teardownSocket(wsRef.current)
+      wsRef.current = null
+      setIsConnected(false)
+      setWs(null)
     }
-  }, [apiToken, projectId, connect])
+  }, [connect, setIsConnected, setWs])
 
   const sendMessage = useCallback((content: string) => {
     if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
