@@ -100,7 +100,7 @@ a synchronous round trip to Google, so read latency and Sheets quota are directl
 
 | Layer | Technology | Citation |
 |---|---|---|
-| Frontend | Next.js 16.2.9, React 19.2.4, NextAuth 5.0.0-beta.31, Zustand 5, Tailwind 4, Recharts | `frontend/package.json` (`dependencies`) |
+| Frontend | Next.js 16.2.9, React 19.2.4, NextAuth 5.0.0-beta.31, Zustand 5, Tailwind 4, Recharts, react-markdown 10 + remark-gfm 4 | `frontend/package.json` (`dependencies`) |
 | Backend | FastAPI, uvicorn, SQLAlchemy 2.0 + asyncpg, Pydantic 2, python-jose | `backend/requirements.txt` |
 | Data | PostgreSQL 16 — RBAC/audit only, **not** sheet data | `docker-compose.yml` (`postgres` service) |
 | Queue | Redis 7 — list-backed FIFO **and** pub/sub event bus | `producer.py:enqueue_write_job`, `events.py:publish_queue_update` |
@@ -425,15 +425,24 @@ misleading "read-only access" message rather than a "not recognized" one (§16 h
 JSONB defaulting to `{}` (`models/project.py:Project`), in one of two shapes distinguished by a
 top-level `"tabs"` key: multi-tab (`{"tabs": {...}, "global": {...}}`, what `detect_all_tabs`
 produces — `schema_detect.py:detect_all_tabs`) or flat. The disambiguation has one implementation,
-`core/schema.py:get_tab_schema` (plus `core/schema.py:get_valid_modules` for the system-prompt
-module list) — previously it was copy-pasted at seven call sites (`read.py`, `write.py` ×3,
+`core/schema.py:get_tab_schema` (plus `core/schema.py:get_available_tabs` for the system-prompt tab
+list) — previously it was copy-pasted at seven call sites (`read.py`, `write.py` ×3,
 `worker.py`, `chat.py`, `agentic_loop.py`), one of them a private `_get_tab_schema` the others
 didn't share (§16 history).
+
+`get_available_tabs` replaced `get_valid_modules`, and the rename carries the fix. That function
+always returned **tab names**, but `tool_schemas.py` injected them into the prompt as
+"Valid modules: …" — an allowlist of legal identifier prefixes. Tabs are a navigation concept for
+`switch_module`; nothing derives legal IDs from them, and the multi-tab branch no longer reads
+`global.valid_modules` at all (see §7.3 and §8). A flat, single-tab config yields `[]`, meaning
+"nowhere to switch to" rather than "no identifiers are valid".
 
 Per-tab defaults are applied inline at each use: `data_start_row` → `3`, `primary_id_position` →
 `"B"`, `primary_id_column` → `"RICEFW ID"`, `assignee_column` → `"Technical Resource "` (with
 trailing space), `critical_fields` → a six-name list (`read.py:search_rows`, the default list
-literal). `header_row_num` is always `data_start_row - 1`.
+literal). `header_row_num` is always `data_start_row - 1`. **Those literal fallbacks are still one
+customer's column names** — they only bite when `schema_config` omits the key, but on a non-SAP
+sheet that is exactly when they are wrong (§16.2).
 
 ### 7.2 Column-name resolution and the whitespace asymmetry
 
@@ -443,7 +452,12 @@ then `difflib.get_close_matches` at `cutoff=0.6`. It returns the **unstripped** 
 
 `COLUMN_ALIASES` (`column_mapper.py:COLUMN_ALIASES`) deliberately preserves the tracker's real
 header typos and trailing spaces — `"Technical Resource "`, `"Functinal Resource "`, `"Color "`,
-`"Programe Name"`.
+`"Programe Name"`. It is explicitly **not** a general default: those headers exist on exactly one
+customer's sheet, so resolving against them elsewhere maps user terms onto columns that are not
+there. It is now reached only when nothing whatsoever is known about a sheet's columns — no stored
+`column_map` and no header row to read. Whenever real headers exist, `build_column_map` falls back
+to `column_mapper.py:_identity_map` (each real header aliased to its own lowercased form) instead,
+which keeps `resolve_column`'s exact and fuzzy passes working without inventing vocabulary.
 
 `get_header_row` strips every header cell (`meta.py:get_header_row`). Both read and write paths
 now treat that the same way: build `{h.lower().strip(): i}` and look up
@@ -460,18 +474,45 @@ now treat that the same way: build `{h.lower().strip(): i}` and look up
 
 `detect_all_tabs` (`schema_detect.py:detect_all_tabs`) enumerates tabs, reads `A1:Z10` from each,
 and asks `deepseek-chat` at `temperature=0.1` to classify the tab and map columns. Non-tracker tabs
-are skipped; `data_start_row` = `header_row_index + 2`. On LLM failure a hard-coded fallback is
-returned with `is_tracker_sheet: True` — so an outage registers every tab, including cover pages,
-as a tracker.
+are skipped; `data_start_row` = `header_row_index + 2`. On LLM failure a fallback is returned with
+`is_tracker_sheet: True` — so an outage still registers every tab, including cover pages, as a
+tracker.
+
+That fallback is now `schema_detect.py:_structural_fallback`, derived from the sheet's own header
+row: it picks the header row as the earliest of the first ten rows with the most non-empty cells
+(trackers routinely carry a title or spacer above the real header), takes the first non-empty
+header as `primary_id_column`, converts its index to an A1 letter, and matches the status / module /
+type / assignee / description and date columns by generic keyword (`status`, `owner`, `due`,
+`category`, …) via `schema_detect.py:_match_header`. It deliberately emits **no** `valid_modules` or
+`valid_types`: an unverified vocabulary is later enforced as a constraint, and no vocabulary is the
+honest default.
+
+It previously returned a verbatim copy of one customer's WRICEF schema — `"RICEFW ID"`,
+`"Dev Status"`, `"Technical Resource "`, the twelve SAP module codes and the WRICEF type letters.
+On any other sheet every one of those columns is absent, so reads and writes silently addressed
+columns that did not exist, and the invented `valid_modules` became an allowlist that rejected
+legitimate rows. The detection prompt itself was also teaching the model to emit those lists via a
+WRICEF-flavoured example; the example is now neutral and instructs it not to emit permitted-value
+lists at all.
+
+`global.valid_modules` is likewise gone from the produced config, replaced by an informational
+`global.detected_tabs` — consumers read tab names from `tabs` directly (§7.1). A legacy stored
+config may still carry the old key; it is inert, and `test_core_logic.py` has a regression asserting
+so.
 
 `build_column_map` (`column_mapper.py:build_column_map`), a two-pass LLM alias generator, is now
 called from `schema_detect.py:detect_all_tabs` for every tracker tab it detects — it generates an
 alias map from that tab's own real headers and attaches it as `column_map` in the tab's schema,
 rather than every deployment silently running on the static `COLUMN_ALIASES` fallback (hardcoded to
 one customer's sheet — §16 history) unless an admin hand-edited `schema_config`. `build_column_map`
-falls back to `COLUMN_ALIASES` itself on any LLM failure, so this can't make detection worse than
-before. `get_column_map_json` (`column_mapper.py:get_column_map_json`) is the system-prompt
-serializer for whichever map ends up active, called from `agentic_loop.py:run_agentic_loop`.
+falls back to `_identity_map` over the real headers on any LLM failure (§7.2), so this can't make
+detection worse than before. Its two alias-generation prompts are also domain-neutral now: they
+used to instruct the model to produce SAP terms ("BADI, enhancement exit, Z-table, tcode, RICEF,
+transport request") for *every* sheet, which actively poisoned the map on a non-SAP tracker; they
+now infer the domain from the headers themselves and the pass-2 review removes aliases borrowed
+from a domain the sheet is not about. `get_column_map_json`
+(`column_mapper.py:get_column_map_json`) is the system-prompt serializer for whichever map ends up
+active, called from `agentic_loop.py:run_agentic_loop`.
 
 ---
 
@@ -486,7 +527,16 @@ serializer for whichever map ends up active, called from `agentic_loop.py:run_ag
   `deepseek-chat`.
 - **Prompt swapping** — iteration 0 sends the full prompt with the serialised column map; from
   iteration 1 the system message is replaced in place with a compact variant
-  (`tool_schemas.py:get_system_prompt_compact`).
+  (`tool_schemas.py:get_system_prompt_compact`). Both builders take the **available tab list**
+  (§7.1) and render an empty list as `(single tab — switch_module is not applicable)` via
+  `tool_schemas.py:_format_tabs`. Neither substitutes a vocabulary: they used to fall back to the
+  literal `FI,MM,SD,PM,QM,PP,TRM,HCM,IM,CO,FM,PS` whenever the list was empty and present it as
+  "Valid modules", so a single-tab sheet — which legitimately has no tabs — was told one customer's
+  SAP module codes were the only legal identifier prefixes, and refused anything else.
+- **Domain-neutral prompt** — the system prompt describes a generic tracking spreadsheet and defers
+  to the injected column reference guide as the sole authority on what exists. Rule 1 instructs the
+  model to pass row IDs through verbatim and never reject one for looking unfamiliar; it previously
+  asserted a fixed `MODULE-NNN` shape alongside the module allowlist.
 - **DSML leakage guard** — content containing `<｜｜DSML｜｜>` triggers one retry against
   `deepseek-chat`, inline in `agentic_loop.py:run_agentic_loop`.
 - **CoT suppression** — `reasoning_content` is logged, never forwarded.
@@ -504,6 +554,22 @@ serializer for whichever map ends up active, called from `agentic_loop.py:run_ag
 
 Nine tools in `core/tool_schemas.py:TOOLS`: `get_row`, `update_cell`, `format_row`, `add_row`,
 `bulk_update`, `search_rows`, `summarize`, `switch_module`, `data_quality`.
+
+These are OpenAI function-calling schemas, so a `pattern` or `enum` in them is a **hard constraint
+the model cannot emit around** — a stricter gate than any prompt wording, and one that fails
+silently. Four such constraints encoded one customer's taxonomy and have been removed:
+
+| Was | Where | Effect |
+|---|---|---|
+| `"pattern": "^([A-Z]+-)?[A-Z]{2,3}-[0-9]{3}$"` | `get_row.ricefw_id` | rejected `SLCM-0586` twice over — 4-letter prefix, 4-digit number |
+| `enum` of the 12 SAP module codes | `add_row.module`, `bulk_update.filter_by.module`, `summarize.scope_module` | no non-SAP category could be expressed |
+| `enum: ["R","I","C","E","F","W"]` | `add_row.type` | WRICEF type letters only |
+
+Parameter descriptions now refer to "this sheet's own vocabulary" and point at the column reference
+guide rather than naming `RICEFW ID` / `Dev Status` / `Go-Live Date`. `switch_module`'s description
+additionally states that an unfamiliar ID prefix is *not* evidence a tab switch is needed — prefixes
+are not tab names. The parameter key is still `ricefw_id` across `tool_dispatch.py`, `read.py`,
+`write.py` and `worker.py`; renaming it is a wider change and was not attempted (§16.2).
 
 ---
 
@@ -740,6 +806,44 @@ layout.
 State lives in one Zustand store (`useChatStore.ts:useChatStore`) holding `projects`,
 `activeProject`, `activeTab`, `isConnected`, `messages`, `ws`, and session metadata.
 
+### 14.1 Message rendering
+
+Assistant text renders as GitHub-flavoured Markdown through
+`components/MarkdownMessage.tsx` (`react-markdown` + `remark-gfm`). The feed previously printed
+`msg.content` into a `<p>` with `whitespace-pre-wrap`, so every `**bold**`, `###`, `---` and
+pipe-delimited table the model emitted appeared as literal punctuation — the model had been writing
+Markdown all along and nothing was reading it. Tables get their own `overflow-x` container so a wide
+table never scrolls the chat column sideways. User messages stay literal; they are whatever was
+typed.
+
+Raw HTML is deliberately **not** enabled (no `rehype-raw`): this text is an LLM summarising
+third-party spreadsheet content, so treating it as markup would be an injection path.
+`react-markdown` escapes HTML by default.
+
+### 14.2 Structured tool results
+
+`components/ToolResultCard.tsx` draws the payloads the read tools already returned (§5.3,
+`sheets/read.py`) but which the UI had been discarding — the chip only ever showed a
+`JSON.stringify` of the *arguments*. It renders under a tool call once `status === "completed"`,
+keyed on the result's own discriminant:
+
+| Result | Form | Why |
+|---|---|---|
+| `summarize` / `count_by_field` | horizontal bar, one hue, direct labels, "Show data" table toggle | magnitude comparison; bar length carries the value, so hue must not vary. Horizontal because category labels run long |
+| `summarize` / `completion_rate` | hero figure + meter + Complete/Remaining/Blank tiles | a single ratio against a limit — deliberately not a two-slice donut |
+| `summarize` / `blank_fields` | stat tiles + affected-ID chips | one headline number, not a one-bar chart |
+| `search_rows` | data table | header is the **union** of keys across rows, since blank columns are omitted per row |
+| `data_quality` | collapsible raw JSON | no bespoke view yet |
+
+Above 12 categories `count_by_field` defaults to the table rather than a wall of stubby bars, and
+axis ticks longer than 24 characters truncate with the full label carried in the hover tooltip.
+
+The bar hue (`#3987e5`) was validated with the data-viz palette validator against the real chat
+surface (`#030014` page + 5% white bubble ≈ `#100d20`): lightness band, chroma floor and ≥ 3:1
+contrast all pass. Status colours were considered for chart marks and rejected — as a set they fail
+all-pairs CVD separation (`#d03b3b` vs `#0ca30c`, ΔE 4.1), which is why they stay reserved for
+icon + label pairings. Re-run that check before substituting a themed accent.
+
 Tab switching is an explicit control frame, not prompt-driven (`chat/page.tsx:handleTabChange`):
 the client sends `{type: "switch_tab", tab_name}` and only applies the new `activeTab` once the
 server confirms with `tab_switched` (§9.1–9.2) — it no longer sets `activeTab` optimistically
@@ -854,6 +958,34 @@ Threading the refresh token through was a deliberate Phase 4 tradeoff — the al
 writes dying whenever the access token expires before the worker gets to them) was worse — but it
 does widen what's exposed here, and a token-reference indirection (store tokens server-side, pass
 the queue only an opaque reference) remains the real fix, not attempted here.
+
+### 16.2 SAP-specific assumptions still remain outside the prompt and tool schemas
+**Severity: medium.** The hard blocks were removed (§7.3, §8.1) but the product goal — running
+against *any* company tracking sheet, not only a WRICEF tracker — is not fully met:
+
+- **Inline column defaults.** `read.py`/`write.py`/`worker.py` still default
+  `primary_id_column` → `"RICEFW ID"`, `status_column` → `"Dev Status"`, `assignee_column` →
+  `"Technical Resource "`, and the `overdue` report defaults `go_live` → `"Go-Live Date"` (§7.1).
+  These only apply when `schema_config` omits the key — which on a non-SAP sheet is exactly when
+  they are wrong, and they fail as "column not found" rather than as a misconfiguration.
+- **`add_row` requires `module` and `type`.** Both are `required` in the tool schema and consumed
+  by `worker.py:process_job`. A sheet with no category or type column cannot satisfy them. Making
+  them optional means touching the write path, so it was left alone.
+- **The `ricefw_id` parameter key** is unchanged across `tool_dispatch.py`, `read.py`, `write.py`
+  and `worker.py`. Cosmetic for the model (its description no longer implies SAP), but it keeps the
+  domain baked into the wire format.
+- **Existing projects are unaffected until re-detected.** These changes alter what
+  `detect_all_tabs` *produces*; a project onboarded earlier still carries its old `schema_config`
+  in Postgres, possibly the hardcoded fallback. Re-running tab detection from `/admin/projects` is
+  the migration path — there is no automatic backfill.
+
+### 16.3 Dependency advisories are outstanding
+**Severity: medium, unverified.** `npm audit` in `frontend/` reports 2 critical and 6 high, all in
+pre-existing dependencies: `@auth/core` / `next-auth` (existence-based auth bypass, and `getToken()`
+raising on a malformed bearer), `next` (middleware/proxy bypass in App Router with Turbopack),
+plus `postcss`, `sharp`, `nanoid`, `js-yaml`, `brace-expansion`. The two auth advisories bear
+directly on §4's token chain. Not triaged against the versions actually in `package-lock.json`, and
+no upgrade attempted — `next-auth` is on a beta pin, so bumping it is not a patch-level change.
 
 ---
 
