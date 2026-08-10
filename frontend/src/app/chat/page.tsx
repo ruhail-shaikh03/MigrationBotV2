@@ -5,6 +5,8 @@ import { useRouter } from "next/navigation"
 import { useEffect, useState, useRef } from "react"
 import { useChatStore, Project, Message } from "@/store/useChatStore"
 import { useWebSocket } from "@/hooks/useWebSocket"
+import MarkdownMessage from "@/components/MarkdownMessage"
+import ToolResultCard from "@/components/ToolResultCard"
 import { 
   Send, Database, Users, History, LogOut, ArrowLeft, 
   Settings, RefreshCw, Circle, CheckCircle2, AlertTriangle, 
@@ -270,9 +272,11 @@ export default function ChatPage() {
               <div className="p-4 bg-indigo-600/10 text-indigo-400 rounded-full border border-indigo-500/20 animate-pulse-slow">
                 <Database className="h-10 w-10" />
               </div>
-              <h3 className="text-lg font-bold text-zinc-200">How can I help you switch or update S/4HANA migrations today?</h3>
+              <h3 className="text-lg font-bold text-zinc-200">What would you like to know about this sheet?</h3>
               <p className="text-sm text-zinc-500 leading-relaxed">
-                You can ask questions like "Show SD tracker overview", "Switch module to MM", "Verify data completeness", or perform updates like "Set Dev Status to Done for RICEFW SD-045".
+                Ask things like &ldquo;break down items by status&rdquo;, &ldquo;how complete is the data?&rdquo;, or
+                &ldquo;show everything assigned to Sara&rdquo; — answers come back as tables and charts. You can
+                also make changes, e.g. &ldquo;set status to Done for SD-045&rdquo;.
               </p>
             </div>
           ) : (
@@ -303,11 +307,17 @@ export default function ChatPage() {
                         isUser ? "chat-bubble-user" : "chat-bubble-agent"
                       }`}
                     >
-                      {/* Message Content */}
-                      <p className="text-[15px] leading-relaxed whitespace-pre-wrap select-text">
-                        {msg.content}
-                      </p>
-                      
+                      {/* Message Content. User text stays literal — it is whatever they
+                          typed. Assistant text is rendered as Markdown, which is the
+                          format it has always been written in. */}
+                      {isUser ? (
+                        <p className="text-[15px] leading-relaxed whitespace-pre-wrap select-text">
+                          {msg.content}
+                        </p>
+                      ) : (
+                        msg.content && <MarkdownMessage content={msg.content} />
+                      )}
+
                       {/* Streaming cursor if empty assistant bubble */}
                       {!isUser && msg.content === "" && (!msg.toolCalls || msg.toolCalls.length === 0) && (
                         <div className="flex space-x-1 items-center h-5">
@@ -320,32 +330,41 @@ export default function ChatPage() {
 
                     {/* Tool Calls Visualizer */}
                     {!isUser && msg.toolCalls && msg.toolCalls.length > 0 && (
-                      <div className="space-y-1.5">
+                      <div className="space-y-2">
                         {msg.toolCalls.map((tool, idx) => (
-                          <div 
-                            key={idx}
-                            className="glass-card px-4 py-2 rounded-xl text-xs flex items-center justify-between border border-white/5"
-                          >
-                            <div className="flex items-center gap-2.5">
-                              {tool.status === "running" ? (
-                                <RefreshCw className="h-3.5 w-3.5 text-amber-400 animate-spin" />
-                              ) : tool.status === "completed" ? (
-                                <CheckCircle2 className="h-3.5 w-3.5 text-emerald-400" />
-                              ) : (
-                                <X className="h-3.5 w-3.5 text-rose-500" />
-                              )}
-                              <span className="font-semibold text-zinc-300">
-                                Tool: {tool.name}
-                              </span>
-                              {tool.args && Object.keys(tool.args).length > 0 && (
-                                <span className="text-zinc-500 font-mono text-[10px]">
-                                  ({JSON.stringify(tool.args)})
+                          <div key={idx} className="space-y-2">
+                            <div className="glass-card px-4 py-2 rounded-xl text-xs flex items-center justify-between border border-white/5">
+                              <div className="flex items-center gap-2.5 min-w-0">
+                                {tool.status === "running" ? (
+                                  <RefreshCw className="h-3.5 w-3.5 shrink-0 text-amber-400 animate-spin" />
+                                ) : tool.status === "completed" ? (
+                                  <CheckCircle2 className="h-3.5 w-3.5 shrink-0 text-emerald-400" />
+                                ) : (
+                                  <X className="h-3.5 w-3.5 shrink-0 text-rose-500" />
+                                )}
+                                <span className="font-semibold text-zinc-300 shrink-0">
+                                  {tool.name}
                                 </span>
-                              )}
+                                {/* Readable summary of the arguments rather than a raw
+                                    JSON.stringify blob spilling across the bubble. */}
+                                {tool.args && Object.keys(tool.args).length > 0 && (
+                                  <span className="text-zinc-500 truncate">
+                                    {Object.entries(tool.args)
+                                      .map(([k, v]) => `${k}: ${typeof v === "object" ? JSON.stringify(v) : String(v)}`)
+                                      .join(" · ")}
+                                  </span>
+                                )}
+                              </div>
+                              <span className="text-zinc-400 text-[10px] uppercase font-bold tracking-wider shrink-0 ml-2">
+                                {tool.status}
+                              </span>
                             </div>
-                            <span className="text-zinc-400 text-[10px] uppercase font-bold tracking-wider">
-                              {tool.status}
-                            </span>
+
+                            {/* Structured view of the result: chart, meter or table
+                                depending on what the tool actually returned. */}
+                            {tool.status === "completed" && (
+                              <ToolResultCard tool={tool.name} result={tool.result} />
+                            )}
                           </div>
                         ))}
                       </div>
