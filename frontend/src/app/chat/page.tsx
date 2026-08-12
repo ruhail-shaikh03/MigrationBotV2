@@ -33,8 +33,8 @@ export default function ChatPage() {
     isConnected, clearChat
   } = useChatStore()
 
-  const apiToken = (session as any)?.apiToken || null
-  const googleToken = (session as any)?.googleAccessToken || null
+  const apiToken = session?.apiToken || null
+  const googleToken = session?.googleAccessToken || null
 
   // Instantiate WebSocket
   const { sendMessage, switchTab } = useWebSocket(apiToken, activeProject?.id || null)

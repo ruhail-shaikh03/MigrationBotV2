@@ -1,4 +1,5 @@
 import NextAuth from "next-auth"
+import type { Session } from "next-auth"
 import Google from "next-auth/providers/google"
 import type { JWT } from "next-auth/jwt"
 import { SignJWT } from "jose"
@@ -30,7 +31,16 @@ function getJwtSecret(): string {
  * Refresh the Google access token using the stored refresh token.
  * Returns the updated token fields, or marks the token with an error on failure.
  */
-async function refreshGoogleAccessToken(token: any) {
+async function refreshGoogleAccessToken(token: JWT): Promise<JWT> {
+  // Typing this parameter (it was `any`) surfaced that googleRefreshToken is
+  // optional. The sole caller guards on it, but nothing made that a requirement —
+  // and without the guard URLSearchParams would have stringified `undefined` and
+  // sent `refresh_token=undefined`, which Google rejects as invalid_grant. That
+  // reads as a revoked grant rather than as a missing token, so fail explicitly.
+  if (!token.googleRefreshToken) {
+    return { ...token, error: "NoRefreshToken" }
+  }
+
   try {
     const response = await fetch("https://oauth2.googleapis.com/token", {
       method: "POST",
@@ -168,7 +178,7 @@ export const { handlers, signIn, signOut, auth } = NextAuth({
       // No refresh token available — can't recover
       return { ...token, error: "NoRefreshToken" }
     },
-    async session({ session, token }: any) {
+    async session({ session, token }: { session: Session; token: JWT }) {
       if (token) {
         session.googleAccessToken = token.googleAccessToken
         session.googleRefreshToken = token.googleRefreshToken
