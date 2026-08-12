@@ -380,10 +380,22 @@ They bridge one way only — a config admin short-circuits to `role="admin"` bef
 
 ### 6.2 Enforcement
 
-Exactly one point: `checker.can_execute(...)` in the agentic loop before every dispatch
-(`agentic_loop.py:run_agentic_loop`). `dispatch_tool` performs no check of its own
-(`tool_dispatch.py:dispatch_tool`). Frontend admin gating is cosmetic (`chat/page.tsx` fetches
-`/api/me`'s `is_admin`).
+Two points, and the second exists only because it cannot route through the first:
+
+1. `checker.can_execute(...)` in the agentic loop before every dispatch
+   (`agentic_loop.py:run_agentic_loop`). `dispatch_tool` performs no check of its own
+   (`tool_dispatch.py:dispatch_tool`).
+2. `checker.can_execute("update_cell", args)` in `dashboard.py:patch_row`, the dashboard's inline
+   reassign (§10.2). A REST route never enters the agentic loop, so without repeating the check it
+   would be an unauthenticated-by-omission write path — a privilege escalation, not a missing
+   feature. The `args` it builds is `{"ricefw_id": ..., "updates": [{"field", "value"}]}`, matching
+   the tool contract exactly, because the field-level gate reads `args["updates"][*]["field"]`: a
+   differently-shaped dict would pass through `can_execute` looking checked while silently allowing
+   every field. `tests/test_core/test_dashboard_rbac.py` asserts against that literal shape for
+   viewer, field-restricted editor, mixed-batch, `denied_operations` and admin-override cases.
+
+Frontend admin gating is cosmetic (`chat/page.tsx` fetches `/api/me`'s `is_admin`), and the
+dashboard route is deliberately not admin-gated at all — its write path is gated server-side.
 
 ```python
 READ_ONLY_TOOLS = {"get_row", "search_rows", "summarize", "switch_module", "data_quality"}
@@ -832,6 +844,26 @@ item counts instead of rendering a zero-day bar, which would assert something fa
 pass `truncated` straight through from the scan: past `_MAX_SCAN_ROWS` the totals are a floor, and
 a dashboard that silently under-reports is worse than one that says it is partial.
 
+### 10.2 Inline reassign
+
+`PATCH /api/projects/{id}/rows/{row_id}` (`dashboard.py:patch_row`), body
+`{tab, updates: [{field, value}]}`. It is the only write path outside the agentic loop.
+
+Order matters and is deliberate: resolve the project (same visibility rule as the reads above) →
+`get_user_permissions` → `can_execute("update_cell", args)` with the exact tool-contract arg shape
+(§6.2) → get-or-create the `(user, project)` `Session` row as `chat.py` does → pre-read the current
+values → `enqueue_write_job`. Everything after the permission check is the existing write path
+unchanged: the same producer, the same Redis queue, the same worker. Throttling at 1 req/sec, audit
+logging and row-cache invalidation therefore apply identically to a dashboard edit and a
+model-issued one, with no second implementation to keep in sync.
+
+A permission failure returns **403 with the checker's own wording**, unlike the reads' 404. The
+caller has already been shown this project and this row, so there is nothing left to conceal, and
+the checker's message names the fields they lack — which is what they need to ask an admin for.
+
+The pre-read is best-effort and wrapped, matching `tool_dispatch.py`: a failure to capture the old
+value degrades the audit diff rather than refusing the edit.
+
 ---
 
 ## 11. Google Sheets Integration
@@ -925,8 +957,14 @@ every exception so an audit failure cannot fail a mutation. Its only caller is t
 | `add_row` | one, `field="ID"` | `worker.py:process_job` (`add_row` branch — ID always server-computed via `meta.py:next_ricefw_id`, `prefix=None`; the schema exposes no `ricefw_id`/`prefix` arg) |
 | exception | one, `field="Mutation"` | `worker.py:process_job` (top-level `except`) |
 
-`old_value` comes from the live pre-read at dispatch time (`tool_dispatch.py:dispatch_tool`).
-Read-only tools produce no audit rows.
+`old_value` comes from the live pre-read at dispatch time (`tool_dispatch.py:dispatch_tool`, and
+`dashboard.py:patch_row` for inline reassign). Read-only tools produce no audit rows.
+
+Dashboard edits need no separate audit handling: `patch_row` enqueues an ordinary `update_cell` job
+(§10.2), so `worker.py:process_job` writes the same one-row-per-field entries, attributed to the
+same `(user, project)` `Session`. An edit made in the grid and one made by asking the model are
+indistinguishable in `audit_logs`, which is the intended property — the audit trail records what
+changed and who changed it, not which surface they used.
 
 `log_audit` (`audit.py:log_audit`), a fire-and-forget `create_task` wrapper, is never called.
 
@@ -1187,6 +1225,26 @@ mirror their spreadsheet.
 
 The entry point in the chat header is deliberately **not** gated on `is_admin` — this is the one
 non-chat surface an ordinary user can reach.
+
+**Inline reassign.** People-cells in the grid are click-to-edit, submitting through
+`PATCH /api/projects/{id}/rows/{row_id}` (§10.2). Editing is offered only when the tab has a
+`primary_id_column`: without a stable row key the only alternative is row position, which reorders
+under sorting and filtering, so the cell stays read-only rather than risk writing to the wrong row.
+The write addresses the **verbatim header**, so the grid keeps a label→header reverse map — the
+table is keyed by display label, and writing `"Technical Resource"` where the sheet says
+`"Technical Resource "` would not resolve.
+
+A queued cell shows its own pending state, since the worker applies at 1 req/sec and an edit that
+rendered instantly would be claiming something that has not happened yet. Resolution has two
+sources, mirroring §14.3: the `queue_update` frame normally clears it, and a `GET /api/jobs/{id}`
+poll after 8 s covers the case where that frame was missed — a reload, a reconnect, a worker
+restart — which previously stranded ledger rows on "queued" forever. That endpoint existed since
+Phase 5 and had no caller until now. A 403 renders the checker's own message in the cell rather
+than a generic failure, because it names the fields the user lacks.
+
+`DataTable` gained an optional `renderCell` prop for this rather than the dashboard growing its own
+table: a second implementation would drift from this one in styling and in the ragged-row padding
+that §10.1 depends on.
 
 Tab switching is an explicit control frame, not prompt-driven (`chat/page.tsx:handleTabChange`):
 the client sends `{type: "switch_tab", tab_name}` and only applies the new `activeTab` once the

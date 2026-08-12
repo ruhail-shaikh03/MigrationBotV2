@@ -43,11 +43,22 @@ interface RowsResponse {
   tab: string
   columns: ColumnDescriptor[]
   people_columns: RoleColumn[]
+  primary_id_column: string | null
   rows: Record<string, string>[]
   total: number
   offset: number
   limit: number
   truncated: boolean
+}
+
+/** An edit that has been queued but not yet confirmed applied by the worker, keyed
+ *  `${rowId}::${header}`. Writes are eventually consistent (the worker applies at
+ *  1 req/sec), so the cell has to show its own pending state or the edit looks lost. */
+interface PendingEdit {
+  jobId: string
+  value: string
+  state: "queued" | "failed"
+  error?: string
 }
 
 interface WorkloadEntry {
@@ -82,6 +93,9 @@ export default function ProjectDashboard() {
   const [analytics, setAnalytics] = useState<AnalyticsResponse | null>(null)
   const [isLoading, setIsLoading] = useState(true)
   const [errorMsg, setErrorMsg] = useState("")
+
+  const [pending, setPending] = useState<Record<string, PendingEdit>>({})
+  const [editing, setEditing] = useState<string | null>(null)
 
   // Filters
   const [q, setQ] = useState("")
@@ -145,10 +159,97 @@ export default function ProjectDashboard() {
   // Reusing the existing queue_update -> CustomEvent bridge means the dashboard reflects
   // an edit made from chat, too.
   useEffect(() => {
-    const onQueueUpdate = () => load()
+    const onQueueUpdate = (event: Event) => {
+      const detail = (event as CustomEvent).detail as
+        | { job_id?: string; status?: string; error?: string }
+        | undefined
+
+      if (detail?.job_id) {
+        setPending((prev) => {
+          const key = Object.keys(prev).find((k) => prev[k].jobId === detail.job_id)
+          if (!key) return prev
+          const next = { ...prev }
+          if (detail.status === "completed") {
+            // Applied: drop the pending marker and let the reload below show the real
+            // cell. Keeping it would leave the UI asserting a value the sheet may have
+            // normalised differently.
+            delete next[key]
+          } else {
+            next[key] = { ...next[key], state: "failed", error: detail.error }
+          }
+          return next
+        })
+      }
+      if (detail?.status === "completed") load()
+    }
     window.addEventListener("queue_update", onQueueUpdate)
     return () => window.removeEventListener("queue_update", onQueueUpdate)
   }, [load])
+
+  // A terminal frame can be missed — a reload, a reconnect, a worker restart — which
+  // would strand a cell on "queued" forever. GET /api/jobs/{id} is the authoritative
+  // fallback for exactly that, and until now nothing in the app called it.
+  useEffect(() => {
+    const stuck = Object.entries(pending).filter(([, p]) => p.state === "queued")
+    if (stuck.length === 0 || !apiToken) return
+
+    const timer = setTimeout(async () => {
+      for (const [key, entry] of stuck) {
+        try {
+          const res = await fetch(`/api/jobs/${entry.jobId}`, { headers: authHeaders })
+          if (!res.ok) continue
+          const job = await res.json()
+          if (job.status === "done") {
+            setPending((prev) => {
+              const next = { ...prev }
+              delete next[key]
+              return next
+            })
+            load()
+          } else if (job.status === "error" || job.status === "dead_letter") {
+            setPending((prev) => ({
+              ...prev,
+              [key]: { ...prev[key], state: "failed", error: job.error },
+            }))
+          }
+        } catch {
+          // Reconciliation is best-effort; the next poll or a manual refresh will catch it.
+        }
+      }
+    }, 8000)
+    return () => clearTimeout(timer)
+  }, [pending, apiToken, authHeaders, load])
+
+  const saveCell = useCallback(
+    async (rowId: string, header: string, value: string) => {
+      const key = `${rowId}::${header}`
+      setEditing(null)
+      try {
+        const res = await fetch(`/api/projects/${projectId}/rows/${encodeURIComponent(rowId)}`, {
+          method: "PATCH",
+          headers: { ...authHeaders, "Content-Type": "application/json" },
+          body: JSON.stringify({ tab: rowsData?.tab, updates: [{ field: header, value }] }),
+        })
+        const body = await res.json().catch(() => ({}))
+        if (!res.ok) {
+          // A 403 here is the RBAC checker refusing the write; show its own wording
+          // rather than a generic failure, since it explains what to ask an admin for.
+          setPending((prev) => ({
+            ...prev,
+            [key]: { jobId: "", value, state: "failed", error: body.detail || `Refused (${res.status}).` },
+          }))
+          return
+        }
+        setPending((prev) => ({ ...prev, [key]: { jobId: body.job_id, value, state: "queued" } }))
+      } catch {
+        setPending((prev) => ({
+          ...prev,
+          [key]: { jobId: "", value, state: "failed", error: "Could not reach the server." },
+        }))
+      }
+    },
+    [projectId, authHeaders, rowsData]
+  )
 
   const peopleColumns = rowsData?.people_columns || analytics?.people_columns || []
   const everyone = useMemo(() => {
@@ -168,6 +269,21 @@ export default function ProjectDashboard() {
     })
     return map
   }, [rowsData])
+
+  // The table is keyed by display label, but a write must address the verbatim header
+  // (trailing spaces and all), so the renderer needs the reverse map.
+  const headerByLabel = useMemo(() => {
+    const map: Record<string, string> = {}
+    ;(rowsData?.columns || []).forEach((c) => {
+      map[c.label || c.header] = c.header
+    })
+    return map
+  }, [rowsData])
+
+  const personHeaders = useMemo(
+    () => new Set((rowsData?.columns || []).filter((c) => c.kind === "person").map((c) => c.header)),
+    [rowsData]
+  )
 
   // Relabel each row's keys to the sheet's display labels so DataTable renders the
   // sheet's own wording without needing to know about column descriptors.
@@ -319,6 +435,56 @@ export default function ProjectDashboard() {
                 <DataTable
                   rows={labelledRows}
                   columns={gridColumns.map((h) => columnLabels[h] || h)}
+                  renderCell={(label, value, rowIndex) => {
+                    const header = headerByLabel[label]
+                    const isPerson = personHeaders.has(header)
+                    const idHeader = rowsData?.primary_id_column
+                    // Editing needs a person column and a way to address the row. Without
+                    // an id column the sheet has no stable row key, so the cell stays
+                    // read-only rather than guessing at row position, which reorders.
+                    if (!isPerson || !idHeader) return undefined
+
+                    const rowId = rowsData?.rows[rowIndex]?.[idHeader]
+                    if (!rowId) return undefined
+
+                    const key = `${rowId}::${header}`
+                    const edit = pending[key]
+                    const cellId = `${key}::cell`
+
+                    if (editing === cellId) {
+                      return (
+                        <input
+                          autoFocus
+                          defaultValue={value}
+                          aria-label={`${label} for ${rowId}`}
+                          onBlur={(e) => saveCell(rowId, header, e.target.value)}
+                          onKeyDown={(e) => {
+                            if (e.key === "Enter") (e.target as HTMLInputElement).blur()
+                            if (e.key === "Escape") setEditing(null)
+                          }}
+                          className="w-full rounded border border-brass-500 bg-ink-950 px-1.5 py-0.5 text-[12.5px] text-ink-100 focus:outline-none"
+                        />
+                      )
+                    }
+
+                    return (
+                      <button
+                        onClick={() => setEditing(cellId)}
+                        title={edit?.error || "Click to reassign"}
+                        className="w-full cursor-pointer text-left hover:text-brass-300"
+                      >
+                        <span className={edit?.state === "failed" ? "text-failed" : undefined}>
+                          {edit ? edit.value : value || <span className="text-ink-600">—</span>}
+                        </span>
+                        {edit?.state === "queued" && (
+                          <span className="status status-queued ml-1.5">queued</span>
+                        )}
+                        {edit?.state === "failed" && (
+                          <span className="status status-failed ml-1.5">failed</span>
+                        )}
+                      </button>
+                    )
+                  }}
                 />
                 {total > PAGE_SIZE && (
                   <div className="flex items-center justify-between text-xs text-ink-500">
