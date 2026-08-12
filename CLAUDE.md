@@ -13,7 +13,7 @@ tool calls against a Sheets-backed dataset.
 |---|---|
 | Frontend | Next.js 16 App Router, React 19, Tailwind v4, Zustand 5, NextAuth v5 |
 | Backend | FastAPI (async), SQLAlchemy 2.0 + asyncpg, Pydantic v2 |
-| Data | PostgreSQL 16 (RBAC, audit, **and a `sheet_records` read cache**) |
+| Data | PostgreSQL 16 (RBAC, audit, projects, sessions) |
 | Queue | Redis 7 (RPUSH/BLPOP FIFO, 1 req/sec throttle) |
 | External | Google Sheets API v4, DeepSeek (`deepseek-chat` / `deepseek-reasoner`) via `AsyncOpenAI` |
 
@@ -67,10 +67,20 @@ row use `search_rows` (AND filters, 3 match types) or `summarize` (count_by_fiel
 completion_rate, blank_fields, overdue). Looping `get_row` is the classic way to blow the
 Sheets quota and stall the agentic loop against its 8-iteration cap.
 
-**Reads come from Postgres, not Sheets.** `read.py:_ensure_sheet_synced()` serves
-`get_row`/`search_rows`/`summarize`/`data_quality` from the `sheet_records` table
-(`models/sheet_record.py`), repopulated by `sheets/sync.py:sync_sheet_to_db()` on miss and
-after writes. If a read looks stale, suspect the cache before the Sheets API.
+**Agent reads hit the Sheets API live.** `get_row`/`search_rows`/`summarize`/`data_quality`
+all scan the spreadsheet through `sheets/read.py:_fetch_all_rows` on every call. There is
+no `sheet_records` table, no `models/sheet_record.py` and no `sheets/sync.py` — earlier
+revisions of this file and of `migrationbot-sheets-testing` described that cache as if it
+existed; it never did. Treat quota as a real constraint on the read path, not something a
+cache absorbs.
+
+**The dashboard endpoints read through a 60-second Redis cache.**
+`sheets/rows_cache.py:get_tab_matrix()` caches one tab's header row plus data rows under
+`migrationbot:rows:{spreadsheet_id}:{tab}`, because a grid re-scans on every sort, filter
+and page. `queue/worker.py` calls `invalidate_tab()` after a successful write, so an edit
+shows up immediately rather than after the TTL. Redis being down degrades to a live scan,
+never an error. If a dashboard read looks stale, suspect this cache; if an *agent* read
+looks stale, it isn't cached at all.
 
 ## Code Style
 
@@ -100,9 +110,9 @@ after writes. If a read looks stale, suspect the cache before the Sheets API.
   `error_kind` and a user-safe `user_message`; `failure_note()` picks the guidance the model sees.
   Returning a bare `{"ok": False, "error": str(e)}` from a new tool regresses this — the model
   will retry outages as if they were bad arguments (TDD §8.2).
-- **Sheets rate limits** hit the write path hardest (worker, 1/sec) and the cache-fill path
-  (`sync_sheet_to_db` scans up to 2000 rows). `_with_retry()` backs off on 429/500/503,
-  max 4 attempts.
+- **Sheets rate limits** hit the write path hardest (worker, 1/sec) and any full-tab scan
+  (`read.py:_fetch_all_rows` pages 2000 rows at a time up to `_MAX_SCAN_ROWS` = 20000).
+  `_with_retry()` backs off on 429/500/503, max 4 attempts.
 - **Default RBAC is fail-closed** (since Phase 4). `get_user_permissions()` returns
   `settings.DEFAULT_ROLE` — `"viewer"` unless a deployment overrides it — for any caller it
   can't place: no `project_id`, no matching user row, or no `permissions` row. It previously
