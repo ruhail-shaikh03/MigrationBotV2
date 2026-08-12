@@ -6,6 +6,7 @@ from app.core.llm_router import select_model
 from app.core.tool_schemas import TOOLS, get_system_prompt, get_system_prompt_compact
 from app.core.permissions import PermissionChecker
 from app.core.tool_dispatch import dispatch_tool
+from app.core.errors import failure_note, PERMISSION
 from app.core.schema import get_available_tabs
 from app.core.column_mapper import get_column_map_json
 
@@ -127,7 +128,12 @@ async def run_agentic_loop(
                 allowed, reason = checker.can_execute(tool_name, tool_args)
                 if not allowed:
                     logger.warning(f"RBAC Blocked tool {tool_name} for user {checker.email}: {reason}")
-                    tool_result = {"ok": False, "error": f"Permission denied: {reason}"}
+                    tool_result = {
+                        "ok": False,
+                        "error": f"Permission denied: {reason}",
+                        "error_kind": PERMISSION,
+                        "user_message": f"You don't have permission to do that: {reason}",
+                    }
                     await send_websocket_msg({
                         "type": "error",
                         "message": f"Permission denied: {reason}"
@@ -155,14 +161,14 @@ async def run_agentic_loop(
                     "result": tool_result
                 })
 
-                # Format tool response content; inject auto-recovery prompt if tool call failed
+                # Format tool response content; on failure, append guidance chosen for
+                # that failure's class. Previously every failure — outage, permission
+                # denial, bad column alike — got the same "formulate a corrected tool
+                # call" note, so the model retried things that could never succeed and
+                # described infrastructure faults to the user as rejected edits.
                 content_str = json.dumps(tool_result, ensure_ascii=False)
                 if not tool_result.get("ok"):
-                    err_detail = tool_result.get("error", "Unknown error")
-                    content_str += (
-                        f"\n[System Recovery Note]: Tool '{tool_name}' failed with error: '{err_detail}'. "
-                        "If this was due to column alias or RICEFW ID mismatch, formulate a corrected tool call."
-                    )
+                    content_str += failure_note(tool_name, tool_result)
                 elif tool_result.get("status") == "queued":
                     # Reinforced here, not just in the system prompt: from iteration 1 onward
                     # the system message is swapped for the compact variant (see below), which

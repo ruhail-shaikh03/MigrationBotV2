@@ -15,6 +15,7 @@ from app.sheets.client import build_sheets_service
 from app.sheets.write import update_cell, bulk_update, add_row
 from app.sheets.format import format_row
 from app.core.audit import _write_audit_record
+from app.core.errors import error_result
 from app.core.schema import get_tab_schema
 
 # Configure logging format
@@ -320,7 +321,10 @@ async def process_job(job_id: str, payload_dict: dict) -> None:
     except Exception as e:
         logger.error(f"Failed to execute mutation {tool} on sheet: {e}")
         result_ok = False
-        error_msg = str(e)
+        # The audit row below keeps the raw exception; what travels back to the
+        # user's toast is the classified message, since "You can't write against a
+        # read only replica" reads to them as a problem with their spreadsheet.
+        error_msg = error_result(e, tool)["user_message"]
         await _write_audit_record(
             user_email=payload.user_email,
             session_id=payload.session_id,

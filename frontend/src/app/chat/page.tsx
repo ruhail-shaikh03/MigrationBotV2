@@ -114,7 +114,15 @@ export default function ChatPage() {
       if (jobStatus === "completed") {
         addToast(`✅ Background write completed: ${tool} succeeded for ${targetId}!`, "success")
       } else if (jobStatus === "failed") {
-        addToast(`❌ Background write failed: ${tool} for ${targetId} encountered an error.`, "error")
+        // Surface the reason. The backend classifies failures (core/errors.py) and
+        // sends a message written for the user, so this is safe to show verbatim;
+        // dropping it — as this handler used to — left "encountered an error" as
+        // the only signal, indistinguishable between an outage and a bad edit.
+        const reason = typeof data.error === "string" && data.error.trim() ? data.error.trim() : ""
+        addToast(
+          `❌ Write failed: ${tool} for ${targetId}.${reason ? ` ${reason}` : ""}`,
+          "error"
+        )
       } else {
         addToast(`⏳ Queue Update: Write job for ${targetId} is ${jobStatus}.`, "info")
       }
