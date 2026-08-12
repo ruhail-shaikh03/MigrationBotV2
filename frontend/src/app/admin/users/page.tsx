@@ -171,14 +171,14 @@ export default function AdminUsers() {
   }
 
   return (
-    <div className="space-y-8 animate-slide-up">
+    <div className="space-y-8 animate-rise">
       {/* Header bar */}
       <div className="flex items-center justify-between">
         <div>
-          <h2 className="text-3xl font-extrabold tracking-tight bg-clip-text text-transparent bg-gradient-to-r from-zinc-50 to-indigo-200">
+          <h2 className="display-md">
             User Security & RBAC Policies
           </h2>
-          <p className="text-sm text-zinc-500 mt-1">
+          <p className="text-sm text-ink-500 mt-1">
             Map project scopes, roles, and allowed/denied columns rules for spreadsheet editors.
           </p>
         </div>
@@ -186,7 +186,7 @@ export default function AdminUsers() {
         <button
           onClick={handleOpenCreateModal}
           disabled={projects.length === 0}
-          className="flex items-center gap-2 bg-indigo-600 hover:bg-indigo-500 text-white font-semibold py-2.5 px-5 rounded-xl text-xs tracking-wider uppercase transition cursor-pointer shadow-lg disabled:opacity-50 disabled:cursor-not-allowed"
+          className="btn btn-primary"
         >
           <Plus className="h-4.5 w-4.5" />
           <span>Add Permissions Mapping</span>
@@ -194,7 +194,7 @@ export default function AdminUsers() {
       </div>
 
       {errorMsg && (
-        <div className="p-4 bg-rose-500/10 border border-rose-500/20 text-rose-400 text-sm rounded-xl flex items-center gap-3">
+        <div className="p-4 bg-[color-mix(in_srgb,var(--color-failed)_10%,transparent)] border border-[color-mix(in_srgb,var(--color-failed)_25%,transparent)] text-failed text-sm rounded-xl flex items-center gap-3">
           <AlertTriangle className="h-5 w-5" />
           <span>{errorMsg}</span>
         </div>
@@ -203,60 +203,60 @@ export default function AdminUsers() {
       {/* Permissions List Table */}
       {isLoading ? (
         <div className="flex justify-center h-48 items-center">
-          <div className="animate-spin rounded-full h-8 w-8 border-t-2 border-indigo-500"></div>
+          <div className="animate-spin rounded-full h-8 w-8 border-t-2 border-brass-500"></div>
         </div>
       ) : permissions.length === 0 ? (
-        <div className="glass-panel p-12 text-center text-zinc-500 rounded-2xl border border-white/5">
+        <div className="panel p-12 text-center text-ink-500 rounded-xl border border-[var(--color-rule)]">
           No user permissions mapped. {projects.length === 0 ? "Create a project first." : 'Click "Add Permissions Mapping" to add.'}
         </div>
       ) : (
-        <div className="glass-panel rounded-2xl border border-white/5 overflow-hidden">
+        <div className="panel rounded-xl border border-[var(--color-rule)] overflow-hidden">
           <div className="overflow-x-auto">
             {/* See projects/page.tsx: min-w is required for the wrapper to scroll. */}
             <table className="w-full min-w-[900px] text-left border-collapse">
               <thead>
-                <tr className="border-b border-white/5 bg-white/[0.02]">
-                  <th className="whitespace-nowrap p-4 text-xs font-bold uppercase tracking-wider text-zinc-400">User Email</th>
-                  <th className="whitespace-nowrap p-4 text-xs font-bold uppercase tracking-wider text-zinc-400">Project Context</th>
-                  <th className="whitespace-nowrap p-4 text-xs font-bold uppercase tracking-wider text-zinc-400">Role</th>
-                  <th className="whitespace-nowrap p-4 text-xs font-bold uppercase tracking-wider text-zinc-400">Allowed Fields</th>
-                  <th className="whitespace-nowrap p-4 text-xs font-bold uppercase tracking-wider text-zinc-400">Denied Ops</th>
-                  <th className="whitespace-nowrap p-4 text-right text-xs font-bold uppercase tracking-wider text-zinc-400">Actions</th>
+                <tr className="border-b border-[var(--color-rule)] bg-ink-850">
+                  <th className="label-micro whitespace-nowrap p-4">User Email</th>
+                  <th className="label-micro whitespace-nowrap p-4">Project Context</th>
+                  <th className="label-micro whitespace-nowrap p-4">Role</th>
+                  <th className="label-micro whitespace-nowrap p-4">Allowed Fields</th>
+                  <th className="label-micro whitespace-nowrap p-4">Denied Ops</th>
+                  <th className="label-micro whitespace-nowrap p-4 text-right">Actions</th>
                 </tr>
               </thead>
-              <tbody className="divide-y divide-white/5">
+              <tbody className="divide-y divide-[var(--color-rule)]">
                 {permissions.map((p) => (
-                  <tr key={p.id} className="hover:bg-white/[0.01] transition">
-                    <td className="p-4 text-sm font-bold text-zinc-200">{p.user_email}</td>
-                    <td className="p-4 text-sm text-zinc-400 font-semibold">{p.project_name}</td>
+                  <tr key={p.id} className="hover:bg-ink-850 transition">
+                    <td className="p-4 text-sm font-bold text-ink-200">{p.user_email}</td>
+                    <td className="p-4 text-sm text-ink-400 font-semibold">{p.project_name}</td>
                     <td className="p-4 text-xs uppercase font-extrabold tracking-wide">
                       <span className={`px-2.5 py-0.5 rounded-full ${
                         p.role === "admin" 
-                          ? "bg-rose-500/10 border border-rose-500/20 text-rose-400"
+                          ? "bg-[color-mix(in_srgb,var(--color-failed)_10%,transparent)] border border-[color-mix(in_srgb,var(--color-failed)_25%,transparent)] text-failed"
                           : p.role === "editor"
-                          ? "bg-indigo-500/10 border border-indigo-500/20 text-indigo-400"
-                          : "bg-zinc-500/10 border border-white/5 text-zinc-400"
+                          ? "bg-brass-400/10 border border-brass-500/20 text-brass-400"
+                          : "bg-zinc-500/10 border border-[var(--color-rule)] text-ink-400"
                       }`}>
                         {p.role}
                       </span>
                     </td>
-                    <td className="p-4 text-xs text-zinc-500 font-mono truncate max-w-[200px]" title={p.allowed_fields.join(", ")}>
+                    <td className="p-4 text-xs text-ink-500 font-mono truncate max-w-[200px]" title={p.allowed_fields.join(", ")}>
                       {p.allowed_fields.join(", ")}
                     </td>
-                    <td className="p-4 text-xs text-zinc-500 font-mono truncate max-w-[200px]" title={p.denied_operations.join(", ")}>
+                    <td className="p-4 text-xs text-ink-500 font-mono truncate max-w-[200px]" title={p.denied_operations.join(", ")}>
                       {p.denied_operations.length === 0 ? "none" : p.denied_operations.join(", ")}
                     </td>
                     <td className="p-4 text-right flex items-center justify-end gap-2.5">
                       <button
                         onClick={() => handleOpenEditModal(p)}
-                        className="p-2 rounded-lg text-indigo-400 bg-indigo-500/10 hover:bg-indigo-500/20 transition cursor-pointer"
+                        className="btn btn-ghost px-2 py-2"
                         title="Edit Permissions"
                       >
                         <Edit2 className="h-4 w-4" />
                       </button>
                       <button
                         onClick={() => handleDelete(p.id)}
-                        className="p-2 rounded-lg text-rose-400 bg-rose-500/10 hover:bg-rose-500/20 transition cursor-pointer"
+                        className="p-2 rounded-lg text-failed bg-[color-mix(in_srgb,var(--color-failed)_10%,transparent)] hover:bg-rose-500/20 transition cursor-pointer"
                         title="Remove Mapping"
                       >
                         <Trash2 className="h-4 w-4" />
@@ -275,14 +275,14 @@ export default function AdminUsers() {
         open={isModalOpen}
         onClose={() => setIsModalOpen(false)}
         title={editingPerm ? "Edit User Permissions Policy" : "New User Permission Mapping"}
-        icon={<ShieldCheck className="h-5 w-5 shrink-0 text-indigo-400" />}
+        icon={<ShieldCheck className="h-5 w-5 shrink-0 text-brass-400" />}
         description="Scoped to one user and one project. Roles gate which tools run; allowed fields gate which columns they can write."
         footer={
           <div className="flex items-center justify-end gap-3">
             <button
               type="button"
               onClick={() => setIsModalOpen(false)}
-              className="cursor-pointer rounded-xl border border-white/10 px-5 py-2.5 text-xs font-semibold uppercase tracking-wider text-zinc-400 transition hover:text-zinc-200"
+              className="btn btn-secondary"
             >
               Cancel
             </button>
@@ -291,7 +291,7 @@ export default function AdminUsers() {
             <button
               type="submit"
               form="permission-form"
-              className="cursor-pointer rounded-xl bg-indigo-600 px-5 py-2.5 text-xs font-semibold uppercase tracking-wider text-white shadow-lg transition hover:bg-indigo-500"
+              className="btn btn-primary"
             >
               Save Configuration
             </button>
@@ -300,27 +300,27 @@ export default function AdminUsers() {
       >
             <form id="permission-form" onSubmit={handleSave} className="space-y-5">
               <div className="space-y-1.5">
-                <label className="text-xs font-semibold uppercase text-zinc-400">User Email Address</label>
+                <label className="label-micro">User Email Address</label>
                 <input
                   type="email"
                   required
                   disabled={!!editingPerm}
                   value={userEmail}
                   onChange={(e) => setUserEmail(e.target.value)}
-                  className="w-full bg-[#120e2e] border border-white/10 rounded-xl px-4 py-2.5 text-sm text-zinc-100 placeholder-zinc-500 focus:outline-none focus:border-indigo-500 disabled:opacity-50"
+                  className="field"
                   placeholder="e.g. consult@company.com"
                 />
               </div>
 
               <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                 <div className="space-y-1.5">
-                  <label className="text-xs font-semibold uppercase text-zinc-400">Project Boundary</label>
+                  <label className="label-micro">Project Boundary</label>
                   <select
                     required
                     disabled={!!editingPerm}
                     value={projectId}
                     onChange={(e) => setProjectId(Number(e.target.value))}
-                    className="w-full bg-[#120e2e] border border-white/10 rounded-xl px-4 py-2.5 text-sm text-zinc-200 focus:outline-none focus:border-indigo-500 cursor-pointer disabled:opacity-50"
+                    className="field cursor-pointer"
                   >
                     {projects.map((proj) => (
                       <option key={proj.id} value={proj.id}>
@@ -331,12 +331,12 @@ export default function AdminUsers() {
                 </div>
 
                 <div className="space-y-1.5">
-                  <label className="text-xs font-semibold uppercase text-zinc-400">Role Assigned</label>
+                  <label className="label-micro">Role Assigned</label>
                   <select
                     required
                     value={role}
                     onChange={(e) => setRole(e.target.value)}
-                    className="w-full bg-[#120e2e] border border-white/10 rounded-xl px-4 py-2.5 text-sm text-zinc-200 focus:outline-none focus:border-indigo-500 cursor-pointer"
+                    className="field cursor-pointer"
                   >
                     <option value="viewer">Viewer (Read-only)</option>
                     <option value="editor">Editor (Queue cell updates)</option>
@@ -346,28 +346,28 @@ export default function AdminUsers() {
               </div>
 
               <div className="space-y-1.5">
-                <label className="text-xs font-semibold uppercase text-zinc-400">Allowed Columns Fields (Comma Separated)</label>
+                <label className="label-micro">Allowed Columns Fields (Comma Separated)</label>
                 <input
                   type="text"
                   required
                   value={allowedFieldsStr}
                   onChange={(e) => setAllowedFieldsStr(e.target.value)}
-                  className="w-full bg-[#120e2e] border border-white/10 rounded-xl px-4 py-2.5 text-sm text-zinc-100 focus:outline-none focus:border-indigo-500 font-mono text-indigo-300"
+                  className="field field-mono"
                   placeholder="e.g. *, Dev Status, Comments"
                 />
-                <span className="text-[10px] text-zinc-500 block">Use '*' to allow editing of all sheet columns.</span>
+                <span className="text-[10px] text-ink-500 block">Use '*' to allow editing of all sheet columns.</span>
               </div>
 
               <div className="space-y-1.5">
-                <label className="text-xs font-semibold uppercase text-zinc-400">Denied Operations (Comma Separated)</label>
+                <label className="label-micro">Denied Operations (Comma Separated)</label>
                 <input
                   type="text"
                   value={deniedOpsStr}
                   onChange={(e) => setDeniedOpsStr(e.target.value)}
-                  className="w-full bg-[#120e2e] border border-white/10 rounded-xl px-4 py-2.5 text-sm text-zinc-100 focus:outline-none focus:border-indigo-500 font-mono text-rose-300"
+                  className="field field-mono"
                   placeholder="e.g. format_row, add_row"
                 />
-                <span className="text-[10px] text-zinc-500 block">List tools to forbid (e.g. format_row, add_row, bulk_update).</span>
+                <span className="text-[10px] text-ink-500 block">List tools to forbid (e.g. format_row, add_row, bulk_update).</span>
               </div>
             </form>
       </Modal>

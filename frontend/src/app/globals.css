@@ -1,55 +1,92 @@
 @import "tailwindcss";
 
+/* ==========================================================================
+   MigrationBot — "Ledger"
+
+   The palette comes from ledger paper and ink rather than from the usual
+   near-black-plus-neon: the ground is a desaturated green-grey, which reads as
+   paper stock rather than as a void, and the one accent is brass. Everything
+   else is a status colour, and status colours are a semantic system here — they
+   map to the four states a write can actually be in (queued, applied, failed,
+   denied) and are never used decoratively.
+
+   Glassmorphism was removed deliberately. Backdrop blur under a dense table
+   costs real legibility, and it dates the product to about 2021.
+   ========================================================================== */
+
 @theme {
-  --color-brand-primary: #6366f1; /* Indigo */
-  --color-brand-secondary: #06b6d4; /* Cyan */
-  --color-brand-accent: #a855f7; /* Purple */
-  --color-bg-dark: #030014; /* Deep Space Black */
-  --color-bg-card: #0b0726; /* Dark Indigo Card */
+  /* Ground → foreground. Green-grey cast; compare #030014, which was purple. */
+  --color-ink-950: #0a0e0d;
+  --color-ink-900: #111817;
+  --color-ink-850: #151d1c;
+  --color-ink-800: #18211f;
+  --color-ink-700: #222d2b;
+  --color-ink-600: #46534f;
+  /* Bumped from #5c6b68, which measured ~3.6:1 on the ground — under AA for the
+     13px secondary text it carries (old values, IDs, timestamps). Now ~4.9:1. */
+  --color-ink-500: #778582;
+  --color-ink-400: #9aa8a5;
+  --color-ink-300: #b3c0bd;
+  --color-ink-200: #d5dedc;
+  --color-ink-100: #eef3f1;
+
+  /* The single interactive accent. */
+  --color-brass-600: #a97a1f;
+  --color-brass-500: #c99230;
+  --color-brass-400: #e0a33e;
+  --color-brass-300: #edbc68;
+
+  /* Status. Semantic only — see note above. */
+  --color-applied: #63c18b;
+  --color-queued: #7fa8d9;
+  --color-failed: #e2687a;
+  --color-denied: #8a9996;
+
+  --color-rule: rgba(255, 255, 255, 0.07);
+  --color-rule-strong: rgba(255, 255, 255, 0.13);
+
+  --font-sans: var(--font-plex-sans), ui-sans-serif, system-ui, sans-serif;
+  --font-mono: var(--font-plex-mono), ui-monospace, SFMono-Regular, monospace;
+
+  /* Tightened from the previous rounded-2xl everywhere. An instrument should
+     look machined, not pillowy. */
+  --radius-sm: 4px;
+  --radius-md: 6px;
+  --radius-lg: 10px;
+  --radius-xl: 14px;
 }
 
 :root {
-  --background: #030014;
-  --foreground: #f4f4f5;
-  --card: #0b0726;
-  --card-foreground: #f4f4f5;
-  --primary: #6366f1;
-  --primary-foreground: #ffffff;
-  --secondary: #161233;
-  --secondary-foreground: #f4f4f5;
-  --muted: #161233;
-  --muted-foreground: #a1a1aa;
-  --accent: #a855f7;
-  --accent-foreground: #ffffff;
-  --destructive: #ef4444;
-  --destructive-foreground: #ffffff;
-  --border: rgba(255, 255, 255, 0.08);
-  --input: rgba(255, 255, 255, 0.06);
-  --ring: #6366f1;
+  --ring: var(--color-brass-400);
 }
 
 body {
-  background-color: var(--background);
-  color: var(--foreground);
-  font-feature-settings: "cv02", "cv03", "cv04", "cv11";
+  background-color: var(--color-ink-950);
+  color: var(--color-ink-100);
   overflow-x: hidden;
-  /* Reserve the scrollbar's width even when nothing is scrolling, so opening a
-     dialog (which locks body scroll) doesn't shift the whole page sideways. */
+  /* Reserve the scrollbar's width even when nothing scrolls, so opening a
+     dialog (which locks body scroll) doesn't shift the page sideways. */
   scrollbar-gutter: stable;
 }
 
-/* Keyboard focus was invisible everywhere: almost every control sets
-   `focus:outline-none` for the custom border treatment, but nothing replaced the
-   ring, so tabbing through a form showed no indication of position at all. This
-   restores it globally for keyboard users without putting a ring on mouse clicks. */
+/* Numbers in a tracker are read in columns and compared down the column, so
+   they line up by default. Opt out with .proportional-nums where a number sits
+   inline in a sentence. */
+body,
+table,
+input,
+button {
+  font-variant-numeric: tabular-nums;
+}
+
+/* Keyboard focus was invisible throughout: nearly every control sets
+   focus:outline-none for a custom border and nothing replaced the ring. */
 :focus-visible {
   outline: 2px solid var(--ring);
   outline-offset: 2px;
-  border-radius: 0.5rem;
+  border-radius: var(--radius-sm);
 }
 
-/* Respect the OS "reduce motion" setting. The blob/ping/pulse animations here run
-   indefinitely, which is exactly the category that triggers vestibular symptoms. */
 @media (prefers-reduced-motion: reduce) {
   *,
   *::before,
@@ -61,65 +98,298 @@ body {
   }
 }
 
-/* Glassmorphism Utility Panels */
-.glass-panel {
-  background: rgba(11, 7, 38, 0.4);
-  backdrop-filter: blur(16px);
-  -webkit-backdrop-filter: blur(16px);
-  border: 1px solid rgba(255, 255, 255, 0.06);
+/* --------------------------------------------------------------------------
+   Surfaces
+   -------------------------------------------------------------------------- */
+
+.panel {
+  background-color: var(--color-ink-900);
+  border: 1px solid var(--color-rule);
 }
 
-.glass-card {
-  background: rgba(22, 18, 51, 0.3);
-  backdrop-filter: blur(12px);
-  -webkit-backdrop-filter: blur(12px);
-  border: 1px solid rgba(255, 255, 255, 0.04);
+.card {
+  background-color: var(--color-ink-850);
+  border: 1px solid var(--color-rule);
 }
 
-/* Chat bubble styling */
-.chat-bubble-user {
-  background: linear-gradient(135deg, #6366f1 0%, #a855f7 100%);
-  color: #ffffff;
-  border-radius: 18px 18px 2px 18px;
+/* Insets — used for wells that hold data rather than chrome. */
+.well {
+  background-color: var(--color-ink-950);
+  border: 1px solid var(--color-rule);
 }
 
-.chat-bubble-agent {
-  background: rgba(255, 255, 255, 0.05);
-  border: 1px solid rgba(255, 255, 255, 0.08);
-  color: #f4f4f5;
-  border-radius: 18px 18px 18px 2px;
+/* --------------------------------------------------------------------------
+   Type roles
+
+   .label-micro is the instrument-panel voice: mono, uppercase, wide tracking.
+   It marks every field label and section eyebrow, which is what gives the
+   admin screens their consistency.
+   -------------------------------------------------------------------------- */
+
+.label-micro {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 500;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--color-ink-400);
 }
 
-/* Custom scrollbars */
+.display-lg {
+  font-size: clamp(2.25rem, 6vw, 3.75rem);
+  font-weight: 600;
+  letter-spacing: -0.035em;
+  line-height: 1.02;
+  color: var(--color-ink-100);
+}
+
+.display-md {
+  font-size: clamp(1.5rem, 3vw, 1.875rem);
+  font-weight: 600;
+  letter-spacing: -0.025em;
+  line-height: 1.15;
+  color: var(--color-ink-100);
+}
+
+/* --------------------------------------------------------------------------
+   The signature: a coordinate stamp.
+
+   Every fact the app states about a sheet is stamped with where it came from —
+   `SD!B7`. This is the product's own coordinate system, so unlike decorative
+   01/02/03 numbering it carries information the reader actually needs: which
+   tab, which cell, which column.
+   -------------------------------------------------------------------------- */
+
+.stamp {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 500;
+  line-height: 1;
+  padding: 0.25rem 0.4rem;
+  border-radius: var(--radius-sm);
+  background-color: var(--color-ink-800);
+  border: 1px solid var(--color-rule);
+  color: var(--color-brass-300);
+  white-space: nowrap;
+}
+
+.stamp-muted {
+  color: var(--color-ink-400);
+}
+
+/* --------------------------------------------------------------------------
+   Controls
+   -------------------------------------------------------------------------- */
+
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.5rem;
+  padding: 0.55rem 0.9rem;
+  border-radius: var(--radius-md);
+  font-size: 13px;
+  font-weight: 500;
+  line-height: 1;
+  white-space: nowrap;
+  cursor: pointer;
+  transition: background-color 0.15s ease, border-color 0.15s ease, color 0.15s ease;
+  border: 1px solid transparent;
+}
+
+/* Desaturate as well as fade. Opacity alone left the brass button still reading
+   as the brightest thing on screen, so a disabled primary looked clickable. */
+.btn:disabled {
+  opacity: 0.4;
+  filter: grayscale(0.8);
+  cursor: not-allowed;
+}
+
+.btn-primary {
+  background-color: var(--color-brass-400);
+  color: #1a1200;
+  font-weight: 600;
+}
+.btn-primary:hover:not(:disabled) {
+  background-color: var(--color-brass-300);
+}
+
+/* For the sign-in CTA. Google's mark is multicolour and clashes on brass, and
+   keeping brass exclusively for the coordinate stamp makes the signature land
+   harder — the accent means one thing throughout the product. */
+.btn-invert {
+  background-color: var(--color-ink-100);
+  color: var(--color-ink-950);
+  font-weight: 600;
+}
+.btn-invert:hover:not(:disabled) {
+  background-color: #ffffff;
+}
+
+.btn-secondary {
+  background-color: var(--color-ink-800);
+  border-color: var(--color-rule-strong);
+  color: var(--color-ink-200);
+}
+.btn-secondary:hover:not(:disabled) {
+  background-color: var(--color-ink-700);
+  color: var(--color-ink-100);
+}
+
+.btn-ghost {
+  background-color: transparent;
+  color: var(--color-ink-400);
+}
+.btn-ghost:hover:not(:disabled) {
+  background-color: var(--color-ink-800);
+  color: var(--color-ink-200);
+}
+
+.btn-danger {
+  background-color: transparent;
+  border-color: color-mix(in srgb, var(--color-failed) 35%, transparent);
+  color: var(--color-failed);
+}
+.btn-danger:hover:not(:disabled) {
+  background-color: color-mix(in srgb, var(--color-failed) 12%, transparent);
+}
+
+.field {
+  width: 100%;
+  background-color: var(--color-ink-950);
+  border: 1px solid var(--color-rule-strong);
+  border-radius: var(--radius-md);
+  padding: 0.55rem 0.75rem;
+  font-size: 13px;
+  color: var(--color-ink-100);
+  transition: border-color 0.15s ease;
+}
+
+.field::placeholder {
+  color: var(--color-ink-500);
+}
+
+.field:focus {
+  outline: none;
+  border-color: var(--color-brass-500);
+}
+
+.field:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.field-mono {
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+}
+
+/* --------------------------------------------------------------------------
+   Status
+
+   One class per real state. Anything that reports the outcome of a write —
+   ledger line, toast, audit row, tool chip — uses these and nothing else, so
+   the same colour always means the same thing.
+   -------------------------------------------------------------------------- */
+
+.status {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.375rem;
+  padding: 0.2rem 0.45rem;
+  border-radius: var(--radius-sm);
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  font-weight: 500;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  border: 1px solid transparent;
+}
+
+.status::before {
+  content: "";
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background-color: currentColor;
+  flex-shrink: 0;
+}
+
+.status-applied {
+  color: var(--color-applied);
+  background-color: color-mix(in srgb, var(--color-applied) 10%, transparent);
+  border-color: color-mix(in srgb, var(--color-applied) 25%, transparent);
+}
+
+.status-queued {
+  color: var(--color-queued);
+  background-color: color-mix(in srgb, var(--color-queued) 10%, transparent);
+  border-color: color-mix(in srgb, var(--color-queued) 25%, transparent);
+}
+
+.status-failed {
+  color: var(--color-failed);
+  background-color: color-mix(in srgb, var(--color-failed) 10%, transparent);
+  border-color: color-mix(in srgb, var(--color-failed) 25%, transparent);
+}
+
+.status-denied {
+  color: var(--color-denied);
+  background-color: color-mix(in srgb, var(--color-denied) 10%, transparent);
+  border-color: color-mix(in srgb, var(--color-denied) 25%, transparent);
+}
+
+/* --------------------------------------------------------------------------
+   Chat bubbles
+   -------------------------------------------------------------------------- */
+
+.bubble-user {
+  background-color: var(--color-ink-800);
+  border: 1px solid var(--color-rule-strong);
+  border-radius: var(--radius-lg) var(--radius-lg) var(--radius-sm) var(--radius-lg);
+  color: var(--color-ink-100);
+}
+
+.bubble-agent {
+  background-color: transparent;
+  border: none;
+  padding-left: 0;
+  color: var(--color-ink-100);
+}
+
+/* --------------------------------------------------------------------------
+   Scrollbars
+   -------------------------------------------------------------------------- */
+
 ::-webkit-scrollbar {
-  width: 6px;
-  height: 6px;
+  width: 10px;
+  height: 10px;
 }
 ::-webkit-scrollbar-track {
   background: transparent;
 }
 ::-webkit-scrollbar-thumb {
-  background: rgba(255, 255, 255, 0.1);
-  border-radius: 4px;
+  background: var(--color-ink-700);
+  border-radius: 6px;
+  border: 3px solid transparent;
+  background-clip: content-box;
 }
 ::-webkit-scrollbar-thumb:hover {
-  background: rgba(255, 255, 255, 0.2);
+  background: var(--color-ink-600);
+  background-clip: content-box;
 }
 
-/* Animation utilities */
-@keyframes pulse-slow {
-  0%, 100% { opacity: 0.3; }
-  50% { opacity: 0.7; }
-}
+/* --------------------------------------------------------------------------
+   Motion — restrained on purpose. One entrance, no ambient loops.
+   -------------------------------------------------------------------------- */
 
-.animate-pulse-slow {
-  animation: pulse-slow 4s cubic-bezier(0.4, 0, 0.6, 1) infinite;
-}
-
-@keyframes slide-up {
+@keyframes rise {
   from {
     opacity: 0;
-    transform: translateY(8px);
+    transform: translateY(4px);
   }
   to {
     opacity: 1;
@@ -127,30 +397,21 @@ body {
   }
 }
 
-.animate-slide-up {
-  animation: slide-up 0.3s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+.animate-rise {
+  animation: rise 0.22s cubic-bezier(0.16, 1, 0.3, 1) both;
 }
 
-@keyframes blob {
-  0%, 100% {
-    transform: translate(0px, 0px) scale(1);
+@keyframes ledger-pulse {
+  0%,
+  100% {
+    opacity: 1;
   }
-  33% {
-    transform: translate(30px, -50px) scale(1.1);
-  }
-  66% {
-    transform: translate(-20px, 20px) scale(0.95);
+  50% {
+    opacity: 0.45;
   }
 }
 
-.animate-blob {
-  animation: blob 7s infinite;
-}
-
-.animation-delay-2000 {
-  animation-delay: 2s;
-}
-
-.animation-delay-4000 {
-  animation-delay: 4s;
+/* Only for genuinely in-flight state — a queued write. Nothing ambient. */
+.animate-inflight {
+  animation: ledger-pulse 1.6s ease-in-out infinite;
 }

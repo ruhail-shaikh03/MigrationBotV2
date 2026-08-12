@@ -90,53 +90,53 @@ export default function AdminAudit() {
   }
 
   return (
-    <div className="space-y-8 animate-slide-up">
+    <div className="space-y-8 animate-rise">
       {/* Header bar */}
       <div>
-        <h2 className="text-3xl font-extrabold tracking-tight bg-clip-text text-transparent bg-gradient-to-r from-zinc-50 to-indigo-200">
+        <h2 className="display-md">
           Security Audits & History Log
         </h2>
-        <p className="text-sm text-zinc-500 mt-1">
+        <p className="text-sm text-ink-500 mt-1">
           Review historical changes, enqueued writes, read queries, and RBAC errors in real time.
         </p>
       </div>
 
       {/* Filter and Search Bar */}
-      <form onSubmit={handleSearchSubmit} className="glass-panel p-5 rounded-2xl border border-white/5 space-y-4">
+      <form onSubmit={handleSearchSubmit} className="panel p-5 rounded-xl border border-[var(--color-rule)] space-y-4">
         <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
           <div className="space-y-1.5 relative">
-            <label className="text-[10px] font-bold uppercase tracking-wider text-zinc-400">Filter User Email</label>
+            <label className="label-micro">Filter User Email</label>
             <div className="relative">
-              <Search className="absolute left-3.5 top-1/2 -translate-y-1/2 h-4 w-4 text-zinc-500" />
+              <Search className="absolute left-3.5 top-1/2 -translate-y-1/2 h-4 w-4 text-ink-500" />
               <input
                 type="text"
                 value={userEmail}
                 onChange={(e) => setUserEmail(e.target.value)}
                 placeholder="search email address..."
-                className="w-full bg-[#120e2e]/50 border border-white/10 rounded-xl pl-10 pr-4 py-2 text-xs text-zinc-200 placeholder-zinc-500 focus:outline-none"
+                className="field pl-9"
               />
             </div>
           </div>
 
           <div className="space-y-1.5">
-            <label className="text-[10px] font-bold uppercase tracking-wider text-zinc-400">Filter Tool Name</label>
+            <label className="label-micro">Filter Tool Name</label>
             <input
               type="text"
               value={toolName}
               onChange={(e) => setToolName(e.target.value)}
               placeholder="e.g. update_cell, bulk_update"
-              className="w-full bg-[#120e2e]/50 border border-white/10 rounded-xl px-4 py-2 text-xs text-zinc-200 placeholder-zinc-500 focus:outline-none"
+              className="field"
             />
           </div>
 
           <div className="space-y-1.5">
-            <label className="text-[10px] font-bold uppercase tracking-wider text-zinc-400">Filter RICEFW ID</label>
+            <label className="label-micro">Filter RICEFW ID</label>
             <input
               type="text"
               value={ricefwId}
               onChange={(e) => setRicefwId(e.target.value)}
               placeholder="e.g. SD-045"
-              className="w-full bg-[#120e2e]/50 border border-white/10 rounded-xl px-4 py-2 text-xs text-zinc-200 placeholder-zinc-500 focus:outline-none"
+              className="field"
             />
           </div>
         </div>
@@ -145,13 +145,13 @@ export default function AdminAudit() {
           <button
             type="button"
             onClick={handleReset}
-            className="flex items-center gap-1.5 px-4 py-2 rounded-xl border border-white/10 text-zinc-400 hover:text-zinc-200 text-xs font-semibold uppercase transition cursor-pointer"
+            className="btn btn-secondary"
           >
             Reset Filters
           </button>
           <button
             type="submit"
-            className="flex items-center gap-1.5 px-4 py-2 bg-indigo-600 hover:bg-indigo-500 text-white rounded-xl text-xs font-semibold uppercase transition cursor-pointer shadow-lg"
+            className="btn btn-primary"
           >
             <Filter className="h-3.5 w-3.5" />
             Apply Filters
@@ -162,65 +162,65 @@ export default function AdminAudit() {
       {/* Audits Table list */}
       {isLoading ? (
         <div className="flex justify-center h-48 items-center">
-          <div className="animate-spin rounded-full h-8 w-8 border-t-2 border-indigo-500"></div>
+          <div className="animate-spin rounded-full h-8 w-8 border-t-2 border-brass-500"></div>
         </div>
       ) : audits.length === 0 ? (
-        <div className="glass-panel p-12 text-center text-zinc-500 rounded-2xl border border-white/5">
+        <div className="panel p-12 text-center text-ink-500 rounded-xl border border-[var(--color-rule)]">
           No audit entries found matching the filter options.
         </div>
       ) : (
-        <div className="glass-panel rounded-2xl border border-white/5 overflow-hidden">
+        <div className="panel rounded-xl border border-[var(--color-rule)] overflow-hidden">
           <div className="overflow-x-auto">
             {/* Seven columns including an old→new diff; needs the most room. */}
             <table className="w-full min-w-[1080px] text-left border-collapse">
               <thead>
-                <tr className="border-b border-white/5 bg-white/[0.02]">
-                  <th className="whitespace-nowrap p-4 text-xs font-bold uppercase tracking-wider text-zinc-400">Timestamp</th>
-                  <th className="whitespace-nowrap p-4 text-xs font-bold uppercase tracking-wider text-zinc-400">User</th>
-                  <th className="whitespace-nowrap p-4 text-xs font-bold uppercase tracking-wider text-zinc-400">Tool Executed</th>
-                  <th className="whitespace-nowrap p-4 text-xs font-bold uppercase tracking-wider text-zinc-400">Tab / RICEFW ID</th>
-                  <th className="whitespace-nowrap p-4 text-xs font-bold uppercase tracking-wider text-zinc-400">Field Targeted</th>
-                  <th className="whitespace-nowrap p-4 text-xs font-bold uppercase tracking-wider text-zinc-400">Changes (Old → New)</th>
-                  <th className="whitespace-nowrap p-4 text-xs font-bold uppercase tracking-wider text-zinc-400">Result</th>
+                <tr className="border-b border-[var(--color-rule)] bg-ink-850">
+                  <th className="label-micro whitespace-nowrap p-4">Timestamp</th>
+                  <th className="label-micro whitespace-nowrap p-4">User</th>
+                  <th className="label-micro whitespace-nowrap p-4">Tool Executed</th>
+                  <th className="label-micro whitespace-nowrap p-4">Tab / RICEFW ID</th>
+                  <th className="label-micro whitespace-nowrap p-4">Field Targeted</th>
+                  <th className="label-micro whitespace-nowrap p-4">Changes (Old → New)</th>
+                  <th className="label-micro whitespace-nowrap p-4">Result</th>
                 </tr>
               </thead>
-              <tbody className="divide-y divide-white/5 text-xs">
+              <tbody className="divide-y divide-[var(--color-rule)] text-xs">
                 {audits.map((a) => (
-                  <tr key={a.id} className="hover:bg-white/[0.01] transition">
-                    <td className="p-4 text-zinc-500 font-mono">
+                  <tr key={a.id} className="hover:bg-ink-850 transition">
+                    <td className="p-4 text-ink-500 font-mono">
                       {new Date(a.timestamp).toLocaleString(undefined, { 
                         month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', second: '2-digit' 
                       })}
                     </td>
-                    <td className="p-4 font-semibold text-zinc-300">{a.user_email}</td>
+                    <td className="p-4 font-semibold text-ink-300">{a.user_email}</td>
                     <td className="p-4">
-                      <span className="px-2 py-0.5 rounded bg-white/5 border border-white/5 text-[11px] font-mono text-indigo-300">
+                      <span className="px-2 py-0.5 rounded bg-ink-800 border border-[var(--color-rule)] text-[11px] font-mono text-brass-300">
                         {a.tool_name}
                       </span>
                     </td>
-                    <td className="p-4 text-zinc-300 font-semibold">
-                      {a.sheet_tab} {a.ricefw_id && <span className="text-zinc-500 font-mono">({a.ricefw_id})</span>}
+                    <td className="p-4 text-ink-300 font-semibold">
+                      {a.sheet_tab} {a.ricefw_id && <span className="text-ink-500 font-mono">({a.ricefw_id})</span>}
                     </td>
-                    <td className="p-4 text-zinc-400 font-mono">{a.field || "-"}</td>
+                    <td className="p-4 text-ink-400 font-mono">{a.field || "-"}</td>
                     <td className="p-4 font-mono max-w-[200px] truncate" title={`${a.old_value} → ${a.new_value}`}>
                       {a.old_value !== null || a.new_value !== null ? (
                         <>
-                          <span className="text-rose-400">{String(a.old_value || "blank")}</span>
-                          <span className="text-zinc-500 mx-1">→</span>
-                          <span className="text-emerald-400">{String(a.new_value || "blank")}</span>
+                          <span className="text-failed">{String(a.old_value || "blank")}</span>
+                          <span className="text-ink-500 mx-1">→</span>
+                          <span className="text-applied">{String(a.new_value || "blank")}</span>
                         </>
                       ) : (
-                        <span className="text-zinc-500">read operation</span>
+                        <span className="text-ink-500">read operation</span>
                       )}
                     </td>
                     <td className="p-4">
                       {a.result_ok ? (
-                        <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full bg-emerald-500/10 border border-emerald-500/20 text-emerald-400 font-semibold text-[10px]">
+                        <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full bg-[color-mix(in_srgb,var(--color-applied)_10%,transparent)] border border-[color-mix(in_srgb,var(--color-applied)_25%,transparent)] text-applied font-semibold text-[10px]">
                           <CheckCircle className="h-3 w-3" />
                           OK
                         </span>
                       ) : (
-                        <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full bg-rose-500/10 border border-rose-500/20 text-rose-400 font-semibold text-[10px]" title={a.error || "error details missing"}>
+                        <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full bg-[color-mix(in_srgb,var(--color-failed)_10%,transparent)] border border-[color-mix(in_srgb,var(--color-failed)_25%,transparent)] text-failed font-semibold text-[10px]" title={a.error || "error details missing"}>
                           <AlertCircle className="h-3 w-3" />
                           ERROR
                         </span>

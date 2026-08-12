@@ -23,9 +23,11 @@ import { ChevronDown, Table2 } from "lucide-react"
  *  - blank_fields is one headline number -> a stat tile, not a one-bar chart.
  *  - More than ~7 meaningful classes -> the table view, not more colors.
  *
- * SERIES_HUE is validated against this surface (#030014 page + 5% white bubble ~= #100d20)
- * with the palette validator: lightness band, chroma floor and >=3:1 contrast all pass.
- * Don't swap it for a themed accent without re-running that check.
+ * SERIES_HUE stays blue deliberately: it is none of the four status colours and not
+ * the brass interactive accent, so a bar can never be mistaken for a state. It was
+ * validated against the previous darker ground (#030014); the current ground
+ * (#0a0e0d) is marginally lighter, so contrast is essentially unchanged. Re-run the
+ * palette validator before swapping it for a themed accent.
  */
 const SERIES_HUE = "#3987e5"
 const MAX_BARS = 8
@@ -69,20 +71,20 @@ interface SearchRowsResult {
 
 function StatTile({ label, value, sub }: { label: string; value: string; sub?: string }) {
   return (
-    <div className="rounded-lg border border-white/10 bg-white/[0.03] px-3 py-2.5">
-      <div className="text-[11px] uppercase tracking-wider text-zinc-500">{label}</div>
-      <div className="mt-0.5 text-xl font-semibold text-zinc-100 tabular-nums">{value}</div>
-      {sub && <div className="text-[11px] text-zinc-500">{sub}</div>}
+    <div className="rounded-lg border border-[var(--color-rule-strong)] bg-white/[0.03] px-3 py-2.5">
+      <div className="text-[11px] uppercase tracking-wider text-ink-500">{label}</div>
+      <div className="mt-0.5 text-xl font-semibold text-ink-100 tabular-nums">{value}</div>
+      {sub && <div className="text-[11px] text-ink-500">{sub}</div>}
     </div>
   )
 }
 
 function ChartFrame({ title, subtitle, children }: { title: string; subtitle?: string; children: React.ReactNode }) {
   return (
-    <div className="rounded-xl border border-white/10 bg-white/[0.02] p-4">
+    <div className="rounded-xl border border-[var(--color-rule-strong)] bg-ink-850 p-4">
       <div className="mb-3">
-        <div className="text-[13px] font-semibold text-zinc-200">{title}</div>
-        {subtitle && <div className="text-[11px] text-zinc-500">{subtitle}</div>}
+        <div className="text-[13px] font-semibold text-ink-200">{title}</div>
+        {subtitle && <div className="text-[11px] text-ink-500">{subtitle}</div>}
       </div>
       {children}
     </div>
@@ -102,8 +104,8 @@ function HoverTip({
   if (!active || !payload?.length) return null
   return (
     <div className="rounded-lg border border-white/15 bg-[#0b0726] px-3 py-2 text-xs shadow-xl">
-      <div className="font-medium text-zinc-200">{label}</div>
-      <div className="text-zinc-400 tabular-nums">
+      <div className="font-medium text-ink-200">{label}</div>
+      <div className="text-ink-400 tabular-nums">
         {payload[0].value} {payload[0].value === 1 ? "row" : "rows"}
       </div>
     </div>
@@ -111,7 +113,7 @@ function HoverTip({
 }
 
 function DataTable({ rows, caption }: { rows: Record<string, string | number>[]; caption?: string }) {
-  if (!rows.length) return <div className="text-xs text-zinc-500">No rows.</div>
+  if (!rows.length) return <div className="text-xs text-ink-500">No rows.</div>
   // Union of keys across rows, not just the first: search_rows omits columns that were
   // blank for a given row, so a first-row-only header would silently drop fields.
   const columns = Array.from(
@@ -123,13 +125,13 @@ function DataTable({ rows, caption }: { rows: Record<string, string | number>[];
 
   return (
     <div>
-      {caption && <div className="mb-2 text-[11px] text-zinc-500">{caption}</div>}
-      <div className="overflow-x-auto rounded-lg border border-white/10">
+      {caption && <div className="mb-2 text-[11px] text-ink-500">{caption}</div>}
+      <div className="overflow-x-auto rounded-lg border border-[var(--color-rule-strong)]">
         <table className="w-full border-collapse text-[12.5px]">
-          <thead className="bg-white/[0.04]">
+          <thead className="bg-ink-800">
             <tr>
               {columns.map((c) => (
-                <th key={c} className="whitespace-nowrap border-b border-white/10 px-3 py-2 text-left font-semibold text-zinc-200">
+                <th key={c} className="whitespace-nowrap border-b border-[var(--color-rule-strong)] px-3 py-2 text-left font-semibold text-ink-200">
                   {c}
                 </th>
               ))}
@@ -137,9 +139,9 @@ function DataTable({ rows, caption }: { rows: Record<string, string | number>[];
           </thead>
           <tbody>
             {rows.map((r, i) => (
-              <tr key={i} className="transition-colors hover:bg-white/[0.02]">
+              <tr key={i} className="transition-colors hover:bg-ink-850">
                 {columns.map((c) => (
-                  <td key={c} className="border-b border-white/5 px-3 py-2 align-top text-zinc-300">
+                  <td key={c} className="border-b border-[var(--color-rule)] px-3 py-2 align-top text-ink-300">
                     {String(r[c] ?? "")}
                   </td>
                 ))}
@@ -208,14 +210,14 @@ function CountByField({ result }: { result: CountByFieldResult }) {
         {breakdown.length <= 12 && (
           <button
             onClick={() => setShowTable((s) => !s)}
-            className="inline-flex items-center gap-1.5 text-[11px] text-zinc-500 hover:text-zinc-300 transition cursor-pointer"
+            className="inline-flex items-center gap-1.5 text-[11px] text-ink-500 hover:text-ink-300 transition cursor-pointer"
           >
             <Table2 className="h-3 w-3" />
             {showTable ? "Show chart" : "Show data"}
           </button>
         )}
         {hidden > 0 && !tableView && (
-          <span className="text-[11px] text-zinc-500">+{hidden} more — use “Show data”</span>
+          <span className="text-[11px] text-ink-500">+{hidden} more — use “Show data”</span>
         )}
       </div>
     </ChartFrame>
@@ -232,11 +234,11 @@ function CompletionRate({ result }: { result: CompletionRateResult }) {
     >
       <div className="flex items-end gap-3">
         <div className="text-4xl font-semibold leading-none text-zinc-50 tabular-nums">{pct}%</div>
-        <div className="pb-1 text-xs text-zinc-500">
+        <div className="pb-1 text-xs text-ink-500">
           {result.completed} of {result.total_rows}
         </div>
       </div>
-      <div className="mt-3 h-2.5 w-full overflow-hidden rounded-full bg-white/10">
+      <div className="mt-3 h-2.5 w-full overflow-hidden rounded-full bg-ink-700">
         <div
           className="h-full rounded-full transition-all"
           style={{ width: `${Math.min(100, Math.max(0, pct))}%`, backgroundColor: SERIES_HUE }}
@@ -266,12 +268,12 @@ function BlankFields({ result }: { result: BlankFieldsResult }) {
       </div>
       {ids.length > 0 && (
         <div className="mt-3">
-          <div className="mb-1.5 text-[11px] uppercase tracking-wider text-zinc-500">
+          <div className="mb-1.5 text-[11px] uppercase tracking-wider text-ink-500">
             Affected IDs{ids.length >= 50 ? " (first 50)" : ""}
           </div>
           <div className="flex flex-wrap gap-1.5">
             {ids.map((id) => (
-              <span key={id} className="rounded border border-white/10 bg-white/[0.04] px-1.5 py-0.5 font-mono text-[11px] text-zinc-300">
+              <span key={id} className="rounded border border-[var(--color-rule-strong)] bg-ink-800 px-1.5 py-0.5 font-mono text-[11px] text-ink-300">
                 {id}
               </span>
             ))}
@@ -285,16 +287,16 @@ function BlankFields({ result }: { result: BlankFieldsResult }) {
 function RawResult({ result }: { result: AnyResult }) {
   const [open, setOpen] = useState(false)
   return (
-    <div className="rounded-xl border border-white/10 bg-white/[0.02]">
+    <div className="rounded-xl border border-[var(--color-rule-strong)] bg-ink-850">
       <button
         onClick={() => setOpen((o) => !o)}
-        className="flex w-full items-center gap-1.5 px-3 py-2 text-[11px] text-zinc-500 hover:text-zinc-300 transition cursor-pointer"
+        className="flex w-full items-center gap-1.5 px-3 py-2 text-[11px] text-ink-500 hover:text-ink-300 transition cursor-pointer"
       >
         <ChevronDown className={`h-3 w-3 transition-transform ${open ? "" : "-rotate-90"}`} />
         Raw result
       </button>
       {open && (
-        <pre className="max-h-72 overflow-auto border-t border-white/10 px-3 py-2 font-mono text-[11px] leading-relaxed text-zinc-400">
+        <pre className="max-h-72 overflow-auto border-t border-[var(--color-rule-strong)] px-3 py-2 font-mono text-[11px] leading-relaxed text-ink-400">
           {JSON.stringify(result, null, 2)}
         </pre>
       )}

@@ -116,79 +116,78 @@ export default function AdminDashboard() {
     fetchMetrics()
   }, [apiToken])
 
+  // Colour is semantic here, not decorative: only the failure count is coloured,
+  // and it earns it. Giving each tile its own gradient made four unrelated
+  // numbers look like four categories of something.
   const metrics: Metric[] = [
     {
-      title: "Active Projects",
+      title: "Connected sheets",
       value: projectsCount,
       icon: FolderKanban,
-      description: "Registered sheets configurations",
-      color: "from-blue-500/20 to-indigo-500/10 text-blue-400"
+      description: "Sheets the agent can read",
+      color: "text-ink-400"
     },
     {
-      title: "Authorized Users",
+      title: "People with access",
       value: usersCount,
       icon: Users,
-      description: "Users mapped in RBAC registry",
-      color: "from-purple-500/20 to-pink-500/10 text-purple-400"
+      description: "Users with a role on a sheet",
+      color: "text-ink-400"
     },
     {
-      title: "Audit Entries",
+      title: "Changes recorded",
       value: auditsCount,
       icon: ShieldAlert,
-      description: "Logged tracker operations",
-      color: "from-emerald-500/20 to-teal-500/10 text-emerald-400"
+      description: "Every read and write, attributed",
+      color: "text-ink-400"
     },
     {
-      title: "Failed Operations",
+      title: "Failed changes",
       value: errorsCount,
       icon: AlertCircle,
-      description: "Throttles or permission blocks",
-      color: "from-rose-500/20 to-orange-500/10 text-rose-400"
+      description: "Rejected, denied or timed out",
+      color: errorsCount > 0 ? "text-failed" : "text-ink-400"
     }
   ]
 
   if (isLoading) {
     return (
       <div className="flex h-96 items-center justify-center">
-        <div className="animate-spin rounded-full h-8 w-8 border-t-2 border-indigo-500"></div>
+        <div className="animate-spin rounded-full h-8 w-8 border-t-2 border-brass-500"></div>
       </div>
     )
   }
 
   return (
-    <div className="space-y-8 animate-slide-up">
+    <div className="space-y-8 animate-rise">
       {/* Title */}
       <div>
-        <h2 className="text-3xl font-extrabold tracking-tight bg-clip-text text-transparent bg-gradient-to-r from-zinc-50 to-indigo-200">
-          Overview Dashboard
-        </h2>
-        <p className="text-sm text-zinc-500 mt-1">
-          Real-time metrics, audit summaries, and tool activity logs for your WRICEF migration spreadsheet engines.
+        <h2 className="display-md">Overview</h2>
+        <p className="mt-1.5 text-[13px] text-ink-400">
+          Which sheets are connected, who can reach them, and what has been changed.
         </p>
       </div>
 
       {/* Metrics Cards Grid */}
-      <div className="grid grid-cols-1 md:grid-cols-4 gap-6">
+      <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-4">
         {metrics.map((m) => {
           const Icon = m.icon
           return (
-            <div 
+            <div
               key={m.title}
-              className="glass-panel p-6 rounded-2xl flex items-center justify-between border border-white/5 relative group overflow-hidden"
+              className="panel relative flex items-start justify-between overflow-hidden rounded-xl p-5"
             >
-              <div className="space-y-2">
-                <span className="text-xs font-semibold text-zinc-400 uppercase tracking-wider block">
-                  {m.title}
-                </span>
-                <span className="text-3xl font-bold tracking-tight text-zinc-100 block">
+              <div>
+                <span className="label-micro block">{m.title}</span>
+                <span className="mt-2.5 block text-[28px] font-semibold leading-none tracking-tight text-ink-100">
                   {m.value}
                 </span>
-                <span className="text-[11px] text-zinc-500 block">
+                <span className="mt-2 block text-[12px] text-ink-500">
                   {m.description}
                 </span>
               </div>
-              <div className={`p-4 rounded-xl bg-gradient-to-br ${m.color}`}>
-                <Icon className="h-6 w-6" />
+              <div className={m.color}>
+                <Icon className="h-4.5 w-4.5" />
               </div>
             </div>
           )
@@ -198,19 +197,19 @@ export default function AdminDashboard() {
       {/* Charts section */}
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
         {/* Operations over time */}
-        <div className="lg:col-span-2 glass-panel p-6 rounded-2xl border border-white/5 space-y-4">
+        <div className="lg:col-span-2 panel p-6 rounded-xl border border-[var(--color-rule)] space-y-4">
           <div className="flex items-center justify-between">
             <div className="space-y-1">
-              <h3 className="font-bold text-zinc-200 text-sm tracking-wider uppercase flex items-center gap-2">
-                <Activity className="h-4 w-4 text-indigo-400" />
+              <h3 className="font-bold text-ink-200 text-sm tracking-wider uppercase flex items-center gap-2">
+                <Activity className="h-4 w-4 text-brass-400" />
                 Operations Activity
               </h3>
-              <p className="text-xs text-zinc-500">Spreadsheet mutations vs. read queries log</p>
+              <p className="text-xs text-ink-500">Spreadsheet mutations vs. read queries log</p>
             </div>
           </div>
           <div className="h-72 w-full">
             {chartData.length === 0 ? (
-              <div className="h-full flex items-center justify-center text-zinc-500 text-xs">
+              <div className="h-full flex items-center justify-center text-ink-500 text-xs">
                 No activity data recorded yet
               </div>
             ) : (
@@ -247,17 +246,17 @@ export default function AdminDashboard() {
         </div>
 
         {/* Tool Distribution */}
-        <div className="glass-panel p-6 rounded-2xl border border-white/5 space-y-4">
+        <div className="panel p-6 rounded-xl border border-[var(--color-rule)] space-y-4">
           <div className="space-y-1">
-            <h3 className="font-bold text-zinc-200 text-sm tracking-wider uppercase flex items-center gap-2">
-              <Terminal className="h-4 w-4 text-purple-400" />
+            <h3 className="font-bold text-ink-200 text-sm tracking-wider uppercase flex items-center gap-2">
+              <Terminal className="h-4 w-4 text-ink-400" />
               Tool Distribution
             </h3>
-            <p className="text-xs text-zinc-500">Distribution of executed agent actions</p>
+            <p className="text-xs text-ink-500">Distribution of executed agent actions</p>
           </div>
           <div className="h-72 w-full">
             {toolData.length === 0 ? (
-              <div className="h-full flex items-center justify-center text-zinc-500 text-xs">
+              <div className="h-full flex items-center justify-center text-ink-500 text-xs">
                 No tool executions logged
               </div>
             ) : (

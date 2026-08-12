@@ -137,7 +137,7 @@ export default function Modal({
   return (
     // Scroll lives here, on the overlay — see the note at the top of this file.
     <div
-      className="fixed inset-0 z-50 overflow-y-auto overscroll-contain bg-black/70 backdrop-blur-sm"
+      className="fixed inset-0 z-50 overflow-y-auto overscroll-contain bg-ink-950/85 backdrop-blur-[2px]"
       // mousedown, not click: a click that STARTS inside the panel and ends on the
       // overlay (drag-selecting text in a field) would otherwise close the dialog.
       onMouseDown={(e) => {
@@ -151,20 +151,20 @@ export default function Modal({
           aria-modal="true"
           aria-labelledby={titleId}
           tabIndex={-1}
-          className={`glass-panel relative flex w-full ${SIZE_CLASS[size]} max-h-[calc(100dvh-2rem)] flex-col overflow-hidden rounded-2xl border border-white/10 shadow-2xl outline-none sm:max-h-[calc(100dvh-3rem)]`}
+          className={`panel relative flex w-full ${SIZE_CLASS[size]} max-h-[calc(100dvh-2rem)] flex-col overflow-hidden rounded-xl shadow-2xl outline-none sm:max-h-[calc(100dvh-3rem)]`}
         >
           {/* Title bar — fixed, never scrolls away. `pr-12` reserves room for the
               close button so a long title can't run underneath it. */}
-          <div className="shrink-0 border-b border-white/5 px-6 py-5 pr-12 sm:px-8">
+          <div className="shrink-0 border-b border-[var(--color-rule)] px-6 py-5 pr-12 sm:px-8">
             <h3
               id={titleId}
-              className="flex items-center gap-2 text-lg font-bold text-zinc-100"
+              className="flex items-center gap-2 text-lg font-bold text-ink-100"
             >
               {icon}
               <span className="min-w-0">{title}</span>
             </h3>
             {description && (
-              <p className="mt-1 text-xs leading-relaxed text-zinc-500">{description}</p>
+              <p className="mt-1 text-xs leading-relaxed text-ink-500">{description}</p>
             )}
           </div>
 
@@ -172,7 +172,7 @@ export default function Modal({
             type="button"
             onClick={onClose}
             aria-label="Close dialog"
-            className="absolute right-5 top-5 rounded-lg p-1.5 text-zinc-400 transition hover:bg-white/5 hover:text-zinc-200 sm:right-6"
+            className="absolute right-5 top-5 rounded-lg p-1.5 text-ink-400 transition hover:bg-ink-800 hover:text-ink-200 sm:right-6"
           >
             <X className="h-5 w-5" />
           </button>
@@ -183,7 +183,7 @@ export default function Modal({
           <div className="min-h-0 flex-1 overflow-y-auto px-6 py-5 sm:px-8">{children}</div>
 
           {footer && (
-            <div className="shrink-0 border-t border-white/5 bg-black/20 px-6 py-4 sm:px-8">
+            <div className="shrink-0 border-t border-[var(--color-rule)] bg-black/20 px-6 py-4 sm:px-8">
               {footer}
             </div>
           )}

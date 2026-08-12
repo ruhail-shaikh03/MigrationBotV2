@@ -853,6 +853,39 @@ layout.
 State lives in one Zustand store (`useChatStore.ts:useChatStore`) holding `projects`,
 `activeProject`, `activeTab`, `isConnected`, `messages`, `ws`, and session metadata.
 
+### 14.0 Design system — "Ledger"
+
+Defined entirely in `app/globals.css` (Tailwind v4 `@theme` tokens plus a small set of component
+classes) and `app/layout.tsx` (fonts). It replaced a look that read as a template — near-black
+ground, indigo→purple gradient headings, animated blur blobs, glassmorphism — and that contradicted
+the product, since the page metadata still described an "SAP S/4HANA WRICEF Assistant" long after
+§7.3 made schema detection generic.
+
+- **Ground** is a green-grey ink (`--color-ink-950: #0a0e0d` … `--color-ink-100`), derived from
+  ledger paper rather than from a void. `ink-500` sits at ~4.9:1 on the ground; it was `#5c6b68`
+  (~3.6:1), which was under AA for the 13px secondary text it carries.
+- **`--color-brass-400` is the only interactive accent.** The sign-in CTA is deliberately *not*
+  brass (`.btn-invert`): Google's mark is multicolour and clashed on it, and reserving brass for
+  the coordinate stamp makes the accent mean one thing product-wide.
+- **Status is a semantic four-state system** — `--color-queued` / `applied` / `failed` / `denied`,
+  surfaced as `.status.status-*`. These map to the states a write can be in (§5.1–5.2) and are used
+  wherever an outcome is reported and nowhere else. The admin metric tiles previously carried four
+  decorative gradients, which made four unrelated counts look like four categories of one thing;
+  only a non-zero failure count is coloured now.
+- **Type** is IBM Plex Sans + Plex Mono (`layout.tsx`), chosen over Inter/Geist because Plex was
+  drawn for enterprise data tooling and its tabular figures suit a product that is mostly numbers in
+  columns — `font-variant-numeric: tabular-nums` is on globally. `.label-micro` (mono, uppercase,
+  wide tracking) is the field-label and eyebrow voice throughout.
+- **`.stamp` is the signature.** Every fact stated about a sheet is marked with where it came from
+  in the sheet's own A1 vocabulary (`SD!B7`, a row ID, a tab). Unlike decorative `01/02/03`
+  numbering it carries information the reader needs, and it reuses the coordinate system the
+  backend already speaks (§7.1).
+- Glassmorphism was removed rather than restyled: `backdrop-filter` under a dense table costs real
+  legibility. `.panel` / `.card` / `.well` are flat layered surfaces with hairline `--color-rule`
+  borders. `:focus-visible` now paints a ring — almost every control sets `focus:outline-none` for
+  a custom border and nothing had replaced it, so keyboard focus was invisible — and
+  `prefers-reduced-motion` is honoured.
+
 ### 14.1 Message rendering
 
 Assistant text renders as GitHub-flavoured Markdown through
@@ -885,11 +918,31 @@ keyed on the result's own discriminant:
 Above 12 categories `count_by_field` defaults to the table rather than a wall of stubby bars, and
 axis ticks longer than 24 characters truncate with the full label carried in the hover tooltip.
 
-The bar hue (`#3987e5`) was validated with the data-viz palette validator against the real chat
-surface (`#030014` page + 5% white bubble ≈ `#100d20`): lightness band, chroma floor and ≥ 3:1
-contrast all pass. Status colours were considered for chart marks and rejected — as a set they fail
-all-pairs CVD separation (`#d03b3b` vs `#0ca30c`, ΔE 4.1), which is why they stay reserved for
-icon + label pairings. Re-run that check before substituting a themed accent.
+The bar hue (`#3987e5`) was validated with the data-viz palette validator against the *previous*
+chat surface (`#030014` page + 5% white bubble ≈ `#100d20`): lightness band, chroma floor and ≥ 3:1
+contrast all passed. The §14.0 ground (`#0a0e0d`) is marginally lighter, so contrast is essentially
+unchanged and the hue was kept — it is also none of the four status colours and not the brass
+accent, so a bar can never be mistaken for a state. Status colours were considered for chart marks
+and rejected: as a set they fail all-pairs CVD separation, which is why they stay reserved for
+icon + label pairings. Re-run the validator before substituting a themed accent.
+
+### 14.3 The write ledger
+
+`components/WriteLedger.tsx`, docked directly above the composer. It replaces the transient toast
+that used to announce `queue_update` frames (§9.2).
+
+A toast was the wrong primitive for this write path. Writes are eventually consistent — the model
+enqueues, `queue/worker.py` applies at 1 req/sec, and the outcome arrives seconds later over the
+socket (§5.1, steps 23–24) — but the toast expired after five seconds and took the only record of
+the change with it, so anyone who looked away could not tell whether their edit had landed. Worse,
+the handler discarded `data.error` entirely, leaving "encountered an error" as the only signal.
+
+Each write is now a ledger line, keyed on `job_id` and upserted as frames arrive, so a job
+transitions `queued → applied`/`failed` **in place** rather than emitting two unrelated toasts. The
+line is stamped with its tab and row ID (§14.0), shows `field → value` where the tool reported
+them, and renders the classified `user_message` from `core/errors.py` (§8.2) inline on failure.
+Entries persist for the session until dismissed. The listener reads the active tab through a ref so
+the subscription is not torn down and re-established on every tab change.
 
 Tab switching is an explicit control frame, not prompt-driven (`chat/page.tsx:handleTabChange`):
 the client sends `{type: "switch_tab", tab_name}` and only applies the new `activeTab` once the

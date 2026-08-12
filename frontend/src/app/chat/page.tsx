@@ -7,28 +7,21 @@ import { useChatStore, Project, Message } from "@/store/useChatStore"
 import { useWebSocket } from "@/hooks/useWebSocket"
 import MarkdownMessage from "@/components/MarkdownMessage"
 import ToolResultCard from "@/components/ToolResultCard"
-import { 
-  Send, Database, Users, History, LogOut, ArrowLeft, 
-  Settings, RefreshCw, Circle, CheckCircle2, AlertTriangle, 
-  Layers, Play, Check, X, Bell
+import WriteLedger, { LedgerEntry, LedgerState } from "@/components/WriteLedger"
+import {
+  Send, Database, LogOut, Settings, RefreshCw, CheckCircle2, AlertTriangle, X
 } from "lucide-react"
-
-interface Toast {
-  id: string
-  message: string
-  type: "success" | "info" | "error"
-}
 
 export default function ChatPage() {
   const { data: session, status } = useSession()
   const router = useRouter()
-  
+
   // Local UI States
   const [input, setInput] = useState("")
-  const [toasts, setToasts] = useState<Toast[]>([])
+  const [ledger, setLedger] = useState<LedgerEntry[]>([])
   const [isAdminState, setIsAdminState] = useState(false)
   const messagesEndRef = useRef<HTMLDivElement | null>(null)
-  
+
   // Zustand Store
   const { 
     projects, setProjects,
@@ -43,6 +36,13 @@ export default function ChatPage() {
 
   // Instantiate WebSocket
   const { sendMessage, switchTab } = useWebSocket(apiToken, activeProject?.id || null)
+
+  // The queue_update listener is mounted once and must not re-subscribe on every
+  // tab change, so it reads the active tab through a ref rather than closing over it.
+  const activeTabRef = useRef(activeTab)
+  useEffect(() => {
+    activeTabRef.current = activeTab
+  }, [activeTab])
 
   // Fetch user profile to check admin status dynamically
   useEffect(() => {
@@ -101,31 +101,39 @@ export default function ChatPage() {
     scrollToBottom()
   }, [messages])
 
-  // Listen to background queue writes notifications
+  // Background write outcomes feed the ledger, which keeps them until the user
+  // clears them. A toast was wrong for an eventually-consistent write path: it
+  // expired after five seconds and took the only record of the change with it.
   useEffect(() => {
     const handleQueueUpdate = (e: Event) => {
       const data = (e as CustomEvent).detail
-      const job_id = data.job_id
-      const jobStatus = data.status // queued, processing, completed, failed
-      const tool = data.tool_name
       const args = data.args || {}
-      const targetId = args.ricefw_id || "Item"
+      const firstUpdate = Array.isArray(args.updates) ? args.updates[0] : undefined
 
-      if (jobStatus === "completed") {
-        addToast(`✅ Background write completed: ${tool} succeeded for ${targetId}!`, "success")
-      } else if (jobStatus === "failed") {
-        // Surface the reason. The backend classifies failures (core/errors.py) and
-        // sends a message written for the user, so this is safe to show verbatim;
-        // dropping it — as this handler used to — left "encountered an error" as
-        // the only signal, indistinguishable between an outage and a bad edit.
-        const reason = typeof data.error === "string" && data.error.trim() ? data.error.trim() : ""
-        addToast(
-          `❌ Write failed: ${tool} for ${targetId}.${reason ? ` ${reason}` : ""}`,
-          "error"
-        )
-      } else {
-        addToast(`⏳ Queue Update: Write job for ${targetId} is ${jobStatus}.`, "info")
+      const state: LedgerState =
+        data.status === "completed" ? "applied" : data.status === "failed" ? "failed" : "queued"
+
+      const entry: LedgerEntry = {
+        jobId: String(data.job_id ?? Math.random()),
+        target: args.ricefw_id || "—",
+        tab: data.sheet_tab || activeTabRef.current || "—",
+        field: firstUpdate?.field ?? args.set_field,
+        value: firstUpdate?.value ?? args.set_value,
+        tool: data.tool_name || "write",
+        state,
+        // core/errors.py classifies failures and sends a message written for a
+        // person, so this is shown verbatim rather than being flattened to
+        // "encountered an error" the way the toast used to.
+        error: typeof data.error === "string" && data.error.trim() ? data.error.trim() : undefined,
       }
+
+      setLedger((prev) => {
+        const existing = prev.findIndex((l) => l.jobId === entry.jobId)
+        if (existing === -1) return [...prev, entry]
+        const next = [...prev]
+        next[existing] = { ...next[existing], ...entry }
+        return next
+      })
     }
 
     window.addEventListener("queue_update", handleQueueUpdate)
@@ -133,15 +141,6 @@ export default function ChatPage() {
       window.removeEventListener("queue_update", handleQueueUpdate)
     }
   }, [])
-
-  // Toast Helpers
-  const addToast = (message: string, type: "success" | "info" | "error" = "info") => {
-    const id = Math.random().toString(36).substring(7)
-    setToasts((prev) => [...prev, { id, message, type }])
-    setTimeout(() => {
-      setToasts((prev) => prev.filter((t) => t.id !== id))
-    }, 5000)
-  }
 
   // Handle message send
   const handleSend = (e: React.FormEvent) => {
@@ -162,8 +161,8 @@ export default function ChatPage() {
 
   if (status === "loading" || !session) {
     return (
-      <div className="flex h-screen items-center justify-center bg-[#030014]">
-        <div className="animate-spin rounded-full h-12 w-12 border-t-2 border-indigo-500"></div>
+      <div className="flex h-screen items-center justify-center bg-ink-950">
+        <div className="label-micro animate-inflight">Opening your sheets</div>
       </div>
     )
   }
@@ -171,36 +170,29 @@ export default function ChatPage() {
   const isAdmin = isAdminState
 
   return (
-    <div className="flex h-screen bg-[#030014] text-zinc-100 overflow-hidden font-sans relative">
-      {/* Background blobs */}
-      <div className="absolute top-0 right-1/4 -z-10 h-[500px] w-[500px] rounded-full bg-indigo-950/20 blur-3xl"></div>
-      <div className="absolute bottom-0 left-1/4 -z-10 h-[500px] w-[500px] rounded-full bg-purple-950/20 blur-3xl"></div>
-
+    <div className="relative flex h-screen flex-col overflow-hidden bg-ink-950 text-ink-100">
       {/* Main chat window container */}
-      <div className="flex flex-1 flex-col relative z-10">
-        
+      <div className="relative z-10 flex flex-1 flex-col">
         {/* Header Bar */}
-        <header className="glass-panel flex flex-wrap items-center justify-between gap-3 border-b border-white/5 px-4 py-4 sm:px-6">
-          <div className="flex min-w-0 items-center gap-4 sm:gap-6">
-            <div className="flex items-center gap-3">
-              <div className="h-8 w-8 rounded-lg bg-indigo-600 flex items-center justify-center text-white font-extrabold text-lg">
-                M
-              </div>
-              <span className="font-bold text-lg tracking-tight bg-clip-text text-transparent bg-gradient-to-r from-zinc-100 to-indigo-200">
-                MigrationBot Chat
-              </span>
-            </div>
-            
-            {/* Project Dropdown Select */}
-            <div className="flex items-center gap-2">
-              <span className="text-xs text-zinc-400">Project:</span>
+        <header className="flex flex-wrap items-center justify-between gap-3 border-b border-[var(--color-rule)] bg-ink-900 px-4 py-3 sm:px-6">
+          <div className="flex min-w-0 items-center gap-4 sm:gap-5">
+            <span className="text-[15px] font-semibold tracking-tight text-ink-100">
+              MigrationBot
+            </span>
+
+            {/* Project selector */}
+            <div className="flex min-w-0 items-center gap-2">
+              <label htmlFor="project-select" className="label-micro">
+                Sheet
+              </label>
               <select
+                id="project-select"
                 value={activeProject?.id || ""}
                 onChange={(e) => {
                   const proj = projects.find((p) => p.id === parseInt(e.target.value))
                   if (proj) setActiveProject(proj)
                 }}
-                className="bg-[#120e2e] border border-white/10 rounded-lg px-3 py-1.5 text-sm font-medium text-zinc-200 focus:outline-none focus:border-indigo-500 transition cursor-pointer"
+                className="field w-auto max-w-[220px] cursor-pointer py-1.5 text-[13px]"
               >
                 {projects.map((p) => (
                   <option key={p.id} value={p.id}>
@@ -213,63 +205,52 @@ export default function ChatPage() {
 
           {/* Sheet tabs. Previously `hidden md:flex`, which left no way at all to
               change tab on a narrow screen; now it scrolls sideways instead. */}
-          <div className="flex max-w-full items-center gap-1.5 overflow-x-auto rounded-xl border border-white/5 bg-[#120e2e]/60 p-1">
-            {(activeProject?.schema_config?.tabs 
-              ? Object.keys(activeProject.schema_config.tabs) 
+          <div className="flex max-w-full items-center gap-1 overflow-x-auto rounded-md border border-[var(--color-rule)] bg-ink-950 p-1">
+            {(activeProject?.schema_config?.tabs
+              ? Object.keys(activeProject.schema_config.tabs)
               : (activeProject?.schema_config?.global?.valid_modules || [])
             ).map((tab: string) => (
               <button
                 key={tab}
                 onClick={() => handleTabChange(tab)}
                 disabled={!isConnected}
-                className={`shrink-0 cursor-pointer rounded-lg px-4 py-1.5 text-xs font-semibold tracking-wide transition ${
-                  activeTab === tab 
-                    ? "bg-indigo-600 text-white shadow-md"
-                    : "text-zinc-400 hover:text-zinc-200 hover:bg-white/5"
-                } disabled:opacity-50`}
+                aria-current={activeTab === tab ? "true" : undefined}
+                className={`shrink-0 cursor-pointer rounded-sm px-3 py-1 font-mono text-[12px] font-medium transition disabled:opacity-40 ${
+                  activeTab === tab
+                    ? "bg-brass-400 text-ink-950"
+                    : "text-ink-400 hover:bg-ink-800 hover:text-ink-200"
+                }`}
               >
                 {tab}
               </button>
             ))}
           </div>
 
-          {/* User Profile & Navigation */}
-          <div className="flex items-center gap-4">
-            {/* WS Connection Status Dot */}
-            <div className="flex items-center gap-2 px-3 py-1.5 rounded-full bg-white/5 border border-white/5">
-              <span className="relative flex h-2 w-2">
-                {isConnected ? (
-                  <>
-                    <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
-                    <span className="relative inline-flex rounded-full h-2 w-2 bg-emerald-500"></span>
-                  </>
-                ) : (
-                  <span className="relative inline-flex rounded-full h-2 w-2 bg-rose-500"></span>
-                )}
-              </span>
-              <span className="text-xs font-medium text-zinc-400">
-                {isConnected ? "Live" : "Offline"}
-              </span>
-            </div>
+          {/* Connection + account */}
+          <div className="flex items-center gap-2">
+            <span
+              className={`status ${isConnected ? "status-applied" : "status-failed"}`}
+              title={isConnected ? "Connected to the sheet" : "Reconnecting"}
+            >
+              {isConnected ? "live" : "offline"}
+            </span>
 
-            {/* Admin link if user is administrator */}
             {isAdmin && (
               <button
                 onClick={() => router.push("/admin")}
-                className="p-2 rounded-lg bg-indigo-600/10 text-indigo-400 border border-indigo-500/20 hover:bg-indigo-600/20 transition cursor-pointer"
-                title="Admin Dashboard"
+                className="btn btn-ghost px-2 py-2"
+                title="Admin settings"
               >
-                <Settings className="h-4.5 w-4.5" />
+                <Settings className="h-4 w-4" />
               </button>
             )}
 
-            {/* Sign Out Button */}
             <button
               onClick={() => signOut({ callbackUrl: "/" })}
-              className="p-2 rounded-lg bg-zinc-800/40 text-zinc-400 border border-white/5 hover:bg-zinc-800/80 hover:text-rose-400 transition cursor-pointer"
-              title="Sign Out"
+              className="btn btn-ghost px-2 py-2"
+              title="Sign out"
             >
-              <LogOut className="h-4.5 w-4.5" />
+              <LogOut className="h-4 w-4" />
             </button>
           </div>
         </header>
@@ -280,24 +261,53 @@ export default function ChatPage() {
         <div className="flex-1 overflow-y-auto px-4 py-8 sm:px-6">
           <div className="mx-auto flex min-h-full w-full max-w-4xl flex-col space-y-6">
           {messages.length === 0 ? (
-            <div className="mx-auto flex max-w-lg flex-1 flex-col items-center justify-center space-y-4 text-center">
-              <div className="p-4 bg-indigo-600/10 text-indigo-400 rounded-full border border-indigo-500/20 animate-pulse-slow">
-                <Database className="h-10 w-10" />
+            // An empty screen is an invitation to act: the examples are real
+            // prompts and clicking one sends it, rather than describing in prose
+            // what the user could theoretically type.
+            <div className="flex flex-1 flex-col justify-center py-8">
+              <div className="label-micro">
+                {activeTab ? `${activeTab} · ready` : "Ready"}
               </div>
-              <h3 className="text-lg font-bold text-zinc-200">What would you like to know about this sheet?</h3>
-              <p className="text-sm text-zinc-500 leading-relaxed">
-                Ask things like &ldquo;break down items by status&rdquo;, &ldquo;how complete is the data?&rdquo;, or
-                &ldquo;show everything assigned to Sara&rdquo; — answers come back as tables and charts. You can
-                also make changes, e.g. &ldquo;set status to Done for SD-045&rdquo;.
+              <h2 className="display-md mt-3 max-w-lg">
+                What do you want to know about this sheet?
+              </h2>
+              <p className="mt-3 max-w-md text-[14px] leading-relaxed text-ink-400">
+                Ask in plain language. Answers come back as tables and charts, with the rows
+                they came from.
+              </p>
+
+              <ul className="mt-7 flex flex-wrap gap-2">
+                {[
+                  "Break down items by status",
+                  "How complete is this tab?",
+                  "What's overdue?",
+                  "Show everything assigned to Sara",
+                ].map((example) => (
+                  <li key={example}>
+                    <button
+                      type="button"
+                      disabled={!isConnected}
+                      onClick={() => sendMessage(example)}
+                      className="btn btn-secondary text-[13px] font-normal"
+                    >
+                      {example}
+                    </button>
+                  </li>
+                ))}
+              </ul>
+
+              <p className="mt-6 flex items-center gap-2 text-[12.5px] text-ink-500">
+                <Database className="h-3.5 w-3.5 shrink-0" />
+                You can also make changes — &ldquo;set status to Done for SD-045&rdquo;.
               </p>
             </div>
           ) : (
             messages.map((msg) => {
               if (msg.role === "system") {
                 return (
-                  <div key={msg.id} className="flex justify-center animate-slide-up">
-                    <div className="bg-rose-500/10 border border-rose-500/20 text-rose-400 text-xs px-4 py-2 rounded-lg flex items-center gap-2">
-                      <AlertTriangle className="h-4 w-4" />
+                  <div key={msg.id} className="animate-rise flex justify-center">
+                    <div className="flex items-center gap-2 rounded-md border border-[color-mix(in_srgb,var(--color-failed)_25%,transparent)] bg-[color-mix(in_srgb,var(--color-failed)_10%,transparent)] px-3 py-2 text-[12.5px] text-failed">
+                      <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
                       <span>{msg.content}</span>
                     </div>
                   </div>
@@ -307,36 +317,32 @@ export default function ChatPage() {
               const isUser = msg.role === "user"
 
               return (
-                <div 
-                  key={msg.id} 
-                  className={`flex w-full ${isUser ? "justify-end" : "justify-start"} animate-slide-up`}
+                <div
+                  key={msg.id}
+                  className={`flex w-full ${isUser ? "justify-end" : "justify-start"} animate-rise`}
                 >
-                  <div className="flex min-w-0 max-w-[92%] flex-col space-y-2 sm:max-w-[85%]">
-                    
-                    {/* Message Bubble */}
-                    <div 
-                      className={`px-5 py-3.5 shadow-md ${
-                        isUser ? "chat-bubble-user" : "chat-bubble-agent"
-                      }`}
-                    >
-                      {/* Message Content. User text stays literal — it is whatever they
-                          typed. Assistant text is rendered as Markdown, which is the
-                          format it has always been written in. */}
+                  <div
+                    className={`flex min-w-0 flex-col space-y-2 ${
+                      // The agent's reply is plain text on the page, so it gets the
+                      // full column; only the user's turn is a bubble that needs
+                      // constraining.
+                      isUser ? "max-w-[85%]" : "w-full"
+                    }`}
+                  >
+                    <div className={isUser ? "bubble-user px-4 py-2.5" : "bubble-agent"}>
+                      {/* User text stays literal — it is whatever they typed. Assistant
+                          text is Markdown, which is the format it is written in. */}
                       {isUser ? (
-                        <p className="text-[15px] leading-relaxed whitespace-pre-wrap select-text">
+                        <p className="select-text whitespace-pre-wrap text-[14.5px] leading-relaxed">
                           {msg.content}
                         </p>
                       ) : (
                         msg.content && <MarkdownMessage content={msg.content} />
                       )}
 
-                      {/* Streaming cursor if empty assistant bubble */}
+                      {/* Thinking indicator on an as-yet-empty assistant turn */}
                       {!isUser && msg.content === "" && (!msg.toolCalls || msg.toolCalls.length === 0) && (
-                        <div className="flex space-x-1 items-center h-5">
-                          <div className="w-1.5 h-1.5 bg-indigo-400 rounded-full animate-bounce"></div>
-                          <div className="w-1.5 h-1.5 bg-indigo-400 rounded-full animate-bounce [animation-delay:0.2s]"></div>
-                          <div className="w-1.5 h-1.5 bg-indigo-400 rounded-full animate-bounce [animation-delay:0.4s]"></div>
-                        </div>
+                        <span className="label-micro animate-inflight">Reading the sheet</span>
                       )}
                     </div>
 
@@ -345,31 +351,29 @@ export default function ChatPage() {
                       <div className="space-y-2">
                         {msg.toolCalls.map((tool, idx) => (
                           <div key={idx} className="space-y-2">
-                            <div className="glass-card px-4 py-2 rounded-xl text-xs flex items-center justify-between border border-white/5">
-                              <div className="flex items-center gap-2.5 min-w-0">
+                            <div className="card flex items-center justify-between gap-3 rounded-md px-3 py-2">
+                              <div className="flex min-w-0 items-center gap-2.5">
                                 {tool.status === "running" ? (
-                                  <RefreshCw className="h-3.5 w-3.5 shrink-0 text-amber-400 animate-spin" />
+                                  <RefreshCw className="h-3.5 w-3.5 shrink-0 animate-spin text-queued" />
                                 ) : tool.status === "completed" ? (
-                                  <CheckCircle2 className="h-3.5 w-3.5 shrink-0 text-emerald-400" />
+                                  <CheckCircle2 className="h-3.5 w-3.5 shrink-0 text-applied" />
                                 ) : (
-                                  <X className="h-3.5 w-3.5 shrink-0 text-rose-500" />
+                                  <X className="h-3.5 w-3.5 shrink-0 text-failed" />
                                 )}
-                                <span className="font-semibold text-zinc-300 shrink-0">
+                                <span className="shrink-0 font-mono text-[12px] font-medium text-ink-200">
                                   {tool.name}
                                 </span>
                                 {/* Readable summary of the arguments rather than a raw
                                     JSON.stringify blob spilling across the bubble. */}
                                 {tool.args && Object.keys(tool.args).length > 0 && (
-                                  <span className="text-zinc-500 truncate">
+                                  <span className="truncate text-[12px] text-ink-500">
                                     {Object.entries(tool.args)
                                       .map(([k, v]) => `${k}: ${typeof v === "object" ? JSON.stringify(v) : String(v)}`)
                                       .join(" · ")}
                                   </span>
                                 )}
                               </div>
-                              <span className="text-zinc-400 text-[10px] uppercase font-bold tracking-wider shrink-0 ml-2">
-                                {tool.status}
-                              </span>
+                              <span className="label-micro shrink-0">{tool.status}</span>
                             </div>
 
                             {/* Structured view of the result: chart, meter or table
@@ -390,54 +394,36 @@ export default function ChatPage() {
           </div>
         </div>
 
-        {/* Input Bar */}
-        <footer className="border-t border-white/5 bg-[#030014] p-4 sm:p-6">
-          <form onSubmit={handleSend} className="max-w-4xl mx-auto flex items-center gap-3 relative">
-            <input
-              type="text"
-              value={input}
-              onChange={(e) => setInput(e.target.value)}
-              placeholder={isConnected ? "Ask MigrationBot or update a sheet cell..." : "Waiting for WebSocket connection..."}
-              disabled={!isConnected}
-              className="flex-1 bg-[#120e2e] border border-white/10 rounded-xl px-5 py-4 text-sm text-zinc-100 placeholder-zinc-500 focus:outline-none focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500 transition disabled:opacity-50"
-            />
-            <button
-              type="submit"
-              disabled={!isConnected || !input.trim()}
-              className="bg-indigo-600 text-white p-4 rounded-xl hover:bg-indigo-500 active:scale-95 transition disabled:opacity-40 disabled:scale-100 cursor-pointer shadow-lg"
-            >
-              <Send className="h-4.5 w-4.5" />
-            </button>
-          </form>
-        </footer>
+        {/* Composer, with the write ledger docked directly above it — the two
+            belong together: you make a change here and watch it land there. */}
+        <footer className="border-t border-[var(--color-rule)] bg-ink-950 p-4 sm:px-6">
+          <div className="mx-auto w-full max-w-4xl space-y-3">
+            <WriteLedger entries={ledger} onDismiss={() => setLedger([])} />
 
-      </div>
-
-      {/* Floating Notifications / Toasts container */}
-      <div className="fixed bottom-6 right-6 z-50 flex flex-col gap-2 max-w-sm">
-        {toasts.map((toast) => (
-          <div
-            key={toast.id}
-            className={`glass-panel p-4 rounded-xl shadow-lg border border-white/10 flex items-start gap-3 animate-slide-up ${
-              toast.type === "success" 
-                ? "border-emerald-500/30" 
-                : toast.type === "error" 
-                ? "border-rose-500/30" 
-                : "border-indigo-500/30"
-            }`}
-          >
-            <Bell className={`h-5 w-5 ${
-              toast.type === "success" 
-                ? "text-emerald-400" 
-                : toast.type === "error" 
-                ? "text-rose-400" 
-                : "text-indigo-400"
-            }`} />
-            <div className="flex-1 text-xs font-medium text-zinc-300">
-              {toast.message}
-            </div>
+            <form onSubmit={handleSend} className="flex items-center gap-2">
+              <input
+                type="text"
+                value={input}
+                onChange={(e) => setInput(e.target.value)}
+                placeholder={
+                  isConnected
+                    ? "Ask about this sheet, or describe a change…"
+                    : "Reconnecting…"
+                }
+                disabled={!isConnected}
+                className="field flex-1 py-3"
+              />
+              <button
+                type="submit"
+                disabled={!isConnected || !input.trim()}
+                aria-label="Send"
+                className="btn btn-primary px-3.5 py-3"
+              >
+                <Send className="h-4 w-4" />
+              </button>
+            </form>
           </div>
-        ))}
+        </footer>
       </div>
     </div>
   )

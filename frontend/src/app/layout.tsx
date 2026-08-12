@@ -1,21 +1,34 @@
 import type { Metadata } from "next";
-import { Geist, Geist_Mono } from "next/font/google";
+import { IBM_Plex_Sans, IBM_Plex_Mono } from "next/font/google";
 import { SessionProvider } from "next-auth/react";
 import "./globals.css";
 
-const geistSans = Geist({
-  variable: "--font-geist-sans",
+/**
+ * IBM Plex, not Inter or Geist. Plex was drawn for enterprise data tooling, which
+ * is exactly what this is; it holds up at the small sizes tables need, and its
+ * tabular figures matter for a product that is mostly numbers in columns. The
+ * mono cut carries every sheet coordinate, ID and count in the UI.
+ */
+const plexSans = IBM_Plex_Sans({
+  variable: "--font-plex-sans",
   subsets: ["latin"],
+  weight: ["400", "500", "600", "700"],
+  display: "swap",
 });
 
-const geistMono = Geist_Mono({
-  variable: "--font-geist-mono",
+const plexMono = IBM_Plex_Mono({
+  variable: "--font-plex-mono",
   subsets: ["latin"],
+  weight: ["400", "500", "600"],
+  display: "swap",
 });
 
 export const metadata: Metadata = {
-  title: "MigrationBot | SAP S/4HANA WRICEF Assistant",
-  description: "AI conversational assistant and queue-backed automation manager for SAP S/4HANA WRICEF migrations.",
+  // Was "SAP S/4HANA WRICEF Assistant", which contradicts the product: this works
+  // against any tracking sheet, and the schema is detected per project.
+  title: "MigrationBot — ask your tracking sheets",
+  description:
+    "Ask questions about a tracking spreadsheet in plain language, and make changes that are queued, attributed and audited.",
 };
 
 export default function RootLayout({
@@ -25,10 +38,10 @@ export default function RootLayout({
 }>) {
   return (
     <html lang="en" className="h-full dark">
-      <body className={`${geistSans.variable} ${geistMono.variable} h-full font-sans antialiased bg-[#030014] text-zinc-100 flex flex-col`}>
-        <SessionProvider>
-          {children}
-        </SessionProvider>
+      <body
+        className={`${plexSans.variable} ${plexMono.variable} flex h-full flex-col bg-ink-950 font-sans text-ink-100 antialiased`}
+      >
+        <SessionProvider>{children}</SessionProvider>
       </body>
     </html>
   );
