@@ -7,18 +7,24 @@ services:
     environment:
       POSTGRES_DB: migrationbot
       POSTGRES_USER: migrationbot
-      POSTGRES_PASSWORD: ${DB_PASSWORD}
+      # `:?` makes compose abort with this message when the var is unset, rather than
+      # substituting an empty string and bringing up a passwordless database.
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD is required — see .env.example}
     volumes:
       - pgdata:/var/lib/postgresql/data
-    ports:
-      - "5433:5432"
+    # No `ports:` mapping. Every consumer reaches Postgres over the compose network
+    # as `postgres:5432`; publishing it to the host only exposes it to the internet.
+    # Docker writes its own iptables rules that bypass UFW, so a host firewall does
+    # NOT contain a published port — see TDD.md §17.
     restart: unless-stopped
 
   redis:
     image: redis:7-alpine
     container_name: migrationbot-redis
-    ports:
-      - "6379:6379"
+    # Defence in depth: unpublished *and* password-protected. Redis has no auth by
+    # default, and an unauthenticated instance is trivially turned into RCE via
+    # CONFIG SET dir/dbfilename to overwrite ~/.ssh/authorized_keys.
+    command: ["redis-server", "--requirepass", "${REDIS_PASSWORD:?REDIS_PASSWORD is required — see .env.example}"]
     restart: unless-stopped
 
   backend:
@@ -28,9 +34,10 @@ services:
       - .env
     environment:
       DATABASE_URL: postgresql+asyncpg://migrationbot:${DB_PASSWORD}@postgres:5432/migrationbot
-      REDIS_URL: redis://redis:6379
-    ports:
-      - "8000:8000"
+      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379
+    # No `ports:` mapping — Caddy reverse-proxies to `backend:8000` over the compose
+    # network. Publishing 8000 would put the API on the internet unauthenticated at
+    # the network layer, alongside the TLS-terminated route Caddy serves.
     depends_on:
       - postgres
       - redis
@@ -53,7 +60,7 @@ services:
       - .env
     environment:
       DATABASE_URL: postgresql+asyncpg://migrationbot:${DB_PASSWORD}@postgres:5432/migrationbot
-      REDIS_URL: redis://redis:6379
+      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379
     depends_on:
       - postgres
       - redis
@@ -71,8 +78,7 @@ services:
       AUTH_TRUST_HOST: "true"
       GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID}
       GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET}
-    ports:
-      - "3000:3000"
+    # No `ports:` mapping — Caddy reverse-proxies to `frontend:3000`.
     depends_on:
       - backend
     restart: unless-stopped
