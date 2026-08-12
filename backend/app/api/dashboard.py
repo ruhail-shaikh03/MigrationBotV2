@@ -16,18 +16,23 @@ from datetime import date
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
 from app.core.people import collect_assignments, normalise_person, parse_date, resolve_effort
+from app.core.permissions import get_user_permissions
 from app.core.schema import get_effort_columns, get_people_columns, get_tab_schema
 from app.db.engine import get_db
 from app.deps import get_current_user, get_google_auth
 from app.models.permission import Permission
 from app.models.project import Project
+from app.models.session import Session as UserSession
 from app.models.user import User
+from app.queue.producer import enqueue_write_job
 from app.sheets.client import build_sheets_service
+from app.sheets.read import get_row_raw
 from app.sheets.rows_cache import get_tab_matrix
 
 logger = logging.getLogger("dashboard")
@@ -181,6 +186,9 @@ async def list_rows(
         "tab": active_tab,
         "columns": _column_descriptors(tab_schema, headers),
         "people_columns": people,
+        # The grid needs this to address a row when queueing an edit — without it the
+        # client would have to guess which column is the identifier.
+        "primary_id_column": tab_schema.get("primary_id_column"),
         "rows": page,
         "total": total,
         "offset": offset,
@@ -209,6 +217,108 @@ def _is_overdue(due: date, row: Dict[str, str], status_header: Optional[str]) ->
         if any(word in value for word in ("done", "complete", "closed", "cancel", "deployed")):
             return False
     return True
+
+
+class RowUpdate(BaseModel):
+    field: str
+    value: str
+
+
+class RowPatch(BaseModel):
+    tab: Optional[str] = None
+    updates: List[RowUpdate]
+
+
+@router.patch("/projects/{project_id}/rows/{row_id}", response_model=Dict[str, Any])
+async def patch_row(
+    project_id: int,
+    row_id: str,
+    payload: RowPatch,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+    google_auth: dict = Depends(get_google_auth),
+) -> Dict[str, Any]:
+    """Queue a cell edit made from the dashboard.
+
+    RBAC is normally enforced inside `agentic_loop.py`, immediately before tool dispatch.
+    A REST route does not pass through that loop, so it must run the identical check
+    itself — a write path that skips `PermissionChecker` is a privilege-escalation bug,
+    not a missing feature. The `args` shape below is therefore not incidental: the
+    field-level gate reads `args["updates"][*]["field"]` (`core/permissions.py`), so
+    passing a differently-shaped dict would silently disable field restrictions while
+    still appearing to check permissions.
+
+    Everything after the check is the existing write path unchanged — the same producer,
+    the same queue, the same worker — so throttling, audit logging and cache invalidation
+    all apply exactly as they do for a write the model made.
+    """
+    if not payload.updates:
+        raise HTTPException(status_code=400, detail="No updates supplied.")
+
+    project = await _resolve_project(db, current_user, project_id)
+    active_tab = _tab_for(project, payload.tab)
+
+    updates = [{"field": u.field, "value": u.value} for u in payload.updates]
+    args = {"ricefw_id": row_id, "updates": updates}
+
+    checker = await get_user_permissions(db, current_user.email, project_id)
+    allowed, reason = checker.can_execute("update_cell", args)
+    if not allowed:
+        # 403 with the checker's own explanation: unlike the read path, the caller
+        # already knows this project and row exist, so there is nothing to conceal and a
+        # 404 here would just be confusing.
+        raise HTTPException(status_code=403, detail=reason)
+
+    # One Session row per (user, project), matching chat.py — the worker records it on the
+    # audit entry, so a dashboard edit is attributable to the same session as a chat edit.
+    sess_res = await db.execute(
+        select(UserSession).where(
+            UserSession.user_id == current_user.id, UserSession.project_id == project.id
+        )
+    )
+    user_sess = sess_res.scalar()
+    if not user_sess:
+        user_sess = UserSession(
+            user_id=current_user.id, project_id=project.id, active_tab=active_tab
+        )
+        db.add(user_sess)
+        await db.commit()
+        await db.refresh(user_sess)
+
+    service = build_sheets_service(
+        access_token=google_auth["access_token"],
+        refresh_token=google_auth.get("refresh_token"),
+    )
+
+    # Pre-read so the audit row carries a real before-value. Best-effort, exactly as
+    # tool_dispatch does it: failing to read the old value must not block the write, since
+    # a missing audit diff is a smaller loss than a refused edit.
+    old_values: Dict[str, str] = {}
+    try:
+        old_values = await get_row_raw(
+            project.spreadsheet_id,
+            active_tab,
+            row_id,
+            [u["field"] for u in updates],
+            project.schema_config or {},
+            service,
+        )
+    except Exception as e:
+        logger.warning(f"Failed to pre-read row {row_id} for audit: {e}")
+
+    job = await enqueue_write_job(
+        user_email=current_user.email,
+        google_access_token=google_auth["access_token"],
+        google_refresh_token=google_auth.get("refresh_token"),
+        session_id=user_sess.id,
+        tool_name="update_cell",
+        spreadsheet_id=project.spreadsheet_id,
+        sheet_tab=active_tab,
+        args=args,
+        old_values=old_values,
+    )
+
+    return {"ok": True, "job_id": job.id, "status": "queued", "tab": active_tab, "row_id": row_id}
 
 
 @router.get("/projects/{project_id}/analytics", response_model=Dict[str, Any])

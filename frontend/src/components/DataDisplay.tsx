@@ -78,6 +78,7 @@ export function DataTable({
   rows,
   caption,
   columns: explicitColumns,
+  renderCell,
 }: {
   rows: Record<string, string | number>[]
   caption?: string
@@ -85,6 +86,11 @@ export function DataTable({
    *  column order; without it the union below sorts by first appearance, which scrambles
    *  a grid the user expects to mirror their spreadsheet. */
   columns?: string[]
+  /** Replace a cell's contents. The dashboard uses this to make people-columns editable
+   *  without forking the table: a second table implementation would drift from this one
+   *  in styling and in the ragged-row handling above. Return undefined to fall through to
+   *  the default text rendering. */
+  renderCell?: (column: string, value: string, rowIndex: number) => React.ReactNode | undefined
 }) {
   if (!rows.length) return <div className="text-xs text-ink-500">No rows.</div>
   // Union of keys across rows, not just the first: search_rows omits columns that were
@@ -118,14 +124,18 @@ export function DataTable({
           <tbody>
             {rows.map((r, i) => (
               <tr key={i} className="transition-colors hover:bg-ink-850">
-                {columns.map((c) => (
-                  <td
-                    key={c}
-                    className="border-b border-[var(--color-rule)] px-3 py-2 align-top text-ink-300"
-                  >
-                    {String(r[c] ?? "")}
-                  </td>
-                ))}
+                {columns.map((c) => {
+                  const value = String(r[c] ?? "")
+                  const custom = renderCell?.(c, value, i)
+                  return (
+                    <td
+                      key={c}
+                      className="border-b border-[var(--color-rule)] px-3 py-2 align-top text-ink-300"
+                    >
+                      {custom === undefined ? value : custom}
+                    </td>
+                  )
+                })}
               </tr>
             ))}
           </tbody>
