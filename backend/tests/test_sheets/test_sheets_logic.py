@@ -1,13 +1,17 @@
 import pytest
 import json
 import asyncio
+import redis
 from unittest.mock import MagicMock, AsyncMock, patch
 from googleapiclient.errors import HttpError
 
 from app.sheets.retry import _with_retry
 from app.sheets.read import find_row_num, get_bulk_rows_raw, search_rows, summarize, run_data_quality_check
 from app.queue.producer import enqueue_write_job
-from app.queue.worker import start_worker, recover_stale_jobs, QUEUE_KEY, PROCESSING_KEY, DEAD_LETTER_KEY, MAX_ATTEMPTS
+from app.queue.worker import (
+    start_worker, recover_stale_jobs, QUEUE_KEY, PROCESSING_KEY, DEAD_LETTER_KEY,
+    MAX_ATTEMPTS, REDIS_BACKOFF_INITIAL_SECONDS,
+)
 from app.queue.events import publish_queue_update, queue_events_channel
 
 # 1. Test transient rate-limiting retry backoff
@@ -459,6 +463,58 @@ async def test_recover_stale_jobs_dead_letters_past_max_attempts():
     assert mock_publish.called
     assert mock_publish.call_args.kwargs["status"] == "failed"
     assert mock_publish.call_args.kwargs["job_id"] == "job-stale-2"
+
+
+# 15b. Regression for the 2026-08 incident: a Redis that answers BLMOVE with
+# "READONLY You can't write against a read only replica" must make the worker back
+# off in place, not die. ReadOnlyError is a ResponseError, NOT a ConnectionError, so
+# it slipped past the TimeoutError-only handler; the loop crashed, the container
+# restarted, and every restart burned one MAX_ATTEMPTS budget on innocent jobs.
+@pytest.mark.asyncio
+async def test_worker_survives_readonly_replica_error():
+    mock_redis = AsyncMock()
+    mock_redis.get.return_value = None
+    mock_redis.lpop.return_value = None  # nothing stale to recover
+
+    call_count = 0
+
+    async def mock_blmove(*args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        if call_count <= 2:
+            raise redis.exceptions.ReadOnlyError("You can't write against a read only replica.")
+        raise asyncio.CancelledError("Stop loop")
+
+    mock_redis.blmove.side_effect = mock_blmove
+
+    with patch("app.queue.worker.aioredis.from_url", return_value=mock_redis), \
+         patch("asyncio.sleep", AsyncMock()) as mock_sleep:
+        try:
+            await start_worker()
+        except asyncio.CancelledError:
+            pass
+
+    # Survived both READONLY replies and kept polling rather than exiting.
+    assert call_count == 3
+    slept = [c[0][0] for c in mock_sleep.call_args_list]
+    assert slept[:2] == [REDIS_BACKOFF_INITIAL_SECONDS, REDIS_BACKOFF_INITIAL_SECONDS * 2]
+
+
+# 15c. A Redis outage during startup recovery must not prevent the worker from
+# reaching its main loop — the loop retries, and the next start re-runs recovery.
+@pytest.mark.asyncio
+async def test_worker_starts_when_stale_job_recovery_fails():
+    mock_redis = AsyncMock()
+    mock_redis.lpop.side_effect = redis.exceptions.ConnectionError("connection refused")
+    mock_redis.blmove.side_effect = asyncio.CancelledError("Stop loop")
+
+    with patch("app.queue.worker.aioredis.from_url", return_value=mock_redis):
+        try:
+            await start_worker()
+        except asyncio.CancelledError:
+            pass
+
+    assert mock_redis.blmove.called  # reached the main loop despite recovery failing
 
 
 # 16. Regression: the job_id dispatch_tool returns to the caller must be queryable

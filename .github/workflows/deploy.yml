@@ -64,9 +64,16 @@ jobs:
               exit 1
             fi
 
+            # Probed from INSIDE the backend container, not from the host: the
+            # backend no longer publishes 8000 (docker-compose.yml), because a
+            # published port is reachable from the internet and Docker's iptables
+            # rules bypass any host firewall. urllib rather than curl — it is the
+            # same probe the container healthcheck uses, and needs no extra package.
             READY=""
             for i in $(seq 1 15); do
-              if curl -fsS http://localhost:8000/api/ready > /dev/null 2>&1; then
+              if docker compose exec -T backend python -c \
+                   "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/ready', timeout=3)" \
+                   > /dev/null 2>&1; then
                 READY="yes"
                 break
               fi
