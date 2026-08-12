@@ -795,6 +795,43 @@ mismatch).
 Previously it returned every active project, including `spreadsheet_id` and full `schema_config`,
 to any authenticated caller regardless of whether they had a permissions row for it.
 
+### 10.1 Dashboard read endpoints
+
+| Method | Path | Purpose | Citation |
+|---|---|---|---|
+| GET | `/api/projects/{id}/rows` | one tab's rows, filtered/sorted/paged, plus column metadata | `dashboard.py:list_rows` |
+| GET | `/api/projects/{id}/analytics` | per-person workload split by role, overdue counts, status breakdown | `dashboard.py:project_analytics` |
+
+Both resolve the project through `dashboard.py:_resolve_project`, which repeats
+`list_user_projects`' rule exactly: a config admin reaches any active project, anyone else needs an
+explicit `permissions` row. The fail-closed default role (§6.2) deliberately grants no visibility
+here — reaching a project only through the default means nothing was ever granted. A permission
+miss returns **404, not 403**, matching `api/jobs.py`: confirming that a project exists is itself a
+disclosure. Google credentials come from the `X-Google-Access-Token` / `X-Google-Refresh-Token`
+headers via `deps.py:get_google_auth`, the same path `/admin/projects/detect-metadata` uses.
+
+`list_rows` returns a `columns` descriptor list built by `_column_descriptors`, tagging each header
+`person`, `effort` or `plain` and carrying the sheet's own label (§7.4). The frontend never decides
+which columns hold people — it is told, so a sheet naming a "QA Owner" renders one with no code
+change. Rows are zipped by `_row_dicts`, which **pads** short rows: Sheets omits trailing empty
+cells, and truncating the header list to match would silently drop real columns from the grid.
+
+Filters are `q` (any cell), `status`, `person` (+ optional `role_key` to scope to one role) and
+`overdue`. Person matching goes through `people.py:normalise_person`, so it is exact after
+case/whitespace folding rather than a substring test — a substring match would fold "Sara" and
+"Sara Khan" into one person. `_is_overdue` treats a row as overdue when its due/go-live date has
+passed and its status does not read as finished; the finished-word list is deliberately narrow
+(no `"live"`, which would clear "Go-Live Pending") because hiding an overdue item is the worse
+error — nobody chases what they cannot see.
+
+`project_analytics` aggregates over `people.py:collect_assignments`, so one person appearing in two
+role columns yields one workload entry carrying a per-role split and a combined total.
+`days_source` reports where the day figures came from — `"column"`, `"dates"`, `"mixed"`, or `null`
+when the sheet records no effort at all — so the UI can label the metric honestly and fall back to
+item counts instead of rendering a zero-day bar, which would assert something false. Both endpoints
+pass `truncated` straight through from the scan: past `_MAX_SCAN_ROWS` the totals are a floor, and
+a dashboard that silently under-reports is worse than one that says it is partial.
+
 ---
 
 ## 11. Google Sheets Integration
@@ -845,6 +882,31 @@ that one pass; `get_bulk_rows_raw` fetches all resolved rows in a single `batchG
 longer silently truncated (§16 history). A `_MAX_SCAN_ROWS` (`read.py:_MAX_SCAN_ROWS`, 20000)
 safety valve stops pagination and sets a `truncated: true` field in the response if a
 misconfigured schema somehow never yields a short page — no real tracker should reach it.
+
+### 11.1 The dashboard row cache
+
+Agent tool reads are **not** cached: every `get_row`/`search_rows`/`summarize`/`data_quality` call
+scans live. (Earlier revisions of `CLAUDE.md` and the `migrationbot-sheets-testing` skill described
+a `sheet_records` Postgres table fronted by `read.py:_ensure_sheet_synced()` and
+`sheets/sync.py:sync_sheet_to_db()`. No such table, model or module has ever existed in this
+repository; both documents have been corrected.)
+
+The dashboard changed the read profile enough to need one. Chat issues one or two scans per
+question; a grid would re-scan the whole tab on every sort, filter, page and panel switch, and each
+scan pages up to 20 000 rows. `sheets/rows_cache.py:get_tab_matrix()` therefore caches
+`{headers, rows, truncated}` as JSON under `migrationbot:rows:{spreadsheet_id}:{tab}` with a
+**60-second** TTL — short on purpose, so it collapses one person's burst of clicks without serving
+stale data to someone who edited the sheet directly in Google.
+
+`queue/worker.py:process_job` calls `rows_cache.invalidate_tab()` on successful completion, before
+publishing the terminal `queue_update`. Only on success: a failed job changed nothing, so the cache
+is still accurate. Without this the grid would keep serving pre-write values for up to a minute
+after an edit landed, which reads to the user as the write having silently failed.
+
+Every Redis failure in this module is logged and swallowed in favour of a live Sheets scan — a
+cache is an optimisation, and Redis being down must not take the dashboard with it. This is
+deliberately *not* the durable, reconciled read model that a `sheet_records` table would be; that
+remains unbuilt.
 
 ---
 

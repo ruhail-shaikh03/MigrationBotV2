@@ -8,6 +8,7 @@ from app.api.health import router as health_router
 from app.api.admin import router as admin_router
 from app.api.chat import router as chat_router
 from app.api.jobs import router as jobs_router
+from app.api.dashboard import router as dashboard_router
 
 # Configure logging format
 logging.basicConfig(
@@ -76,3 +77,4 @@ app.include_router(chat_router)
 app.include_router(health_router, prefix="/api")
 app.include_router(admin_router, prefix="/api")
 app.include_router(jobs_router, prefix="/api")
+app.include_router(dashboard_router, prefix="/api")

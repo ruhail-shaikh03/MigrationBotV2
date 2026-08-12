@@ -11,6 +11,7 @@ from app.db.engine import AsyncSessionLocal
 from app.models.project import Project
 from app.queue.schemas import WriteJobPayload, JOB_STATE_PREFIX, JOB_STATE_TTL_SECONDS
 from app.queue.events import publish_queue_update
+from app.sheets.rows_cache import invalidate_tab
 from app.sheets.client import build_sheets_service
 from app.sheets.write import update_cell, bulk_update, add_row
 from app.sheets.format import format_row
@@ -340,7 +341,14 @@ async def process_job(job_id: str, payload_dict: dict) -> None:
             error=str(e)
         )
 
-    # 4. Notify the originating client of the terminal job state over its WebSocket
+    # 4. Drop the cached row matrix so the dashboard reflects this write immediately.
+    # Without it the grid keeps serving the pre-write values for up to the cache TTL,
+    # which reads to the user as the write having silently failed. Only on success —
+    # a failed job changed nothing, so the cache is still accurate.
+    if result_ok:
+        await invalidate_tab(payload.spreadsheet_id, payload.sheet_tab)
+
+    # 5. Notify the originating client of the terminal job state over its WebSocket
     await publish_queue_update(
         user_email=payload.user_email,
         job_id=job_id,

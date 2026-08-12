@@ -1,6 +1,6 @@
 ---
 name: migrationbot-sheets-testing
-description: Write or debug pytest tests for MigrationBot's Google Sheets layer (backend/app/sheets/ — read.py, write.py, format.py, meta.py, retry.py, sync.py) and the sheet_records Postgres cache. Use when adding tests for sheet reads/writes, mocking the googleapiclient service object, testing retry/backoff on 429/500/503, testing sync_sheet_to_db cache behavior, or when pytest fails to import app.* modules.
+description: Write or debug pytest tests for MigrationBot's Google Sheets layer (backend/app/sheets/ — read.py, write.py, format.py, meta.py, retry.py, rows_cache.py). Use when adding tests for sheet reads/writes, mocking the googleapiclient service object, testing retry/backoff on 429/500/503, testing the dashboard's Redis row cache and its invalidation, or when pytest fails to import app.* modules.
 ---
 
 # Testing the MigrationBot Sheets Layer
@@ -74,18 +74,23 @@ Patch the sleep to keep the test fast; assert attempt counts rather than wall-cl
 Because `fn` runs in an executor, a `MagicMock` side effect is called from a worker thread —
 keep it thread-safe (no shared mutable state without a lock).
 
-## The `sheet_records` cache changes what "a read" means
+## Agent reads are live; only the dashboard is cached
 
-`get_row`, `search_rows`, `summarize`, and `run_data_quality_check` read from the
-`sheet_records` Postgres table, not live Sheets. `read.py:_ensure_sheet_synced()` calls
-`sheets/sync.py:sync_sheet_to_db()` only on a cache miss.
+`get_row`, `search_rows`, `summarize`, and `run_data_quality_check` read **live Sheets** on
+every call, via `read.py:_fetch_all_rows`. Every read test therefore needs a mocked
+`service` object; there is no cache to warm or seed.
 
-So a read test needs **either** a seeded `SheetRecord` row (`models/sheet_record.py`:
-`spreadsheet_id`, `tab_name`, `ricefw_id`, `data` JSON) **or** a mocked service for the
-sync path to consume. A passing read test with an unused service mock usually means the
-cache was already warm — assert on which path ran, not just the return value.
+Earlier revisions of this skill described a `sheet_records` Postgres table,
+`models/sheet_record.py`, `read.py:_ensure_sheet_synced()`, `sheets/sync.py:sync_sheet_to_db()`
+and `tests/test_sheets/test_sync.py`. **None of those exist and none ever did** — do not
+write tests against them.
 
-`tests/test_sheets/test_sync.py` is the existing model for cache tests.
+The one real cache is `sheets/rows_cache.py:get_tab_matrix()`, used only by the dashboard
+endpoints (`api/dashboard.py`): a 60-second Redis blob of `{headers, rows, truncated}` keyed
+`migrationbot:rows:{spreadsheet_id}:{tab}`, invalidated by `queue/worker.py` after a
+successful write. To test it, patch `rows_cache.redis_client`; a `get` returning `None`
+exercises the miss path, and every Redis failure is swallowed in favour of a live scan, so
+assert on which path ran rather than only on the returned rows.
 
 ## Schema arguments are not optional in practice
 
