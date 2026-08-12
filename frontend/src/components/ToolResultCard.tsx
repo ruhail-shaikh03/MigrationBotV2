@@ -6,6 +6,8 @@ import {
 } from "recharts"
 import { ChevronDown, Table2 } from "lucide-react"
 
+import { ChartFrame, DataTable, HoverTip, MAX_BARS, SERIES_HUE, StatTile } from "./DataDisplay"
+
 /**
  * Structured renderers for tool results.
  *
@@ -23,14 +25,9 @@ import { ChevronDown, Table2 } from "lucide-react"
  *  - blank_fields is one headline number -> a stat tile, not a one-bar chart.
  *  - More than ~7 meaningful classes -> the table view, not more colors.
  *
- * SERIES_HUE stays blue deliberately: it is none of the four status colours and not
- * the brass interactive accent, so a bar can never be mistaken for a state. It was
- * validated against the previous darker ground (#030014); the current ground
- * (#0a0e0d) is marginally lighter, so contrast is essentially unchanged. Re-run the
- * palette validator before swapping it for a themed accent.
+ * The display primitives (StatTile, ChartFrame, HoverTip, DataTable, SERIES_HUE) live in
+ * DataDisplay.tsx so the project dashboard renders the same sheet data the same way.
  */
-const SERIES_HUE = "#3987e5"
-const MAX_BARS = 8
 
 /** Tool results arrive as parsed JSON, so the boundary is untyped; narrow at each use. */
 type AnyResult = Record<string, unknown>
@@ -67,91 +64,6 @@ interface SearchRowsResult {
   rows: Record<string, string>[]
   capped?: boolean
   truncated?: boolean
-}
-
-function StatTile({ label, value, sub }: { label: string; value: string; sub?: string }) {
-  return (
-    <div className="rounded-lg border border-[var(--color-rule-strong)] bg-white/[0.03] px-3 py-2.5">
-      <div className="text-[11px] uppercase tracking-wider text-ink-500">{label}</div>
-      <div className="mt-0.5 text-xl font-semibold text-ink-100 tabular-nums">{value}</div>
-      {sub && <div className="text-[11px] text-ink-500">{sub}</div>}
-    </div>
-  )
-}
-
-function ChartFrame({ title, subtitle, children }: { title: string; subtitle?: string; children: React.ReactNode }) {
-  return (
-    <div className="rounded-xl border border-[var(--color-rule-strong)] bg-ink-850 p-4">
-      <div className="mb-3">
-        <div className="text-[13px] font-semibold text-ink-200">{title}</div>
-        {subtitle && <div className="text-[11px] text-ink-500">{subtitle}</div>}
-      </div>
-      {children}
-    </div>
-  )
-}
-
-/** Shared tooltip. An HTML chart is interactive by default; hover is not optional. */
-function HoverTip({
-  active,
-  payload,
-  label,
-}: {
-  active?: boolean
-  payload?: { value?: number }[]
-  label?: string
-}) {
-  if (!active || !payload?.length) return null
-  return (
-    <div className="rounded-lg border border-white/15 bg-[#0b0726] px-3 py-2 text-xs shadow-xl">
-      <div className="font-medium text-ink-200">{label}</div>
-      <div className="text-ink-400 tabular-nums">
-        {payload[0].value} {payload[0].value === 1 ? "row" : "rows"}
-      </div>
-    </div>
-  )
-}
-
-function DataTable({ rows, caption }: { rows: Record<string, string | number>[]; caption?: string }) {
-  if (!rows.length) return <div className="text-xs text-ink-500">No rows.</div>
-  // Union of keys across rows, not just the first: search_rows omits columns that were
-  // blank for a given row, so a first-row-only header would silently drop fields.
-  const columns = Array.from(
-    rows.reduce<Set<string>>((set, r) => {
-      Object.keys(r).forEach((k) => set.add(k))
-      return set
-    }, new Set<string>())
-  )
-
-  return (
-    <div>
-      {caption && <div className="mb-2 text-[11px] text-ink-500">{caption}</div>}
-      <div className="overflow-x-auto rounded-lg border border-[var(--color-rule-strong)]">
-        <table className="w-full border-collapse text-[12.5px]">
-          <thead className="bg-ink-800">
-            <tr>
-              {columns.map((c) => (
-                <th key={c} className="whitespace-nowrap border-b border-[var(--color-rule-strong)] px-3 py-2 text-left font-semibold text-ink-200">
-                  {c}
-                </th>
-              ))}
-            </tr>
-          </thead>
-          <tbody>
-            {rows.map((r, i) => (
-              <tr key={i} className="transition-colors hover:bg-ink-850">
-                {columns.map((c) => (
-                  <td key={c} className="border-b border-[var(--color-rule)] px-3 py-2 align-top text-ink-300">
-                    {String(r[c] ?? "")}
-                  </td>
-                ))}
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      </div>
-    </div>
-  )
 }
 
 /** count_by_field -> horizontal bar. One hue; value carried by length + direct label. */
