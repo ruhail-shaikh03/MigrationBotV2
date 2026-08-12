@@ -45,8 +45,10 @@
   --color-rule: rgba(255, 255, 255, 0.07);
   --color-rule-strong: rgba(255, 255, 255, 0.13);
 
-  --font-sans: var(--font-plex-sans), ui-sans-serif, system-ui, sans-serif;
-  --font-mono: var(--font-plex-mono), ui-monospace, SFMono-Regular, monospace;
+  /* Family names come from the @fontsource @font-face declarations imported in
+     layout.tsx — no next/font CSS-variable indirection, so no build-time fetch. */
+  --font-sans: "IBM Plex Sans", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "IBM Plex Mono", ui-monospace, SFMono-Regular, monospace;
 
   /* Tightened from the previous rounded-2xl everywhere. An instrument should
      look machined, not pillowy. */

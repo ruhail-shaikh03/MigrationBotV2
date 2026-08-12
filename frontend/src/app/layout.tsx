@@ -1,27 +1,31 @@
 import type { Metadata } from "next";
-import { IBM_Plex_Sans, IBM_Plex_Mono } from "next/font/google";
 import { SessionProvider } from "next-auth/react";
-import "./globals.css";
 
 /**
- * IBM Plex, not Inter or Geist. Plex was drawn for enterprise data tooling, which
- * is exactly what this is; it holds up at the small sizes tables need, and its
- * tabular figures matter for a product that is mostly numbers in columns. The
- * mono cut carries every sheet coordinate, ID and count in the UI.
+ * Fonts are self-hosted through @fontsource rather than `next/font/google`.
+ *
+ * `next/font/google` downloads the woff2 files from fonts.gstatic.com during
+ * `next build`. That makes the build depend on outbound network access at image
+ * build time, and it broke the Docker build: the font requests returned 404 in
+ * the builder, after which Turbopack's fallback collapsed into a cascade of
+ * "Can't resolve '@vercel/turbopack-next/internal/font/google/font'". It passed
+ * locally only because the fetch succeeded there and Next cached the result —
+ * which is exactly the kind of works-on-my-machine dependency a container build
+ * should not have.
+ *
+ * @fontsource ships the woff2 files inside the npm package, so `npm ci` is the
+ * only network the build needs, and it already had to succeed for anything else
+ * to work. Latin subset and the four weights actually used, to keep the payload
+ * honest — the design uses 400/500/600/700 sans and 400/500 mono.
  */
-const plexSans = IBM_Plex_Sans({
-  variable: "--font-plex-sans",
-  subsets: ["latin"],
-  weight: ["400", "500", "600", "700"],
-  display: "swap",
-});
+import "@fontsource/ibm-plex-sans/latin-400.css";
+import "@fontsource/ibm-plex-sans/latin-500.css";
+import "@fontsource/ibm-plex-sans/latin-600.css";
+import "@fontsource/ibm-plex-sans/latin-700.css";
+import "@fontsource/ibm-plex-mono/latin-400.css";
+import "@fontsource/ibm-plex-mono/latin-500.css";
 
-const plexMono = IBM_Plex_Mono({
-  variable: "--font-plex-mono",
-  subsets: ["latin"],
-  weight: ["400", "500", "600"],
-  display: "swap",
-});
+import "./globals.css";
 
 export const metadata: Metadata = {
   // Was "SAP S/4HANA WRICEF Assistant", which contradicts the product: this works
@@ -38,9 +42,7 @@ export default function RootLayout({
 }>) {
   return (
     <html lang="en" className="h-full dark">
-      <body
-        className={`${plexSans.variable} ${plexMono.variable} flex h-full flex-col bg-ink-950 font-sans text-ink-100 antialiased`}
-      >
+      <body className="flex h-full flex-col bg-ink-950 font-sans text-ink-100 antialiased">
         <SessionProvider>{children}</SessionProvider>
       </body>
     </html>

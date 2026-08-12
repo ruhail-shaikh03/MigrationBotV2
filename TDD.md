@@ -872,7 +872,15 @@ the product, since the page metadata still described an "SAP S/4HANA WRICEF Assi
   wherever an outcome is reported and nowhere else. The admin metric tiles previously carried four
   decorative gradients, which made four unrelated counts look like four categories of one thing;
   only a non-zero failure count is coloured now.
-- **Type** is IBM Plex Sans + Plex Mono (`layout.tsx`), chosen over Inter/Geist because Plex was
+- **Type** is IBM Plex Sans + Plex Mono, **self-hosted via `@fontsource`**, not `next/font/google`.
+  That is a deployment constraint, not a preference: `next/font/google` downloads the woff2 files
+  from `fonts.gstatic.com` during `next build`, so the image build depends on outbound network
+  access. It broke the Docker build — the font requests 404'd in the builder and Turbopack's
+  fallback collapsed into a cascade of `Can't resolve
+  '@vercel/turbopack-next/internal/font/google/font'` — while passing locally, where the fetch
+  succeeded and Next cached it. `@fontsource` ships the woff2 files inside the npm package, so
+  `npm ci` is the only network the build needs. Latin subset, six faces, 128 KB total.
+  Chosen over Inter/Geist because Plex was
   drawn for enterprise data tooling and its tabular figures suit a product that is mostly numbers in
   columns — `font-variant-numeric: tabular-nums` is on globally. `.label-micro` (mono, uppercase,
   wide tracking) is the field-label and eyebrow voice throughout.
