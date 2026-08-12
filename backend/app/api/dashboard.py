@@ -85,16 +85,34 @@ def _row_dicts(headers: List[str], rows: List[List[str]]) -> List[Dict[str, str]
     return out
 
 
-def _column_descriptors(tab_schema: dict, headers: List[str]) -> List[Dict[str, Any]]:
+def _column_descriptors(
+    tab_schema: dict,
+    headers: List[str],
+    rows: Optional[List[Dict[str, str]]] = None,
+) -> List[Dict[str, Any]]:
     """What the grid should render, in sheet order, with roles marked.
 
     The frontend never decides which columns are people — it is told. That is the whole
     point of §7.4: a sheet naming a "QA Owner" gets a QA Owner column with no code change.
+
+    `has_data` reports whether the column holds a value in *any* row of the tab. Real
+    trackers carry a long tail of untouched columns — the reference sheet has a dozen
+    literally named "Column 15", "Column 16" and so on — and rendering them pushes the
+    columns that matter off-screen behind a horizontal scrollbar. Emptiness is measured
+    over the whole scan, not the current page, so paging never changes which columns
+    appear; the client hides them by default and can reveal them.
     """
     people = get_people_columns(tab_schema)
     effort = get_effort_columns(tab_schema)
     people_by_norm = {p["header"].lower().strip(): p for p in people}
     effort_by_norm = {e["header"].lower().strip(): e for e in effort}
+
+    populated = set()
+    if rows is not None:
+        for row in rows:
+            for header, value in row.items():
+                if str(value).strip():
+                    populated.add(header)
 
     descriptors = []
     for h in headers:
@@ -108,6 +126,7 @@ def _column_descriptors(tab_schema: dict, headers: List[str]) -> List[Dict[str, 
             "label": (person or eff or {}).get("label", h),
             "key": (person or eff or {}).get("key"),
             "kind": "person" if person else ("effort" if eff else "plain"),
+            "has_data": True if rows is None else h in populated,
         })
     return descriptors
 
@@ -184,7 +203,10 @@ async def list_rows(
 
     return {
         "tab": active_tab,
-        "columns": _column_descriptors(tab_schema, headers),
+        "project_name": project.project_name,
+        # Emptiness is judged across every scanned row, not the page being returned, so
+        # which columns show up does not change as the user pages through.
+        "columns": _column_descriptors(tab_schema, headers, rows),
         "people_columns": people,
         # The grid needs this to address a row when queueing an edit — without it the
         # client would have to guess which column is the identifier.
@@ -353,6 +375,7 @@ async def project_analytics(
     by_status: Dict[str, int] = {}
     workload: Dict[str, Dict[str, Any]] = {}
     effort_sources = set()
+    effort_rows = 0
 
     for row in rows:
         if status_header:
@@ -362,6 +385,7 @@ async def project_analytics(
         days, source = resolve_effort(row, effort, date_columns)
         if source:
             effort_sources.add(source)
+            effort_rows += 1
 
         due = parse_date(row.get(due_header)) if due_header else None
         is_overdue = bool(due) and _is_overdue(due, row, status_header)
@@ -404,6 +428,10 @@ async def project_analytics(
         # None means the sheet records no effort anywhere: the UI must show item counts
         # and say so rather than render a zero-day bar, which asserts something false.
         "days_source": days_source,
+        # How many rows actually yielded a day figure. On the reference sheet only ~40 of
+        # 412 rows carry both dates, so a bare "525 days" reads as a project total when it
+        # is a sum over a tenth of the work. The UI states the denominator instead.
+        "effort_rows": effort_rows,
         "has_due_dates": bool(due_header),
         "truncated": truncated,
     }

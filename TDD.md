@@ -823,7 +823,9 @@ disclosure. Google credentials come from the `X-Google-Access-Token` / `X-Google
 headers via `deps.py:get_google_auth`, the same path `/admin/projects/detect-metadata` uses.
 
 `list_rows` returns a `columns` descriptor list built by `_column_descriptors`, tagging each header
-`person`, `effort` or `plain` and carrying the sheet's own label (§7.4). The frontend never decides
+`person`, `effort` or `plain`, carrying the sheet's own label (§7.4), and flagging `has_data` —
+false when the column is empty in every scanned row (§14.5). Emptiness is measured over the whole
+scan rather than the returned page, so paging never changes which columns the grid shows. The frontend never decides
 which columns hold people — it is told, so a sheet naming a "QA Owner" renders one with no code
 change. Rows are zipped by `_row_dicts`, which **pads** short rows: Sheets omits trailing empty
 cells, and truncating the header list to match would silently drop real columns from the grid.
@@ -1244,7 +1246,45 @@ than a generic failure, because it names the fields the user lacks.
 
 `DataTable` gained an optional `renderCell` prop for this rather than the dashboard growing its own
 table: a second implementation would drift from this one in styling and in the ragged-row padding
-that §10.1 depends on.
+that §10.1 depends on. People-cells carry a dotted underline and a hover pencil — without an
+affordance an editable cell is visually identical to a read-only one, so nobody discovers it.
+
+### 14.5 Corrections from the first live run
+
+Verified against the deployed instance on a real 412-row tracker. Four things the local unit tests
+could not have caught, all fixed:
+
+- **The workload chart ranked by one metric and drew another.** `project_analytics` sorts by
+  `total_items`, but the chart plotted `total_days`, so three people with date spans appeared above
+  five drawn at length zero — the ordering contradicted the bar lengths, which is the one thing a
+  bar chart must not do. The client now sorts by the value it draws and drops zero-value entries.
+- **Days were charted on a sheet that barely records them.** Only ~40 of 412 rows carried both
+  dates, so "days" ranked three people above thirty shown as `0` — which reads as *no work* rather
+  than *no dates*. The chart now falls back to assignment counts below 50 % coverage (`effort_rows`
+  / `total_rows`, added to the response) and states why. The days figure keeps its denominator:
+  "525 days across 41 of 412 rows", never a bare total.
+- **Empty columns buried the useful ones.** The tracker ends in a dozen untouched headers literally
+  named "Column 15"…"Column 26". `_column_descriptors` now takes the scanned rows and marks
+  `has_data` per column — measured across the whole scan, not the current page, so paging never
+  changes which columns appear — and the grid hides them behind a "N empty columns are hidden"
+  toggle.
+- **The grid was four rows tall.** Free-text description columns wrapped to five or six lines.
+  `DataTable` gained `clampCells` (two lines, full text on hover) and `maxHeight` with a sticky
+  header row, since a 412-row grid scrolled past its own column names within one screen.
+
+Also: the chart allocates 40 px per row rather than 34, because real names wrap to two lines at the
+axis width and the tighter figure clipped the last bar out of its frame; and the page title now
+shows the project's own name instead of the literal string "Project Dashboard", which told a PM
+working three trackers nothing about which one was on screen.
+
+One finding is **recorded but not fixed**: the "Assigned to" filter lists 34 raw values including
+`Abdullah Azfar`/`Abdullah Azfer`, `Ahmad Qamar`/`Ahmed Qamar`, `Muhammad Dawood Umer`/`Muhmmad
+Dawood Umer`, multi-person cells (`Minhaj Alam & Dawood`, `Ahmed Qamar/Asif`) and the placeholder
+`Need Developer`. This is `people.py:normalise_person` behaving exactly as designed — exact
+matching, no fuzzy merging, no comma splitting (§7.4) — and the conservative choice is still right,
+since merging `Ahmad`/`Ahmed Qamar` would silently fuse two people who may be distinct. But the
+cost is now visible: one person's workload is split across several entries. The admin-maintained
+alias map noted in §7.4 is the fix, and it is not built.
 
 Tab switching is an explicit control frame, not prompt-driven (`chat/page.tsx:handleTabChange`):
 the client sends `{type: "switch_tab", tab_name}` and only applies the new `activeTab` once the

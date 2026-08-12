@@ -79,6 +79,8 @@ export function DataTable({
   caption,
   columns: explicitColumns,
   renderCell,
+  maxHeight,
+  clampCells,
 }: {
   rows: Record<string, string | number>[]
   caption?: string
@@ -91,6 +93,11 @@ export function DataTable({
    *  in styling and in the ragged-row handling above. Return undefined to fall through to
    *  the default text rendering. */
   renderCell?: (column: string, value: string, rowIndex: number) => React.ReactNode | undefined
+  /** Cap the table's height and scroll inside it, keeping the header row pinned. */
+  maxHeight?: number | string
+  /** Clamp long cell text to two lines. Free-text description columns otherwise wrap to
+   *  five or six lines, which drops a 400-row grid to four visible rows. */
+  clampCells?: boolean
 }) {
   if (!rows.length) return <div className="text-xs text-ink-500">No rows.</div>
   // Union of keys across rows, not just the first: search_rows omits columns that were
@@ -107,14 +114,19 @@ export function DataTable({
   return (
     <div>
       {caption && <div className="mb-2 text-[11px] text-ink-500">{caption}</div>}
-      <div className="overflow-x-auto rounded-lg border border-[var(--color-rule-strong)]">
+      {/* maxHeight + sticky header: a 400-row tracker scrolled past its own column names
+          within one screen, leaving the reader guessing which column they were in. */}
+      <div
+        className="overflow-auto rounded-lg border border-[var(--color-rule-strong)]"
+        style={maxHeight ? { maxHeight } : undefined}
+      >
         <table className="w-full border-collapse text-[12.5px]">
           <thead className="bg-ink-800">
             <tr>
               {columns.map((c) => (
                 <th
                   key={c}
-                  className="whitespace-nowrap border-b border-[var(--color-rule-strong)] px-3 py-2 text-left font-semibold text-ink-200"
+                  className="sticky top-0 z-10 whitespace-nowrap border-b border-[var(--color-rule-strong)] bg-ink-800 px-3 py-2 text-left font-semibold text-ink-200"
                 >
                   {c}
                 </th>
@@ -132,7 +144,16 @@ export function DataTable({
                       key={c}
                       className="border-b border-[var(--color-rule)] px-3 py-2 align-top text-ink-300"
                     >
-                      {custom === undefined ? value : custom}
+                      {custom !== undefined ? (
+                        custom
+                      ) : clampCells ? (
+                        // Full text stays reachable on hover rather than being lost.
+                        <span className="line-clamp-2 max-w-[26ch]" title={value}>
+                          {value}
+                        </span>
+                      ) : (
+                        value
+                      )}
                     </td>
                   )
                 })}
