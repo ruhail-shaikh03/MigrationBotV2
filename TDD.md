@@ -976,8 +976,19 @@ socket (§5.1, steps 23–24) — but the toast expired after five seconds and t
 the change with it, so anyone who looked away could not tell whether their edit had landed. Worse,
 the handler discarded `data.error` entirely, leaving "encountered an error" as the only signal.
 
-Each write is now a ledger line, keyed on `job_id` and upserted as frames arrive, so a job
-transitions `queued → applied`/`failed` **in place** rather than emitting two unrelated toasts. The
+Each write is a ledger line keyed on `job_id` and upserted, so a job transitions
+`queued → applied`/`failed` **in place** rather than emitting two unrelated toasts.
+
+The two ends of that transition come from different sources, which is not obvious and was got wrong
+first time. `worker.py` publishes a `queue_update` **only on terminal states** — there is no
+in-flight frame on the socket at all, so a real write verified against production appeared already
+`applied` and the queued state was unreachable. The queued row is therefore seeded client-side from
+the enqueue result itself, which already carries `job_id` and `status: "queued"`
+(`tool_dispatch.py`, §5.1 step 12); the terminal frame then resolves that same row by `job_id`.
+Without it a slow or stuck write would display nothing while it waited, which is precisely the case
+the ledger exists for.
+
+The
 line is stamped with its tab and row ID (§14.0), shows `field → value` where the tool reported
 them, and renders the classified `user_message` from `core/errors.py` (§8.2) inline on failure.
 Entries persist for the session until dismissed. The listener reads the active tab through a ref so

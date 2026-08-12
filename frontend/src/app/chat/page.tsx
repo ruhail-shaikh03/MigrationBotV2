@@ -142,6 +142,48 @@ export default function ChatPage() {
     }
   }, [])
 
+  // Seed the ledger the moment a write is accepted onto the queue.
+  //
+  // queue/worker.py only publishes a queue_update on TERMINAL states, so the
+  // socket never carries an in-flight frame — verified against a real write,
+  // which appeared already "applied". Without this the queued state would be
+  // unreachable and a slow write would show nothing at all while it waited.
+  // The enqueue result already carries job_id and status:"queued"
+  // (tool_dispatch.py), and the ledger upserts on job_id, so the queue_update
+  // that arrives later resolves this same row in place.
+  useEffect(() => {
+    const queued: LedgerEntry[] = []
+    for (const msg of messages) {
+      for (const tool of msg.toolCalls ?? []) {
+        const res = tool.result
+        if (!res || res.status !== "queued" || !res.job_id) continue
+        const args = tool.args || {}
+        const firstUpdate = Array.isArray(args.updates) ? args.updates[0] : undefined
+        queued.push({
+          jobId: String(res.job_id),
+          target: args.ricefw_id || "—",
+          tab: activeTabRef.current || "—",
+          field: firstUpdate?.field ?? args.set_field,
+          value: firstUpdate?.value ?? args.set_value,
+          tool: tool.name,
+          state: "queued",
+        })
+      }
+    }
+    if (queued.length === 0) return
+
+    setLedger((prev) => {
+      const next = [...prev]
+      let changed = false
+      for (const entry of queued) {
+        if (next.some((l) => l.jobId === entry.jobId)) continue
+        next.push(entry)
+        changed = true
+      }
+      return changed ? next : prev
+    })
+  }, [messages])
+
   // Handle message send
   const handleSend = (e: React.FormEvent) => {
     e.preventDefault()
