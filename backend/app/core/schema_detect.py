@@ -4,6 +4,7 @@ import re
 from typing import List, Dict, Any, Optional
 from openai import AsyncOpenAI
 from app.core.column_mapper import build_column_map
+from app.core.people import slugify_role
 
 logger = logging.getLogger("schema_detect")
 
@@ -112,9 +113,24 @@ Your goals:
    - "primary_id_position": Column letter (e.g., "A", "B", "C") matching the 0-indexed position of primary_id_column in the header row.
    - "status_column": Header tracking progress/status (e.g., Dev Status, State, Progress, Stage, Status). Set to null if missing.
    - "module_column": Header for functional area/module/workstream (e.g., Module, Area, Functional Code, Track). Set to null if missing.
-   - "assignee_column": Header for responsible owner (e.g., Assignee, Technical Resource, Resource, Owner, Lead). Set to null if missing.
+   - "people_columns": A LIST of EVERY column naming a person responsible for the item. A sheet
+     routinely has more than one (e.g. a technical resource AND a functional resource, or a
+     developer, a reviewer and a business owner) — return all of them, not just the first.
+     Each entry is {{"label": "<the sheet's own wording, cleaned of stray whitespace>",
+     "header": "<the header copied VERBATIM including any trailing space or typo>"}}.
+     Order them as they appear in the sheet. Return [] if the sheet names no people.
+     Do NOT invent a role the sheet does not have, and do NOT rename a role to a
+     conventional term — if the header says "Functinal Resource", the label is
+     "Functinal Resource", not "Functional Consultant".
+   - "assignee_column": The header of the FIRST entry in people_columns, or null if there are
+     none. Retained for backward compatibility with existing tools.
    - "description_column": Header for details/description (e.g., Description, Task Name, Summary, Details). Set to null if missing.
    - "type_column": Header for category/type (e.g., Type, RICEFW Type, Object Type, Category). Set to null if missing.
+   - "effort_columns": A LIST of columns expressing level of effort / duration / estimated
+     work (e.g. Est. Days, Effort, Man-Days, Duration, Story Points). Each entry is
+     {{"label": "<the sheet's own wording>", "header": "<verbatim header>",
+     "unit": "<days|hours|points, whichever the sheet means>"}}. Return [] if absent —
+     many trackers record no effort at all, and [] is the correct answer, not a guess.
    - "date_columns": Object mapping "go_live", "signoff", "start", "completion" to their respective headers, or null if missing.
 
 Every value below must be copied verbatim from THIS tab's header row, preserving exact
@@ -132,7 +148,14 @@ and must not be copied:
   "primary_id_position": "B",
   "status_column": "Current State",
   "module_column": "Workstream",
+  "people_columns": [
+    {{"label": "Owner", "header": "Owner"}},
+    {{"label": "Reviewer", "header": "Reviewer "}}
+  ],
   "assignee_column": "Owner",
+  "effort_columns": [
+    {{"label": "Effort", "header": "Effort (d)", "unit": "days"}}
+  ],
   "description_column": "Summary",
   "type_column": "Category",
   "date_columns": {{
@@ -181,13 +204,86 @@ async def detect_schema_config(
         
         result = _parse_json_safely(content)
         if result:
-            return result
-        
+            return _normalise_people_and_effort(result)
+
     except Exception as e:
         logger.error(f"Error during schema auto-detection for tab '{tab_name}': {e}")
 
     # Structural fallback if LLM request fails — derived from this sheet's own header row.
-    return _structural_fallback(raw_rows)
+    return _normalise_people_and_effort(_structural_fallback(raw_rows))
+
+
+def _normalise_people_and_effort(tab_schema: Dict[str, Any]) -> Dict[str, Any]:
+    """Give people_columns/effort_columns a well-formed shape before they are stored.
+
+    The model is asked for `label` and `header` but not `key`, and it may omit
+    people_columns entirely while still returning the older `assignee_column`. Doing the
+    repair once here means the persisted schema_config is always canonical, so neither
+    the read path nor the admin editor has to defend against a half-populated config.
+    The two directions are kept in sync both ways: a legacy `assignee_column` seeds the
+    list, and a detected list re-derives `assignee_column` from its first entry so tools
+    still reading the old key address the same column.
+    """
+    people = []
+    seen_headers = set()
+    for entry in tab_schema.get("people_columns") or []:
+        if not isinstance(entry, dict):
+            continue
+        header = entry.get("header")
+        if not header or header in seen_headers:
+            continue
+        seen_headers.add(header)
+        label = str(entry.get("label") or header).strip()
+        people.append({"key": slugify_role(label), "label": label, "header": header})
+
+    legacy = tab_schema.get("assignee_column")
+    if not people and legacy:
+        label = str(legacy).strip()
+        people.append({"key": slugify_role(label), "label": label, "header": legacy})
+
+    effort = []
+    seen_effort = set()
+    for entry in tab_schema.get("effort_columns") or []:
+        if not isinstance(entry, dict):
+            continue
+        header = entry.get("header")
+        if not header or header in seen_effort:
+            continue
+        seen_effort.add(header)
+        label = str(entry.get("label") or header).strip()
+        effort.append({
+            "key": slugify_role(label),
+            "label": label,
+            "header": header,
+            "unit": entry.get("unit") or "days",
+        })
+
+    tab_schema["people_columns"] = people
+    tab_schema["effort_columns"] = effort
+    # Keep the legacy single-slot key pointing at the first role so anything still
+    # reading assignee_column resolves to a column that exists.
+    tab_schema["assignee_column"] = people[0]["header"] if people else None
+    return tab_schema
+
+
+def normalise_schema_config(config: Dict[str, Any]) -> Dict[str, Any]:
+    """Canonicalise people/effort columns anywhere in a schema_config before it is stored.
+
+    The admin UI can PUT a hand-edited schema_config, and the role editor sends whatever
+    the admin assembled. Normalising on the way in makes the persisted config the single
+    canonical shape, so the read path never has to defend against a half-populated entry
+    written by hand. Handles both config shapes (multi-tab and flat) via the same
+    "tabs" key test that schema.py:get_tab_schema uses.
+    """
+    if not isinstance(config, dict):
+        return config
+    if "tabs" in config and isinstance(config.get("tabs"), dict):
+        config["tabs"] = {
+            name: _normalise_people_and_effort(tab) if isinstance(tab, dict) else tab
+            for name, tab in config["tabs"].items()
+        }
+        return config
+    return _normalise_people_and_effort(config)
 
 
 def _column_letter(index: int) -> str:
@@ -207,6 +303,16 @@ def _match_header(headers: List[str], keywords: List[str]) -> Optional[str]:
         if any(kw in lowered for kw in keywords):
             return header
     return None
+
+
+def _match_all_headers(headers: List[str], keywords: List[str]) -> List[str]:
+    """Every header containing any keyword, in sheet order.
+
+    The people/effort equivalents of _match_header: a sheet with both a technical and a
+    functional resource column needs both, and taking only the first is the bug this
+    whole change exists to fix.
+    """
+    return [h for h in headers if any(kw in h.lower() for kw in keywords)]
 
 
 def _structural_fallback(raw_rows: List[List[Any]]) -> Dict[str, Any]:
@@ -233,8 +339,13 @@ def _structural_fallback(raw_rows: List[List[Any]]) -> Dict[str, Any]:
             best_filled = filled
             header_idx = idx
 
-    headers = [str(c).strip() for c in rows[header_idx]] if header_idx < len(rows) else []
+    raw_headers = [str(c) for c in rows[header_idx]] if header_idx < len(rows) else []
+    headers = [h.strip() for h in raw_headers]
     non_empty = [h for h in headers if h]
+    # Stripped header -> the header exactly as the sheet spells it. people_columns must
+    # carry the verbatim form ("Technical Resource " keeps its trailing space) because
+    # that string is what addresses the column; the stripped form is only for display.
+    verbatim = {h.strip(): h for h in raw_headers if h.strip()}
 
     primary_id_column = non_empty[0] if non_empty else ""
     primary_id_position = _column_letter(headers.index(primary_id_column)) if primary_id_column else "A"
@@ -242,7 +353,25 @@ def _structural_fallback(raw_rows: List[List[Any]]) -> Dict[str, Any]:
     status_column = _match_header(non_empty, ["status", "state", "progress", "stage"])
     module_column = _match_header(non_empty, ["module", "workstream", "area", "team", "department", "function"])
     type_column = _match_header(non_empty, ["type", "category", "kind", "class"])
-    assignee_column = _match_header(non_empty, ["assign", "owner", "resource", "responsible", "developer", "engineer"])
+    people_headers = _match_all_headers(
+        non_empty,
+        ["assign", "owner", "resource", "responsible", "developer", "engineer", "consultant", "lead", "analyst"],
+    )
+    people_columns = [
+        {"key": slugify_role(h), "label": h, "header": verbatim.get(h, h)}
+        for h in people_headers
+    ]
+    assignee_column = people_columns[0]["header"] if people_columns else None
+
+    effort_headers = _match_all_headers(
+        non_empty,
+        ["effort", "man-day", "man day", "mandays", "duration", "estimate", "est.", "story point", "days"],
+    )
+    effort_columns = [
+        {"key": slugify_role(h), "label": h, "header": verbatim.get(h, h), "unit": "days"}
+        for h in effort_headers
+    ]
+
     description_column = _match_header(non_empty, ["description", "desc", "summary", "title", "subject"])
 
     date_columns = {
@@ -264,6 +393,8 @@ def _structural_fallback(raw_rows: List[List[Any]]) -> Dict[str, Any]:
         "primary_id_position": primary_id_position,
         "status_column": status_column,
         "module_column": module_column,
+        "people_columns": people_columns,
+        "effort_columns": effort_columns,
         "assignee_column": assignee_column,
         "description_column": description_column,
         "type_column": type_column,

@@ -11,7 +11,7 @@ from app.models.audit_log import AuditLog
 from app.config import settings
 from pydantic import BaseModel
 from app.sheets.client import build_sheets_service
-from app.core.schema_detect import parse_spreadsheet_url, detect_all_tabs
+from app.core.schema_detect import parse_spreadsheet_url, detect_all_tabs, normalise_schema_config
 from app.api.chat import llm_client
 
 logger = logging.getLogger("admin_api")
@@ -138,7 +138,7 @@ async def create_project(
     if existing.scalar():
         raise HTTPException(status_code=400, detail="Spreadsheet ID is already registered.")
 
-    schema_config = payload.schema_config or {}
+    schema_config = normalise_schema_config(payload.schema_config) if payload.schema_config else {}
     if not schema_config and google_auth.get("access_token"):
         try:
             service = build_sheets_service(
@@ -189,7 +189,10 @@ async def update_project(project_id: int, payload: ProjectUpdate, db: AsyncSessi
     if payload.is_active is not None:
         project.is_active = payload.is_active
     if payload.schema_config is not None:
-        project.schema_config = payload.schema_config
+        # Canonicalise on the way in: the role editor (and the raw JSON textarea beside
+        # it) can submit people/effort entries without keys, so the stored config is
+        # made well-formed here rather than defended against on every read.
+        project.schema_config = normalise_schema_config(payload.schema_config)
 
     await db.commit()
     return {"id": project.id, "status": "updated"}

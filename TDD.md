@@ -513,6 +513,74 @@ lists at all.
 config may still carry the old key; it is inert, and `test_core_logic.py` has a regression asserting
 so.
 
+### 7.4 People and effort columns
+
+Detection used to map a single `assignee_column`, described to the model as "header for
+responsible owner". A tracker routinely names more than one person per row — the reference sheet
+has both `"Technical Resource "` and `"Functinal Resource "` (the typo and both trailing spaces are
+real data, preserved in `COLUMN_ALIASES`) — so detection picked one and **silently discarded the
+rest**. Every functional consultant was invisible to the app: unsearchable, uncounted, absent from
+any assignment view.
+
+The replacement is a list, not a second slot. Two more hardcoded keys would have failed the same
+way on the next sheet, which has a QA owner, or only one resource column, or five. Each per-tab
+schema now carries:
+
+```json
+"people_columns": [
+  { "key": "technical_resource",  "label": "Technical Resource",  "header": "Technical Resource " },
+  { "key": "functinal_resource",  "label": "Functinal Resource",  "header": "Functinal Resource " }
+],
+"effort_columns": [
+  { "key": "est_days", "label": "Est. Days", "header": "Est Days", "unit": "days" }
+]
+```
+
+The invariant: **the app knows there is a set of people-columns; it never knows what they are
+called.** `header` is verbatim and is the only string used to address the column — trailing space
+and misspelling intact, resolved through `resolve_column` per §7.2. `label` is the sheet's own
+wording, stripped for display and rendered directly as a UI column heading, so a dashboard reads
+"Functinal Resource" on one sheet and "QA Owner" on another with no code change. `key` is a slug
+(`core/people.py:slugify_role`) used only in URLs and API filter params, never for lookup.
+
+**Back-compatibility is load-bearing.** Existing projects are not re-detected automatically (§16.3),
+so `core/schema.py:get_people_columns` synthesises a one-entry list from a legacy `assignee_column`
+when `people_columns` is absent — an un-migrated project keeps the single role it always had rather
+than rendering nobody. The reverse also holds: `assignee_column` is re-derived from
+`people_columns[0].header` wherever the config is written, so tools still reading the old key
+address a column that exists. `get_effort_columns` is the equivalent accessor for effort; `[]` is a
+normal answer, and callers must then show item **counts**, not days.
+
+Canonicalisation happens once, on the way in: `schema_detect.py:_normalise_people_and_effort` runs
+on every detection result (LLM or structural fallback), and `normalise_schema_config` wraps it for
+both admin write paths (`api/admin.py` create and update). The stored config is therefore always
+well-formed and the read path never defends against a half-populated entry hand-written through the
+admin UI's raw-JSON textarea.
+
+`core/people.py` holds the row-level resolution:
+
+- `normalise_person` — trim, collapse whitespace, case-fold, then **exact** comparison. No fuzzy
+  matching: merging two colleagues into one workload row is silent corruption, while showing one
+  person twice is visible and correctable. An admin alias map is the deliberate follow-up.
+- `collect_assignments` — every `(role, person)` pair a row names; the same person in two roles
+  yields two assignments, so callers can show a per-role split and a total. A cell holding several
+  names is treated as one value on purpose — splitting on commas turns `"Shaikh, Rohail"` into two
+  people who do not exist, and inventing colleagues is worse than under-splitting.
+- `resolve_effort` — returns `(value, source)` with source `"column" | "dates" | None`: an explicit
+  effort column first, else a start→due/go-live span, else nothing. It never synthesises a number.
+  `parse_effort` returns `None` rather than coercing junk to `0`, because a zero-day workload is a
+  claim ("this person has nothing on") and not an absence of data.
+
+The structural fallback matches **all** people/effort headers via
+`schema_detect.py:_match_all_headers` and preserves each header verbatim through a stripped→raw
+map, since that path previously stripped every header and would have destroyed the trailing space
+it needs to address the column.
+
+Detection is an LLM call over ten rows and will misfire, so `components/RoleColumnsEditor.tsx`
+(embedded in the `/admin/projects` detect wizard) lets an admin add, remove, relabel and set units
+on these columns against the tab's real header list. Headers are chosen, never typed, so the
+verbatim string cannot be corrupted by hand.
+
 `build_column_map` (`column_mapper.py:build_column_map`), a two-pass LLM alias generator, is now
 called from `schema_detect.py:detect_all_tabs` for every tracker tab it detects — it generates an
 alias map from that tab's own real headers and attaches it as `column_map` in the tab's schema,
@@ -1213,7 +1281,11 @@ against *any* company tracking sheet, not only a WRICEF tracker — is not fully
 - **Existing projects are unaffected until re-detected.** These changes alter what
   `detect_all_tabs` *produces*; a project onboarded earlier still carries its old `schema_config`
   in Postgres, possibly the hardcoded fallback. Re-running tab detection from `/admin/projects` is
-  the migration path — there is no automatic backfill.
+  the migration path — there is no automatic backfill. This now also governs `people_columns`
+  (§7.4): an un-migrated project resolves to the single synthesised role derived from its legacy
+  `assignee_column`, so a second resource column stays invisible until someone re-detects that tab
+  or adds it by hand in the role editor. The degradation is silent — the UI cannot distinguish
+  "this sheet has one resource column" from "this project was never re-detected".
 
 ### 16.4 Dependency advisories are outstanding
 **Severity: medium, unverified.** `npm audit` in `frontend/` reports 2 critical and 6 high, all in

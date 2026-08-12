@@ -6,6 +6,17 @@ import {
   FolderKanban, Plus, Edit2, Trash2, X, Check, AlertTriangle
 } from "lucide-react"
 import Modal from "@/components/Modal"
+import RoleColumnsEditor, { RoleColumn } from "@/components/RoleColumnsEditor"
+
+/** The parts of a detected per-tab schema this page reads. Deliberately partial —
+ *  the backend owns the full shape and adds keys this UI does not render. */
+interface TabSchema {
+  column_map?: Record<string, string[]>
+  critical_fields?: string[]
+  people_columns?: RoleColumn[]
+  effort_columns?: RoleColumn[]
+  assignee_column?: string | null
+}
 
 interface Project {
   id: number
@@ -219,6 +230,33 @@ export default function AdminProjects() {
         setDefaultTab(activeKeys[0])
       }
     }
+  }
+
+  /** Verbatim headers this tab has, for the role editor's add-menu.
+   *  column_map is keyed by the sheet's real headers (built by build_column_map from the
+   *  header row), which is the only place the untouched header strings survive. */
+  const headersForTab = (tabSchema: TabSchema | undefined): string[] => {
+    const fromMap = Object.keys(tabSchema?.column_map || {})
+    if (fromMap.length > 0) return fromMap
+    return tabSchema?.critical_fields || []
+  }
+
+  const handleRoleColumnsChange = (
+    tabName: string,
+    next: { people_columns: RoleColumn[]; effort_columns: RoleColumn[] }
+  ) => {
+    const nextMap = {
+      ...detectedTabsMap,
+      [tabName]: {
+        ...detectedTabsMap[tabName],
+        ...next,
+        // Keep the legacy single-slot key aimed at the first role. Tools that still read
+        // assignee_column then address a column that exists rather than a stale one.
+        assignee_column: next.people_columns[0]?.header ?? null,
+      },
+    }
+    setDetectedTabsMap(nextMap)
+    rebuildSchemaConfig(nextMap, selectedTabs, companyPrefix)
   }
 
   const handleCompanyPrefixChange = (val: string) => {
@@ -617,9 +655,13 @@ export default function AdminProjects() {
                                       <span className="text-ink-500">Module Col:</span>{" "}
                                       <span className="text-ink-200 font-medium">{tabSchema.module_column || "Module"}</span>
                                     </div>
-                                    <div>
-                                      <span className="text-ink-500">Assignee Col:</span>{" "}
-                                      <span className="text-ink-200 font-medium">{tabSchema.assignee_column || "Technical Resource"}</span>
+                                    <div className="col-span-2 mt-2 pt-3 border-t border-[var(--color-rule)]">
+                                      <RoleColumnsEditor
+                                        availableHeaders={headersForTab(tabSchema)}
+                                        peopleColumns={tabSchema.people_columns || []}
+                                        effortColumns={tabSchema.effort_columns || []}
+                                        onChange={(next) => handleRoleColumnsChange(tab, next)}
+                                      />
                                     </div>
 
                                     {critFields.length > 0 && (
