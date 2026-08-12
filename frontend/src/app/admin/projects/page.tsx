@@ -5,6 +5,7 @@ import { useEffect, useState } from "react"
 import {
   FolderKanban, Plus, Edit2, Trash2, X, Check, AlertTriangle
 } from "lucide-react"
+import Modal from "@/components/Modal"
 
 interface Project {
   id: number
@@ -370,21 +371,36 @@ export default function AdminProjects() {
           <div className="animate-spin rounded-full h-8 w-8 border-t-2 border-indigo-500"></div>
         </div>
       ) : projects.length === 0 ? (
-        <div className="glass-panel p-12 text-center text-zinc-500 rounded-2xl border border-white/5">
-          No projects registered. Click "New Project" to add one.
+        <div className="glass-panel rounded-2xl border border-white/5 p-12 text-center">
+          <FolderKanban className="mx-auto mb-3 h-8 w-8 text-zinc-600" />
+          <p className="text-sm font-semibold text-zinc-300">No projects registered yet</p>
+          <p className="mx-auto mt-1 max-w-sm text-xs leading-relaxed text-zinc-500">
+            Register a Google Sheet to let the agent read and update it. Auto-detect will work
+            out the tabs and columns for you.
+          </p>
+          <button
+            onClick={handleOpenCreateModal}
+            className="mx-auto mt-5 flex cursor-pointer items-center gap-2 rounded-xl bg-indigo-600 px-4 py-2.5 text-xs font-semibold uppercase tracking-wider text-white shadow-lg transition hover:bg-indigo-500"
+          >
+            <Plus className="h-4 w-4" />
+            <span>New Project</span>
+          </button>
         </div>
       ) : (
         <div className="glass-panel rounded-2xl border border-white/5 overflow-hidden">
           <div className="overflow-x-auto">
-            <table className="w-full text-left border-collapse">
+            {/* min-w is what makes the wrapper above actually scroll. With `w-full`
+                alone the table can never exceed its container, so narrow viewports
+                crushed the columns into unreadable slivers instead of scrolling. */}
+            <table className="w-full min-w-[900px] text-left border-collapse">
               <thead>
                 <tr className="border-b border-white/5 bg-white/[0.02]">
-                  <th className="p-4 text-xs font-bold uppercase tracking-wider text-zinc-400">Project Name</th>
-                  <th className="p-4 text-xs font-bold uppercase tracking-wider text-zinc-400">Spreadsheet ID</th>
-                  <th className="p-4 text-xs font-bold uppercase tracking-wider text-zinc-400">Default Tab</th>
-                  <th className="p-4 text-xs font-bold uppercase tracking-wider text-zinc-400">Prefix</th>
-                  <th className="p-4 text-xs font-bold uppercase tracking-wider text-zinc-400">Status</th>
-                  <th className="p-4 text-xs font-bold uppercase tracking-wider text-zinc-400 text-right">Actions</th>
+                  <th className="whitespace-nowrap p-4 text-xs font-bold uppercase tracking-wider text-zinc-400">Project Name</th>
+                  <th className="whitespace-nowrap p-4 text-xs font-bold uppercase tracking-wider text-zinc-400">Spreadsheet ID</th>
+                  <th className="whitespace-nowrap p-4 text-xs font-bold uppercase tracking-wider text-zinc-400">Default Tab</th>
+                  <th className="whitespace-nowrap p-4 text-xs font-bold uppercase tracking-wider text-zinc-400">Prefix</th>
+                  <th className="whitespace-nowrap p-4 text-xs font-bold uppercase tracking-wider text-zinc-400">Status</th>
+                  <th className="whitespace-nowrap p-4 text-right text-xs font-bold uppercase tracking-wider text-zinc-400">Actions</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-white/5">
@@ -434,20 +450,43 @@ export default function AdminProjects() {
       )}
 
       {/* Edit / Create Project Modal */}
-      {isModalOpen && (
-        <div className="fixed inset-0 z-50 overflow-y-auto bg-black/75 backdrop-blur-sm p-4 sm:p-6 flex items-center justify-center">
-          <div className="glass-panel w-full max-w-2xl rounded-2xl border border-white/10 shadow-2xl p-6 sm:p-8 relative flex flex-col my-auto max-h-[85vh] overflow-hidden">
+      <Modal
+        open={isModalOpen}
+        onClose={() => setIsModalOpen(false)}
+        size="xl"
+        // Auto-detection round-trips to Google and can take a while; a stray
+        // backdrop click shouldn't throw the detected tabs away.
+        dismissOnBackdrop={false}
+        title={editingProject ? "Modify Project Configuration" : "Register New Spreadsheet Project"}
+        icon={<FolderKanban className="h-5 w-5 shrink-0 text-indigo-400" />}
+        description={
+          editingProject
+            ? undefined
+            : "Point MigrationBot at any Google Sheet. Auto-detect reads the tabs and headers for you; manual mode is for sheets it can't work out."
+        }
+        footer={
+          <div className="flex items-center justify-end gap-3">
             <button
+              type="button"
               onClick={() => setIsModalOpen(false)}
-              className="absolute top-6 right-6 p-1.5 rounded-lg text-zinc-400 hover:text-zinc-200 hover:bg-white/5 transition cursor-pointer"
+              className="cursor-pointer rounded-xl border border-white/10 px-5 py-2.5 text-xs font-semibold uppercase tracking-wider text-zinc-400 transition hover:text-zinc-200"
             >
-              <X className="h-5 w-5" />
+              Cancel
             </button>
-
-            <h3 className="text-xl font-bold text-zinc-100 mb-2">
-              {editingProject ? "Modify Project Configs" : "Register New Spreadsheet Project"}
-            </h3>
-
+            {/* `form=` keeps this pinned in the footer. It used to be the last child
+                of the scrolling <form>, so on a long config the Save button scrolled
+                out of sight and the dialog looked like it had no way to commit. */}
+            <button
+              type="submit"
+              form="project-form"
+              disabled={isAutoDetectMode && !editingProject && Object.keys(detectedTabsMap).length === 0}
+              className="cursor-pointer rounded-xl bg-indigo-600 px-5 py-2.5 text-xs font-semibold uppercase tracking-wider text-white shadow-lg transition hover:bg-indigo-500 disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              Save Changes
+            </button>
+          </div>
+        }
+      >
             {!editingProject && (
               <div className="flex gap-4 border-b border-white/5 pb-3 mb-4">
                 <button
@@ -483,7 +522,7 @@ export default function AdminProjects() {
               </div>
             )}
 
-            <form onSubmit={handleSave} className="space-y-5 overflow-y-auto pr-2 flex-1">
+            <form id="project-form" onSubmit={handleSave} className="space-y-5">
               {isAutoDetectMode && !editingProject ? (
                 <div className="space-y-5 animate-slide-up">
                   {/* Step 1: URL input */}
@@ -718,27 +757,8 @@ export default function AdminProjects() {
                   </div>
                 </div>
               )}
-
-              <div className="flex items-center justify-end gap-3 pt-4 border-t border-white/5">
-                <button
-                  type="button"
-                  onClick={() => setIsModalOpen(false)}
-                  className="px-5 py-2.5 rounded-xl border border-white/10 text-zinc-400 hover:text-zinc-200 text-xs font-semibold tracking-wider uppercase transition cursor-pointer"
-                >
-                  Cancel
-                </button>
-                <button
-                  type="submit"
-                  disabled={isAutoDetectMode && !editingProject && Object.keys(detectedTabsMap).length === 0}
-                  className="px-5 py-2.5 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-semibold tracking-wider uppercase transition cursor-pointer shadow-lg disabled:opacity-50 disabled:cursor-not-allowed"
-                >
-                  Save Changes
-                </button>
-              </div>
             </form>
-          </div>
-        </div>
-      )}
+      </Modal>
     </div>
   )
 }

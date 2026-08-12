@@ -92,6 +92,14 @@ after writes. If a read looks stale, suspect the cache before the Sheets API.
   The minted JWT is cached on the NextAuth token and re-signed only near expiry or when the
   Google token rotates. Don't reintroduce per-call signing: it changes `session.apiToken`'s
   identity on every session read and tears down the chat WebSocket (TDD §4.1).
+- **Only Caddy publishes a port.** Postgres, Redis, the backend and the frontend are reachable
+  only over the compose network; `DB_PASSWORD` and `REDIS_PASSWORD` are required and compose
+  aborts without them. Re-adding a `ports:` mapping puts that service on the public internet —
+  Docker's iptables rules bypass UFW, which is how the 2026-08 host compromise happened (TDD §15.1).
+- **Tool failures are classified, not stringified.** `core/errors.py:classify_error` assigns an
+  `error_kind` and a user-safe `user_message`; `failure_note()` picks the guidance the model sees.
+  Returning a bare `{"ok": False, "error": str(e)}` from a new tool regresses this — the model
+  will retry outages as if they were bad arguments (TDD §8.2).
 - **Sheets rate limits** hit the write path hardest (worker, 1/sec) and the cache-fill path
   (`sync_sheet_to_db` scans up to 2000 rows). `_with_retry()` backs off on 429/500/503,
   max 4 attempts.

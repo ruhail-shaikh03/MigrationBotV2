@@ -33,6 +33,32 @@ body {
   color: var(--foreground);
   font-feature-settings: "cv02", "cv03", "cv04", "cv11";
   overflow-x: hidden;
+  /* Reserve the scrollbar's width even when nothing is scrolling, so opening a
+     dialog (which locks body scroll) doesn't shift the whole page sideways. */
+  scrollbar-gutter: stable;
+}
+
+/* Keyboard focus was invisible everywhere: almost every control sets
+   `focus:outline-none` for the custom border treatment, but nothing replaced the
+   ring, so tabbing through a form showed no indication of position at all. This
+   restores it globally for keyboard users without putting a ring on mouse clicks. */
+:focus-visible {
+  outline: 2px solid var(--ring);
+  outline-offset: 2px;
+  border-radius: 0.5rem;
+}
+
+/* Respect the OS "reduce motion" setting. The blob/ping/pulse animations here run
+   indefinitely, which is exactly the category that triggers vestibular symptoms. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
 }
 
 /* Glassmorphism Utility Panels */

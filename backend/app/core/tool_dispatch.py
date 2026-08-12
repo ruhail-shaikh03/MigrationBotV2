@@ -1,6 +1,8 @@
 import logging
 from typing import Dict, Any, Optional
 
+from app.core.errors import error_result, INVALID_REQUEST, USER_MESSAGE
+
 logger = logging.getLogger("tool_dispatch")
 
 async def dispatch_tool(
@@ -57,8 +59,9 @@ async def dispatch_tool(
             logger.warning(f"Sheets layer not implemented yet. Mocking result for read tool: {tool_name}")
             return {"ok": True, "data": f"Mock result for {tool_name}"}
         except Exception as e:
-            logger.error(f"Error executing read tool {tool_name}: {e}")
-            return {"ok": False, "error": str(e)}
+            # Classified rather than str(e): a Sheets 429 and a mistyped column
+            # name are both "an error" here, but only one is worth retrying.
+            return error_result(e, tool_name)
 
     # 2. WRITE/MUTATION PATHWAY (Queue-backed write)
     elif tool_name in ("update_cell", "bulk_update", "format_row", "add_row"):
@@ -104,7 +107,14 @@ async def dispatch_tool(
             logger.warning(f"Queue layer not implemented yet. Mocking queue action for write tool: {tool_name}")
             return {"ok": True, "message": f"Mock: Operation {tool_name} successfully enqueued"}
         except Exception as e:
-            logger.error(f"Error enqueuing write tool {tool_name}: {e}")
-            return {"ok": False, "error": str(e)}
+            # Reaching here means the job never made it onto the queue, so nothing
+            # will retry it later — the classification is what stops the model
+            # from reporting a queue outage as a rejected edit.
+            return error_result(e, tool_name)
 
-    return {"ok": False, "error": f"Unknown tool: {tool_name}"}
+    return {
+        "ok": False,
+        "error": f"Unknown tool: {tool_name}",
+        "error_kind": INVALID_REQUEST,
+        "user_message": USER_MESSAGE[INVALID_REQUEST],
+    }

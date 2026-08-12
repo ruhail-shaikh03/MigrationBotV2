@@ -120,15 +120,17 @@ export default function AdminLayout({
 
   return (
     <div className="flex h-screen bg-[#030014] text-zinc-100 font-sans overflow-hidden">
-      {/* Sidebar Navigation */}
-      <aside className="w-64 glass-panel border-r border-white/5 flex flex-col justify-between">
-        <div className="p-6 space-y-8">
+      {/* Sidebar Navigation. Collapses to an icon rail below lg rather than eating
+          a quarter of a narrow viewport — `shrink-0` stops flex from squeezing it
+          into the content when a wide table is present. */}
+      <aside className="flex w-16 shrink-0 flex-col justify-between border-r border-white/5 glass-panel lg:w-64">
+        <div className="space-y-8 p-3 lg:p-6">
           {/* Logo */}
           <div className="flex items-center gap-3">
-            <div className="h-8 w-8 rounded-lg bg-indigo-600 flex items-center justify-center text-white font-extrabold text-lg">
+            <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-indigo-600 text-lg font-extrabold text-white">
               M
             </div>
-            <div>
+            <div className="hidden lg:block">
               <h1 className="font-bold text-sm tracking-tight">MigrationBot</h1>
               <span className="text-[10px] text-zinc-500 font-semibold uppercase tracking-wider">Admin Panel</span>
             </div>
@@ -143,14 +145,16 @@ export default function AdminLayout({
                 <Link
                   key={item.name}
                   href={item.href}
-                  className={`flex items-center gap-3 px-4 py-3 rounded-xl text-xs font-semibold tracking-wider uppercase transition ${
+                  title={item.name}
+                  aria-current={isActive ? "page" : undefined}
+                  className={`flex items-center justify-center gap-3 rounded-xl px-3 py-3 text-xs font-semibold uppercase tracking-wider transition lg:justify-start lg:px-4 ${
                     isActive
                       ? "bg-indigo-600 text-white shadow-md"
-                      : "text-zinc-400 hover:text-zinc-200 hover:bg-white/5"
+                      : "text-zinc-400 hover:bg-white/5 hover:text-zinc-200"
                   }`}
                 >
-                  <Icon className="h-4.5 w-4.5" />
-                  <span>{item.name}</span>
+                  <Icon className="h-4.5 w-4.5 shrink-0" />
+                  <span className="hidden lg:inline">{item.name}</span>
                 </Link>
               )
             })}
@@ -158,20 +162,23 @@ export default function AdminLayout({
         </div>
 
         {/* Footer Sidebar buttons */}
-        <div className="p-6 border-t border-white/5 space-y-2">
+        <div className="space-y-2 border-t border-white/5 p-3 lg:p-6">
           <Link
             href="/chat"
-            className="flex items-center gap-3 px-4 py-3 rounded-xl text-xs font-semibold tracking-wider uppercase text-zinc-400 hover:text-zinc-200 hover:bg-white/5 transition"
+            title="Agent Chat"
+            className="flex items-center justify-center gap-3 rounded-xl px-3 py-3 text-xs font-semibold uppercase tracking-wider text-zinc-400 transition hover:bg-white/5 hover:text-zinc-200 lg:justify-start lg:px-4"
           >
-            <MessageSquare className="h-4.5 w-4.5" />
-            <span>Agent Chat</span>
+            <MessageSquare className="h-4.5 w-4.5 shrink-0" />
+            <span className="hidden lg:inline">Agent Chat</span>
           </Link>
         </div>
       </aside>
 
-      {/* Main Panel Content Area */}
-      <div className="flex-1 flex flex-col overflow-hidden">
-        <main className="flex-1 overflow-y-auto p-8 relative">
+      {/* Main Panel Content Area. `min-w-0` is what allows the wide admin tables to
+          scroll inside their own container instead of stretching this column and
+          pushing the whole layout sideways. */}
+      <div className="flex min-w-0 flex-1 flex-col overflow-hidden">
+        <main className="relative flex-1 overflow-y-auto p-5 sm:p-8">
           {/* Grid Background Overlay */}
           <div className="absolute inset-0 -z-10 bg-[linear-gradient(to_right,#ffffff01_1px,transparent_1px),linear-gradient(to_bottom,#ffffff01_1px,transparent_1px)] bg-[size:3rem_3rem]"></div>
           {children}

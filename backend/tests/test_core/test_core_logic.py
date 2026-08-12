@@ -8,6 +8,10 @@ from app.core.permissions import PermissionChecker, get_user_permissions
 from app.core import audit
 from app.core.agentic_loop import run_agentic_loop
 from app.core.data_quality import DataQualityChecker
+from app.core.errors import (
+    classify_error, error_result, failure_note,
+    AUTH, INFRASTRUCTURE, NOT_FOUND, RATE_LIMIT, UPSTREAM,
+)
 
 # Test cases below
 
@@ -319,8 +323,9 @@ async def test_agentic_loop_flags_queued_write_as_pending():
     assert len(tool_messages) == 1
     assert "[System Note]" in tool_messages[0]["content"]
     assert "not yet applied" in tool_messages[0]["content"]
-    # A failure-recovery note must never appear alongside a successful queued result.
-    assert "[System Recovery Note]" not in tool_messages[0]["content"]
+    # A failure note must never appear alongside a successful queued result.
+    # (failure_note() formats as "Tool 'x' failed (<kind>): ...")
+    assert "failed (" not in tool_messages[0]["content"]
 
 
 # 8. Regression for TDD §16.3 (Phase 4): a caller get_user_permissions can't place —
@@ -610,3 +615,52 @@ def test_unrestricted_editor_still_allowed_add_row_and_format_row():
 
     allowed, _ = editor.can_execute("format_row", {"ricefw_id": "SD-012", "color": "red", "scope": "entire_row"})
     assert allowed is True
+
+
+# 20. Regression for the 2026-08 incident: a Redis outage must be classified as
+# infrastructure, not as a bad argument. The model previously received the same
+# "formulate a corrected tool call" note for every failure, so it rewrote calls
+# that could never succeed and told the user their edit had been rejected.
+def test_classify_redis_readonly_as_infrastructure():
+    import redis.exceptions as redis_exc
+
+    exc = redis_exc.ReadOnlyError("You can't write against a read only replica.")
+    assert classify_error(exc) == INFRASTRUCTURE
+
+    result = error_result(exc, "update_cell")
+    assert result["ok"] is False
+    assert result["error_kind"] == INFRASTRUCTURE
+    # The raw text is preserved for logs/audit...
+    assert "read only replica" in result["error"]
+    # ...but what the user is shown never mentions replicas.
+    assert "replica" not in result["user_message"].lower()
+    assert "not saved" in result["user_message"].lower()
+
+
+# 21. Guidance must forbid a retry for failures a retry cannot fix, and invite one
+# only where corrected arguments could plausibly succeed.
+def test_failure_note_guidance_differs_by_kind():
+    infra = failure_note("update_cell", error_result(ConnectionError("redis down"), "update_cell"))
+    assert "infrastructure" in infra
+    assert "Do NOT retry" in infra
+
+    bad_args = failure_note("search_rows", error_result(KeyError("Dev Status"), "search_rows"))
+    assert "invalid_request" in bad_args
+    assert "retry once with corrected arguments" in bad_args
+
+
+# 22. Google HTTP statuses map to distinct kinds — 429 must not read as a
+# permission problem, and 403 must not read as something to retry.
+@pytest.mark.parametrize("status,expected", [
+    (401, AUTH),
+    (404, NOT_FOUND),
+    (429, RATE_LIMIT),
+    (503, UPSTREAM),
+])
+def test_classify_google_http_errors(status, expected):
+    from googleapiclient.errors import HttpError
+
+    resp = MagicMock()
+    resp.status = status
+    resp.reason = "err"
+    assert classify_error(HttpError(resp=resp, content=b"{}")) == expected
