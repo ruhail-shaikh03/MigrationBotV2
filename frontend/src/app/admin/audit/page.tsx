@@ -171,16 +171,17 @@ export default function AdminAudit() {
       ) : (
         <div className="glass-panel rounded-2xl border border-white/5 overflow-hidden">
           <div className="overflow-x-auto">
-            <table className="w-full text-left border-collapse">
+            {/* Seven columns including an old→new diff; needs the most room. */}
+            <table className="w-full min-w-[1080px] text-left border-collapse">
               <thead>
                 <tr className="border-b border-white/5 bg-white/[0.02]">
-                  <th className="p-4 text-xs font-bold uppercase tracking-wider text-zinc-400">Timestamp</th>
-                  <th className="p-4 text-xs font-bold uppercase tracking-wider text-zinc-400">User</th>
-                  <th className="p-4 text-xs font-bold uppercase tracking-wider text-zinc-400">Tool Executed</th>
-                  <th className="p-4 text-xs font-bold uppercase tracking-wider text-zinc-400">Tab / RICEFW ID</th>
-                  <th className="p-4 text-xs font-bold uppercase tracking-wider text-zinc-400">Field Targeted</th>
-                  <th className="p-4 text-xs font-bold uppercase tracking-wider text-zinc-400">Changes (Old → New)</th>
-                  <th className="p-4 text-xs font-bold uppercase tracking-wider text-zinc-400">Result</th>
+                  <th className="whitespace-nowrap p-4 text-xs font-bold uppercase tracking-wider text-zinc-400">Timestamp</th>
+                  <th className="whitespace-nowrap p-4 text-xs font-bold uppercase tracking-wider text-zinc-400">User</th>
+                  <th className="whitespace-nowrap p-4 text-xs font-bold uppercase tracking-wider text-zinc-400">Tool Executed</th>
+                  <th className="whitespace-nowrap p-4 text-xs font-bold uppercase tracking-wider text-zinc-400">Tab / RICEFW ID</th>
+                  <th className="whitespace-nowrap p-4 text-xs font-bold uppercase tracking-wider text-zinc-400">Field Targeted</th>
+                  <th className="whitespace-nowrap p-4 text-xs font-bold uppercase tracking-wider text-zinc-400">Changes (Old → New)</th>
+                  <th className="whitespace-nowrap p-4 text-xs font-bold uppercase tracking-wider text-zinc-400">Result</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-white/5 text-xs">

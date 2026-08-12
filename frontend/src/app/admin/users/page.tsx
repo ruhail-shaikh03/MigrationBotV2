@@ -2,9 +2,10 @@
 
 import { useSession } from "next-auth/react"
 import { useEffect, useState } from "react"
-import { 
+import {
   Users, Plus, Edit2, Trash2, X, AlertTriangle, ShieldCheck
 } from "lucide-react"
+import Modal from "@/components/Modal"
 
 interface PermissionRecord {
   id: number
@@ -211,15 +212,16 @@ export default function AdminUsers() {
       ) : (
         <div className="glass-panel rounded-2xl border border-white/5 overflow-hidden">
           <div className="overflow-x-auto">
-            <table className="w-full text-left border-collapse">
+            {/* See projects/page.tsx: min-w is required for the wrapper to scroll. */}
+            <table className="w-full min-w-[900px] text-left border-collapse">
               <thead>
                 <tr className="border-b border-white/5 bg-white/[0.02]">
-                  <th className="p-4 text-xs font-bold uppercase tracking-wider text-zinc-400">User Email</th>
-                  <th className="p-4 text-xs font-bold uppercase tracking-wider text-zinc-400">Project Context</th>
-                  <th className="p-4 text-xs font-bold uppercase tracking-wider text-zinc-400">Role Role</th>
-                  <th className="p-4 text-xs font-bold uppercase tracking-wider text-zinc-400">Allowed Fields</th>
-                  <th className="p-4 text-xs font-bold uppercase tracking-wider text-zinc-400">Denied Ops</th>
-                  <th className="p-4 text-xs font-bold uppercase tracking-wider text-zinc-400 text-right">Actions</th>
+                  <th className="whitespace-nowrap p-4 text-xs font-bold uppercase tracking-wider text-zinc-400">User Email</th>
+                  <th className="whitespace-nowrap p-4 text-xs font-bold uppercase tracking-wider text-zinc-400">Project Context</th>
+                  <th className="whitespace-nowrap p-4 text-xs font-bold uppercase tracking-wider text-zinc-400">Role</th>
+                  <th className="whitespace-nowrap p-4 text-xs font-bold uppercase tracking-wider text-zinc-400">Allowed Fields</th>
+                  <th className="whitespace-nowrap p-4 text-xs font-bold uppercase tracking-wider text-zinc-400">Denied Ops</th>
+                  <th className="whitespace-nowrap p-4 text-right text-xs font-bold uppercase tracking-wider text-zinc-400">Actions</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-white/5">
@@ -269,22 +271,34 @@ export default function AdminUsers() {
       )}
 
       {/* Edit / Create User Permission Mapping Modal */}
-      {isModalOpen && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm p-4">
-          <div className="glass-panel w-full max-w-xl rounded-2xl border border-white/10 shadow-2xl p-8 relative">
+      <Modal
+        open={isModalOpen}
+        onClose={() => setIsModalOpen(false)}
+        title={editingPerm ? "Edit User Permissions Policy" : "New User Permission Mapping"}
+        icon={<ShieldCheck className="h-5 w-5 shrink-0 text-indigo-400" />}
+        description="Scoped to one user and one project. Roles gate which tools run; allowed fields gate which columns they can write."
+        footer={
+          <div className="flex items-center justify-end gap-3">
             <button
+              type="button"
               onClick={() => setIsModalOpen(false)}
-              className="absolute top-6 right-6 p-1.5 rounded-lg text-zinc-400 hover:text-zinc-200 hover:bg-white/5 transition cursor-pointer"
+              className="cursor-pointer rounded-xl border border-white/10 px-5 py-2.5 text-xs font-semibold uppercase tracking-wider text-zinc-400 transition hover:text-zinc-200"
             >
-              <X className="h-5 w-5" />
+              Cancel
             </button>
-
-            <h3 className="text-xl font-bold text-zinc-100 mb-6 flex items-center gap-2">
-              <ShieldCheck className="h-5.5 w-5.5 text-indigo-400" />
-              {editingPerm ? "Edit User Permissions Policy" : "Create New User RBAC Rule Mapping"}
-            </h3>
-
-            <form onSubmit={handleSave} className="space-y-5">
+            {/* `form=` lets the submit button live outside the <form>, which is what
+                keeps it pinned in the footer instead of scrolling away with the fields. */}
+            <button
+              type="submit"
+              form="permission-form"
+              className="cursor-pointer rounded-xl bg-indigo-600 px-5 py-2.5 text-xs font-semibold uppercase tracking-wider text-white shadow-lg transition hover:bg-indigo-500"
+            >
+              Save Configuration
+            </button>
+          </div>
+        }
+      >
+            <form id="permission-form" onSubmit={handleSave} className="space-y-5">
               <div className="space-y-1.5">
                 <label className="text-xs font-semibold uppercase text-zinc-400">User Email Address</label>
                 <input
@@ -355,26 +369,8 @@ export default function AdminUsers() {
                 />
                 <span className="text-[10px] text-zinc-500 block">List tools to forbid (e.g. format_row, add_row, bulk_update).</span>
               </div>
-
-              <div className="flex items-center justify-end gap-3 pt-4 border-t border-white/5">
-                <button
-                  type="button"
-                  onClick={() => setIsModalOpen(false)}
-                  className="px-5 py-2.5 rounded-xl border border-white/10 text-zinc-400 hover:text-zinc-200 text-xs font-semibold tracking-wider uppercase transition cursor-pointer"
-                >
-                  Cancel
-                </button>
-                <button
-                  type="submit"
-                  className="px-5 py-2.5 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-semibold tracking-wider uppercase transition cursor-pointer shadow-lg"
-                >
-                  Save Configuration
-                </button>
-              </div>
             </form>
-          </div>
-        </div>
-      )}
+      </Modal>
     </div>
   )
 }

@@ -180,8 +180,8 @@ export default function ChatPage() {
       <div className="flex flex-1 flex-col relative z-10">
         
         {/* Header Bar */}
-        <header className="glass-panel px-6 py-4 flex items-center justify-between border-b border-white/5">
-          <div className="flex items-center gap-6">
+        <header className="glass-panel flex flex-wrap items-center justify-between gap-3 border-b border-white/5 px-4 py-4 sm:px-6">
+          <div className="flex min-w-0 items-center gap-4 sm:gap-6">
             <div className="flex items-center gap-3">
               <div className="h-8 w-8 rounded-lg bg-indigo-600 flex items-center justify-center text-white font-extrabold text-lg">
                 M
@@ -211,8 +211,9 @@ export default function ChatPage() {
             </div>
           </div>
 
-          {/* Module Tabs (SD, MM, FI, etc.) */}
-          <div className="hidden md:flex items-center gap-1.5 bg-[#120e2e]/60 p-1 rounded-xl border border-white/5">
+          {/* Sheet tabs. Previously `hidden md:flex`, which left no way at all to
+              change tab on a narrow screen; now it scrolls sideways instead. */}
+          <div className="flex max-w-full items-center gap-1.5 overflow-x-auto rounded-xl border border-white/5 bg-[#120e2e]/60 p-1">
             {(activeProject?.schema_config?.tabs 
               ? Object.keys(activeProject.schema_config.tabs) 
               : (activeProject?.schema_config?.global?.valid_modules || [])
@@ -221,7 +222,7 @@ export default function ChatPage() {
                 key={tab}
                 onClick={() => handleTabChange(tab)}
                 disabled={!isConnected}
-                className={`px-4 py-1.5 rounded-lg text-xs font-semibold tracking-wide transition cursor-pointer ${
+                className={`shrink-0 cursor-pointer rounded-lg px-4 py-1.5 text-xs font-semibold tracking-wide transition ${
                   activeTab === tab 
                     ? "bg-indigo-600 text-white shadow-md"
                     : "text-zinc-400 hover:text-zinc-200 hover:bg-white/5"
@@ -273,10 +274,13 @@ export default function ChatPage() {
           </div>
         </header>
 
-        {/* Messages Feed */}
-        <div className="flex-1 overflow-y-auto px-6 py-8 space-y-6">
+        {/* Messages Feed. The column is capped to the same max-w-4xl the input bar
+            uses — it was full-bleed, so on a wide monitor the conversation sprawled
+            edge to edge while the composer sat centred underneath it. */}
+        <div className="flex-1 overflow-y-auto px-4 py-8 sm:px-6">
+          <div className="mx-auto flex min-h-full w-full max-w-4xl flex-col space-y-6">
           {messages.length === 0 ? (
-            <div className="flex flex-col items-center justify-center h-full text-center max-w-lg mx-auto space-y-4">
+            <div className="mx-auto flex max-w-lg flex-1 flex-col items-center justify-center space-y-4 text-center">
               <div className="p-4 bg-indigo-600/10 text-indigo-400 rounded-full border border-indigo-500/20 animate-pulse-slow">
                 <Database className="h-10 w-10" />
               </div>
@@ -307,7 +311,7 @@ export default function ChatPage() {
                   key={msg.id} 
                   className={`flex w-full ${isUser ? "justify-end" : "justify-start"} animate-slide-up`}
                 >
-                  <div className={`max-w-[80%] flex flex-col space-y-2`}>
+                  <div className="flex min-w-0 max-w-[92%] flex-col space-y-2 sm:max-w-[85%]">
                     
                     {/* Message Bubble */}
                     <div 
@@ -383,10 +387,11 @@ export default function ChatPage() {
             })
           )}
           <div ref={messagesEndRef} />
+          </div>
         </div>
 
         {/* Input Bar */}
-        <footer className="p-6 bg-[#030014] border-t border-white/5">
+        <footer className="border-t border-white/5 bg-[#030014] p-4 sm:p-6">
           <form onSubmit={handleSend} className="max-w-4xl mx-auto flex items-center gap-3 relative">
             <input
               type="text"
