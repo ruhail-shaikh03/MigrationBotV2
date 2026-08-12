@@ -397,8 +397,13 @@ button {
   }
 }
 
+/* No fill mode, deliberately. `forwards`/`both` leaves the final `transform:
+   translateY(0)` applied permanently, and any non-none transform makes the
+   element a containing block for `position: fixed` descendants — which is how
+   the admin page root ended up capturing the modal overlay (see Modal.tsx).
+   Without a fill mode the transform is gone once the 220ms entrance ends. */
 .animate-rise {
-  animation: rise 0.22s cubic-bezier(0.16, 1, 0.3, 1) both;
+  animation: rise 0.22s cubic-bezier(0.16, 1, 0.3, 1);
 }
 
 @keyframes ledger-pulse {

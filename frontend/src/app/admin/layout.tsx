@@ -71,7 +71,7 @@ export default function AdminLayout({
     return (
       <div className="flex h-screen items-center justify-center bg-ink-950 text-ink-100 p-6">
         <div className="panel max-w-md w-full p-8 rounded-xl border border-[color-mix(in_srgb,var(--color-failed)_25%,transparent)] text-center space-y-6">
-          <div className="h-16 w-16 bg-[color-mix(in_srgb,var(--color-failed)_10%,transparent)] border border-rose-500/30 text-failed rounded-xl flex items-center justify-center mx-auto">
+          <div className="h-16 w-16 bg-[color-mix(in_srgb,var(--color-failed)_10%,transparent)] border border-[color-mix(in_srgb,var(--color-failed)_30%,transparent)] text-failed rounded-xl flex items-center justify-center mx-auto">
             <ShieldX className="h-8 w-8" />
           </div>
           <div>
@@ -127,7 +127,7 @@ export default function AdminLayout({
         <div className="space-y-8 p-3 lg:p-6">
           {/* Logo */}
           <div className="flex items-center gap-3">
-            <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-brass-400 text-lg font-extrabold text-white">
+            <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-md border border-[var(--color-rule-strong)] bg-ink-800 text-[15px] font-semibold text-ink-100">
               M
             </div>
             <div className="hidden lg:block">
@@ -149,7 +149,7 @@ export default function AdminLayout({
                   aria-current={isActive ? "page" : undefined}
                   className={`flex items-center justify-center gap-3 rounded-xl px-3 py-3 text-xs font-semibold uppercase tracking-wider transition lg:justify-start lg:px-4 ${
                     isActive
-                      ? "bg-brass-400 text-white shadow-md"
+                      ? "bg-ink-800 text-ink-100 shadow-[inset_2px_0_0_var(--color-brass-400)]"
                       : "text-ink-400 hover:bg-ink-800 hover:text-ink-200"
                   }`}
                 >

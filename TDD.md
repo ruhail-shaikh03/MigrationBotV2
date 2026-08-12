@@ -886,6 +886,30 @@ the product, since the page metadata still described an "SAP S/4HANA WRICEF Assi
   a custom border and nothing had replaced it, so keyboard focus was invisible — and
   `prefers-reduced-motion` is honoured.
 
+### 14.0.1 The dialog is portalled, and that is load-bearing
+
+`components/Modal.tsx` renders through `createPortal(…, document.body)`. This is not tidiness.
+`position: fixed` resolves against the viewport **only** while no ancestor establishes a containing
+block, and any ancestor with a `transform`, `filter`, `backdrop-filter`, `perspective`, `contain` or
+`will-change` establishes one.
+
+Measured on the deployed `/admin/projects`: every admin page root carries the entrance animation,
+whose fill mode (`forwards` originally, `both` after the redesign) left `transform: translateY(0)`
+applied permanently once it finished. So `fixed inset-0` resolved against that div — the overlay
+rendered **206 px tall inside a 620 px viewport**, and the dialog's pinned footer, Save button
+included, fell past the bottom edge with no way to scroll to it.
+
+This is the real cause of the original "modals not appearing properly" report, and it predates the
+redesign. Two independent fixes, because either alone leaves a trap for the next component:
+
+- the overlay is portalled outside every possible transformed ancestor, and
+- `.animate-rise` carries **no fill mode**, so the transform is gone once the 220 ms entrance ends.
+
+Verified by reproducing the exact condition (an `animate-rise` ancestor wrapping a modal with an
+over-tall body): overlay height 671 px against a 670 px viewport, footer fully visible, body
+scrolling internally. Initial focus targets the first control inside `[data-modal-body]` rather
+than the close button, which precedes the body in DOM order and would otherwise win.
+
 ### 14.1 Message rendering
 
 Assistant text renders as GitHub-flavoured Markdown through
