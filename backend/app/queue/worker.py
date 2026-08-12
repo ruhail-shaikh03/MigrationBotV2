@@ -34,6 +34,19 @@ PROCESSING_KEY = "migrationbot:write_queue:processing"
 DEAD_LETTER_KEY = "migrationbot:write_queue:dead_letter"
 MAX_ATTEMPTS = 3
 
+# Redis-level faults are transient infrastructure problems, not job failures: a
+# failover that leaves this node a replica (ReadOnlyError), a restart, a dropped
+# socket. Crashing the loop turns them into a restart storm that burns through
+# MAX_ATTEMPTS on innocent jobs, so we back off in place instead.
+REDIS_BACKOFF_INITIAL_SECONDS = 1.0
+REDIS_BACKOFF_MAX_SECONDS = 60.0
+# ReadOnlyError is NOT a subclass of ConnectionError, so listing it separately is
+# required — that omission is what let a replica-promoted Redis kill this worker.
+REDIS_TRANSIENT_ERRORS = (
+    redis.exceptions.ReadOnlyError,
+    redis.exceptions.ConnectionError,
+)
+
 
 async def _set_job_state(redis_client, job_id: str, **fields) -> None:
     """Merge fields into the job's state hash so the job_id already returned to the
@@ -340,11 +353,18 @@ async def start_worker():
     logger.info(f"Connecting to Redis at {settings.REDIS_URL}...")
     redis_client = aioredis.from_url(settings.REDIS_URL, decode_responses=True)
 
-    recovered = await recover_stale_jobs(redis_client)
-    if recovered:
-        logger.warning(f"Recovered {recovered} job(s) left behind by a previous worker crash.")
+    try:
+        recovered = await recover_stale_jobs(redis_client)
+        if recovered:
+            logger.warning(f"Recovered {recovered} job(s) left behind by a previous worker crash.")
+    except REDIS_TRANSIENT_ERRORS as e:
+        # Recovery is best-effort at startup. If Redis is unreachable or read-only
+        # right now, still enter the main loop — it backs off and retries, and the
+        # next worker start will recover whatever is left in PROCESSING_KEY.
+        logger.error(f"Could not run stale-job recovery ({type(e).__name__}: {e}); continuing to main loop.")
 
     logger.info("Worker is running and listening for queue updates...")
+    backoff = REDIS_BACKOFF_INITIAL_SECONDS
 
     try:
         while True:
@@ -353,9 +373,21 @@ async def start_worker():
             # recover_stale_jobs()'s docstring for why that matters.
             try:
                 raw_data = await redis_client.blmove(QUEUE_KEY, PROCESSING_KEY, timeout=10, src="LEFT", dest="RIGHT")
+                # Reached Redis — reset the backoff here, before the idle `continue`
+                # below, or an empty queue (by far the common case) would let a stale
+                # 60s backoff survive the outage that caused it.
+                backoff = REDIS_BACKOFF_INITIAL_SECONDS
                 if raw_data is None:
                     continue
             except (TimeoutError, redis.exceptions.TimeoutError):
+                continue
+            except REDIS_TRANSIENT_ERRORS as e:
+                logger.error(
+                    f"Redis unavailable while waiting for jobs ({type(e).__name__}: {e}); "
+                    f"retrying in {backoff:.0f}s."
+                )
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, REDIS_BACKOFF_MAX_SECONDS)
                 continue
 
             job_id = None
@@ -381,7 +413,13 @@ async def start_worker():
                 # state the write is in. recover_stale_jobs() retries it (bounded)
                 # on the next worker start rather than silently dropping it here.
             else:
-                await redis_client.lrem(PROCESSING_KEY, 1, raw_data)
+                try:
+                    await redis_client.lrem(PROCESSING_KEY, 1, raw_data)
+                except REDIS_TRANSIENT_ERRORS as e:
+                    # The write itself already succeeded and was audited. Failing to
+                    # clear PROCESSING_KEY only means recover_stale_jobs() may replay
+                    # it later; losing the worker here would be strictly worse.
+                    logger.error(f"Could not clear completed job {job_id} from processing list: {e}")
 
             # Enforce 1-second interval rate limiting throttle to protect Google API quotas
             await asyncio.sleep(1.0)
