@@ -94,10 +94,10 @@ export default function AdminAudit() {
       {/* Header bar */}
       <div>
         <h2 className="display-md">
-          Security Audits & History Log
+          Change history
         </h2>
         <p className="text-sm text-ink-500 mt-1">
-          Review historical changes, enqueued writes, read queries, and RBAC errors in real time.
+          Every read and change, with who made it and what it replaced.
         </p>
       </div>
 

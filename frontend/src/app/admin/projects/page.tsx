@@ -163,7 +163,7 @@ export default function AdminProjects() {
         const sheetsMap = config.tabs || {}
 
         if (Object.keys(sheetsMap).length === 0) {
-          setErrorMsg("Analysis completed but no WRICEF tracker tabs were detected. Make sure the spreadsheet has header rows containing columns like 'RICEFW ID', 'Module', 'Type', or 'Description'.")
+          setErrorMsg("No tabs could be read from that sheet. Check it has a header row, and that your Google account can open it.")
           return
         }
 
@@ -283,7 +283,7 @@ export default function AdminProjects() {
           return
         }
         const payload = {
-          project_name: projectName || "S/4HANA Migration Project",
+          project_name: projectName || "Untitled sheet",
           spreadsheet_id: targetId,
           default_tab: defaultTab || "SD",
           company_prefix: companyPrefix || "FFC",
@@ -342,10 +342,10 @@ export default function AdminProjects() {
       <div className="flex items-center justify-between">
         <div>
           <h2 className="display-md">
-            Projects Configuration Manager
+            Connected sheets
           </h2>
           <p className="text-sm text-ink-500 mt-1">
-            Register S/4HANA tracker spreadsheets and edit columns mappings metadata below.
+            Point MigrationBot at a Google Sheet. It works out the tabs and columns; you can correct them here.
           </p>
         </div>
 
@@ -431,7 +431,7 @@ export default function AdminProjects() {
                       </button>
                       <button
                         onClick={() => handleDelete(p.id)}
-                        className="p-2 rounded-lg text-failed bg-[color-mix(in_srgb,var(--color-failed)_10%,transparent)] hover:bg-rose-500/20 transition cursor-pointer"
+                        className="btn btn-danger px-2 py-2"
                         title="Delete Project"
                       >
                         <Trash2 className="h-4 w-4" />

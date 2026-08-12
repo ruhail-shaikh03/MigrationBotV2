@@ -1,6 +1,7 @@
 "use client"
 
-import { useCallback, useEffect, useRef } from "react"
+import { useCallback, useEffect, useRef, useState } from "react"
+import { createPortal } from "react-dom"
 import { X } from "lucide-react"
 
 /**
@@ -22,6 +23,17 @@ import { X } from "lucide-react"
  * wrapper *inside* it rather than by the scroll container itself. Then the panel
  * is free to be taller than the viewport — the overlay scrolls to reveal it —
  * while `max-h` plus an internal scroll region keeps the common case pinned.
+ *
+ * The dialog is rendered through a PORTAL to document.body, and that is load
+ * bearing rather than tidiness. `position: fixed` is resolved against the
+ * viewport only while no ancestor establishes a containing block, and any
+ * ancestor with a transform, filter, backdrop-filter, perspective, contain or
+ * will-change does establish one. Measured on the deployed admin page: the
+ * page root carries an entrance animation whose fill mode left
+ * `transform: translateY(0)` applied for good, so `fixed inset-0` resolved
+ * against that div — the overlay rendered 206px tall inside a 620px viewport
+ * and the dialog footer fell past the bottom edge. Portalling puts the overlay
+ * outside every such ancestor, permanently.
  */
 
 type ModalSize = "md" | "lg" | "xl"
@@ -70,6 +82,10 @@ export default function Modal({
   const panelRef = useRef<HTMLDivElement | null>(null)
   // Whatever had focus before we opened, so it can be handed back on close.
   const restoreFocusRef = useRef<HTMLElement | null>(null)
+  // document doesn't exist during SSR, so the portal target is only available
+  // after mount. Rendering null on the server matches the closed state anyway.
+  const [mounted, setMounted] = useState(false)
+  useEffect(() => setMounted(true), [])
 
   const titleId = `modal-title-${title.replace(/\W+/g, "-").toLowerCase()}`
 
@@ -116,11 +132,16 @@ export default function Modal({
 
     document.addEventListener("keydown", handleKeyDown, true)
 
-    // Focus the first real control, falling back to the panel itself so screen
-    // readers announce the dialog rather than leaving focus on the page behind.
+    // Prefer the first control in the scrolling body — a form dialog should open
+    // on its first field, not on the close button, which precedes the body in DOM
+    // order and would otherwise win. Falls back to any focusable, then the panel
+    // itself so screen readers still announce the dialog.
     const focusTimer = window.setTimeout(() => {
+      const panel = panelRef.current
       const target =
-        panelRef.current?.querySelector<HTMLElement>(FOCUSABLE) ?? panelRef.current
+        panel?.querySelector<HTMLElement>(`[data-modal-body] ${FOCUSABLE.split(",").join(", [data-modal-body] ")}`) ??
+        panel?.querySelector<HTMLElement>(FOCUSABLE) ??
+        panel
       target?.focus()
     }, 0)
 
@@ -132,9 +153,9 @@ export default function Modal({
     }
   }, [open, handleKeyDown])
 
-  if (!open) return null
+  if (!open || !mounted) return null
 
-  return (
+  return createPortal(
     // Scroll lives here, on the overlay — see the note at the top of this file.
     <div
       className="fixed inset-0 z-50 overflow-y-auto overscroll-contain bg-ink-950/85 backdrop-blur-[2px]"
@@ -180,7 +201,9 @@ export default function Modal({
           {/* The only scrolling region. min-h-0 is required — without it a flex
               child refuses to shrink below its content and the scroll never
               engages, which is how the panel ends up taller than the viewport. */}
-          <div className="min-h-0 flex-1 overflow-y-auto px-6 py-5 sm:px-8">{children}</div>
+          <div data-modal-body className="min-h-0 flex-1 overflow-y-auto px-6 py-5 sm:px-8">
+            {children}
+          </div>
 
           {footer && (
             <div className="shrink-0 border-t border-[var(--color-rule)] bg-black/20 px-6 py-4 sm:px-8">
@@ -189,6 +212,7 @@ export default function Modal({
           )}
         </div>
       </div>
-    </div>
+    </div>,
+    document.body
   )
 }

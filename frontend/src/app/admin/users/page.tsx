@@ -176,10 +176,10 @@ export default function AdminUsers() {
       <div className="flex items-center justify-between">
         <div>
           <h2 className="display-md">
-            User Security & RBAC Policies
+            Who can do what
           </h2>
           <p className="text-sm text-ink-500 mt-1">
-            Map project scopes, roles, and allowed/denied columns rules for spreadsheet editors.
+            Give someone a role on a sheet, and limit which columns they can change.
           </p>
         </div>
 
@@ -256,7 +256,7 @@ export default function AdminUsers() {
                       </button>
                       <button
                         onClick={() => handleDelete(p.id)}
-                        className="p-2 rounded-lg text-failed bg-[color-mix(in_srgb,var(--color-failed)_10%,transparent)] hover:bg-rose-500/20 transition cursor-pointer"
+                        className="btn btn-danger px-2 py-2"
                         title="Remove Mapping"
                       >
                         <Trash2 className="h-4 w-4" />
