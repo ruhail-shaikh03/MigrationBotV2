@@ -9,7 +9,7 @@ import MarkdownMessage from "@/components/MarkdownMessage"
 import ToolResultCard from "@/components/ToolResultCard"
 import WriteLedger, { LedgerEntry, LedgerState } from "@/components/WriteLedger"
 import {
-  Send, Database, LogOut, Settings, RefreshCw, CheckCircle2, AlertTriangle, X
+  Send, Database, LogOut, Settings, RefreshCw, CheckCircle2, AlertTriangle, X, LayoutDashboard
 } from "lucide-react"
 
 export default function ChatPage() {
@@ -277,6 +277,18 @@ export default function ChatPage() {
             >
               {isConnected ? "live" : "offline"}
             </span>
+
+            {/* The dashboard is the only non-chat surface a non-admin can reach, so the
+                entry point is deliberately not gated behind isAdmin. */}
+            {activeProject && (
+              <button
+                onClick={() => router.push(`/project/${activeProject.id}`)}
+                className="btn btn-ghost px-2 py-2"
+                title="Project dashboard"
+              >
+                <LayoutDashboard className="h-4 w-4" />
+              </button>
+            )}
 
             {isAdmin && (
               <button

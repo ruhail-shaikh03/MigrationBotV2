@@ -1146,6 +1146,48 @@ Verified against production with a real `update_cell` on a live sheet, sampling 
 across the transition — which is the whole point, and the thing two toasts could not do. The
 `failed` path has still only been seen with mock data; provoking it needs an actual write failure.
 
+### 14.4 The project dashboard
+
+`app/project/[id]/page.tsx` — the sheet itself, rather than answers about it. Until this route the
+product had one surface for non-admins: a chat box. Chat could report that eleven items were
+overdue but could not show which, or who held them, and `/admin` (the only other page) is gated.
+
+One route, two panels behind a toggle. **Grid** is a filtered, sorted, paged table of real rows;
+**Workload** is per-person bars, a per-role assignment table, and a status breakdown. Filters
+(`q`, person, role, overdue-only) apply to both — a workload chart that ignored the filter beside
+the grid would contradict it.
+
+Nothing in this file knows the words "technical" or "functional". Column identity, display labels
+and which headers name people all arrive from `dashboard.py:_column_descriptors` (§10.1), so a
+sheet whose people-column is "QA Owner" renders a QA Owner column and a QA Owner role filter with
+no code change (§7.4). The role filter renders only when a tab actually has more than one role.
+
+Honesty about what the sheet contains is enforced in the UI, not just the API. When
+`days_source` is `null` the sheet records no effort anywhere, so the chart measures **items** and
+says so in its subtitle rather than plotting zeros — a zero-day bar per person asserts that nobody
+has any work, which is a false statement rather than a missing one. `dates` and `mixed` are
+labelled as derived. The Overdue tile shows `—` with "no due-date column" instead of `0` when the
+tab has no due date at all, for the same reason. `HoverTip` gained a `unit` prop specifically so a
+bar of days is never labelled "12 rows".
+
+The two panels load together, but an analytics failure degrades to "workload data is unavailable"
+rather than blanking the page: the grid is the primary view and is useful on its own.
+
+The page re-reads on the `queue_update` DOM CustomEvent that `useWebSocket.ts` already dispatches
+(§14.3), so an edit applied by the worker — whether made here or from chat — refreshes the grid
+once it actually lands, rather than optimistically or on a timer.
+
+Display primitives were extracted from `ToolResultCard.tsx` into `components/DataDisplay.tsx`
+(`StatTile`, `ChartFrame`, `HoverTip`, `DataTable`, `SERIES_HUE`, `MAX_BARS`) and are now imported
+by both. Duplicating them would have let the chat and dashboard surfaces drift into looking like
+different products while showing the same numbers from the same sheet. `DataTable` gained an
+optional `columns` prop: the dashboard passes the sheet's own column order, since the existing
+union-of-keys behaviour orders by first appearance and would scramble a grid the user expects to
+mirror their spreadsheet.
+
+The entry point in the chat header is deliberately **not** gated on `is_admin` — this is the one
+non-chat surface an ordinary user can reach.
+
 Tab switching is an explicit control frame, not prompt-driven (`chat/page.tsx:handleTabChange`):
 the client sends `{type: "switch_tab", tab_name}` and only applies the new `activeTab` once the
 server confirms with `tab_switched` (§9.1–9.2) — it no longer sets `activeTab` optimistically
