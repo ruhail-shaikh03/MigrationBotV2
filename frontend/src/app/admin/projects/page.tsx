@@ -337,21 +337,21 @@ export default function AdminProjects() {
   }
 
   return (
-    <div className="space-y-8 animate-slide-up">
+    <div className="space-y-8 animate-rise">
       {/* Header bar */}
       <div className="flex items-center justify-between">
         <div>
-          <h2 className="text-3xl font-extrabold tracking-tight bg-clip-text text-transparent bg-gradient-to-r from-zinc-50 to-indigo-200">
+          <h2 className="display-md">
             Projects Configuration Manager
           </h2>
-          <p className="text-sm text-zinc-500 mt-1">
+          <p className="text-sm text-ink-500 mt-1">
             Register S/4HANA tracker spreadsheets and edit columns mappings metadata below.
           </p>
         </div>
 
         <button
           onClick={handleOpenCreateModal}
-          className="flex items-center gap-2 bg-indigo-600 hover:bg-indigo-500 text-white font-semibold py-2.5 px-5 rounded-xl text-xs tracking-wider uppercase transition cursor-pointer shadow-lg"
+          className="btn btn-primary"
         >
           <Plus className="h-4.5 w-4.5" />
           <span>New Project</span>
@@ -359,7 +359,7 @@ export default function AdminProjects() {
       </div>
 
       {errorMsg && (
-        <div className="p-4 bg-rose-500/10 border border-rose-500/20 text-rose-400 text-sm rounded-xl flex items-center gap-3">
+        <div className="p-4 bg-[color-mix(in_srgb,var(--color-failed)_10%,transparent)] border border-[color-mix(in_srgb,var(--color-failed)_25%,transparent)] text-failed text-sm rounded-xl flex items-center gap-3">
           <AlertTriangle className="h-5 w-5" />
           <span>{errorMsg}</span>
         </div>
@@ -368,74 +368,70 @@ export default function AdminProjects() {
       {/* Projects List Table */}
       {isLoading ? (
         <div className="flex justify-center h-48 items-center">
-          <div className="animate-spin rounded-full h-8 w-8 border-t-2 border-indigo-500"></div>
+          <div className="animate-spin rounded-full h-8 w-8 border-t-2 border-brass-500"></div>
         </div>
       ) : projects.length === 0 ? (
-        <div className="glass-panel rounded-2xl border border-white/5 p-12 text-center">
-          <FolderKanban className="mx-auto mb-3 h-8 w-8 text-zinc-600" />
-          <p className="text-sm font-semibold text-zinc-300">No projects registered yet</p>
-          <p className="mx-auto mt-1 max-w-sm text-xs leading-relaxed text-zinc-500">
+        <div className="panel rounded-xl border border-[var(--color-rule)] p-12 text-center">
+          <FolderKanban className="mx-auto mb-3 h-8 w-8 text-ink-600" />
+          <p className="text-sm font-semibold text-ink-300">No projects registered yet</p>
+          <p className="mx-auto mt-1 max-w-sm text-xs leading-relaxed text-ink-500">
             Register a Google Sheet to let the agent read and update it. Auto-detect will work
             out the tabs and columns for you.
           </p>
           <button
             onClick={handleOpenCreateModal}
-            className="mx-auto mt-5 flex cursor-pointer items-center gap-2 rounded-xl bg-indigo-600 px-4 py-2.5 text-xs font-semibold uppercase tracking-wider text-white shadow-lg transition hover:bg-indigo-500"
+            className="btn btn-primary mx-auto mt-5"
           >
             <Plus className="h-4 w-4" />
             <span>New Project</span>
           </button>
         </div>
       ) : (
-        <div className="glass-panel rounded-2xl border border-white/5 overflow-hidden">
+        <div className="panel rounded-xl border border-[var(--color-rule)] overflow-hidden">
           <div className="overflow-x-auto">
             {/* min-w is what makes the wrapper above actually scroll. With `w-full`
                 alone the table can never exceed its container, so narrow viewports
                 crushed the columns into unreadable slivers instead of scrolling. */}
             <table className="w-full min-w-[900px] text-left border-collapse">
               <thead>
-                <tr className="border-b border-white/5 bg-white/[0.02]">
-                  <th className="whitespace-nowrap p-4 text-xs font-bold uppercase tracking-wider text-zinc-400">Project Name</th>
-                  <th className="whitespace-nowrap p-4 text-xs font-bold uppercase tracking-wider text-zinc-400">Spreadsheet ID</th>
-                  <th className="whitespace-nowrap p-4 text-xs font-bold uppercase tracking-wider text-zinc-400">Default Tab</th>
-                  <th className="whitespace-nowrap p-4 text-xs font-bold uppercase tracking-wider text-zinc-400">Prefix</th>
-                  <th className="whitespace-nowrap p-4 text-xs font-bold uppercase tracking-wider text-zinc-400">Status</th>
-                  <th className="whitespace-nowrap p-4 text-right text-xs font-bold uppercase tracking-wider text-zinc-400">Actions</th>
+                <tr className="border-b border-[var(--color-rule)] bg-ink-850">
+                  <th className="label-micro whitespace-nowrap p-4">Project Name</th>
+                  <th className="label-micro whitespace-nowrap p-4">Spreadsheet ID</th>
+                  <th className="label-micro whitespace-nowrap p-4">Default Tab</th>
+                  <th className="label-micro whitespace-nowrap p-4">Prefix</th>
+                  <th className="label-micro whitespace-nowrap p-4">Status</th>
+                  <th className="label-micro whitespace-nowrap p-4 text-right">Actions</th>
                 </tr>
               </thead>
-              <tbody className="divide-y divide-white/5">
+              <tbody className="divide-y divide-[var(--color-rule)]">
                 {projects.map((p) => (
-                  <tr key={p.id} className="hover:bg-white/[0.01] transition">
-                    <td className="p-4 text-sm font-bold text-zinc-200">{p.project_name}</td>
-                    <td className="p-4 text-xs text-zinc-500 font-mono select-all max-w-[200px] truncate" title={p.spreadsheet_id}>
+                  <tr key={p.id} className="hover:bg-ink-850 transition">
+                    <td className="p-4 text-sm font-bold text-ink-200">{p.project_name}</td>
+                    <td className="p-4 text-xs text-ink-500 font-mono select-all max-w-[200px] truncate" title={p.spreadsheet_id}>
                       {p.spreadsheet_id}
                     </td>
-                    <td className="p-4 text-xs font-semibold text-zinc-300">
-                      <span className="px-2 py-1 rounded bg-[#120e2e] border border-white/5">{p.default_tab}</span>
+                    <td className="p-4 text-xs font-semibold text-ink-300">
+                      <span className="stamp">{p.default_tab}</span>
                     </td>
-                    <td className="p-4 text-xs font-semibold text-zinc-300">{p.company_prefix}</td>
+                    <td className="p-4 text-xs font-semibold text-ink-300">{p.company_prefix}</td>
                     <td className="p-4 text-xs">
                       {p.is_active ? (
-                        <span className="px-2.5 py-0.5 rounded-full bg-emerald-500/10 border border-emerald-500/20 text-emerald-400 font-medium">
-                          Active
-                        </span>
+                        <span className="status status-applied">Active</span>
                       ) : (
-                        <span className="px-2.5 py-0.5 rounded-full bg-zinc-500/10 border border-white/5 text-zinc-500 font-medium">
-                          Inactive
-                        </span>
+                        <span className="status status-denied">Inactive</span>
                       )}
                     </td>
                     <td className="p-4 text-right flex items-center justify-end gap-2.5">
                       <button
                         onClick={() => handleOpenEditModal(p)}
-                        className="p-2 rounded-lg text-indigo-400 bg-indigo-500/10 hover:bg-indigo-500/20 transition cursor-pointer"
+                        className="btn btn-ghost px-2 py-2"
                         title="Edit Project"
                       >
                         <Edit2 className="h-4 w-4" />
                       </button>
                       <button
                         onClick={() => handleDelete(p.id)}
-                        className="p-2 rounded-lg text-rose-400 bg-rose-500/10 hover:bg-rose-500/20 transition cursor-pointer"
+                        className="p-2 rounded-lg text-failed bg-[color-mix(in_srgb,var(--color-failed)_10%,transparent)] hover:bg-rose-500/20 transition cursor-pointer"
                         title="Delete Project"
                       >
                         <Trash2 className="h-4 w-4" />
@@ -458,7 +454,7 @@ export default function AdminProjects() {
         // backdrop click shouldn't throw the detected tabs away.
         dismissOnBackdrop={false}
         title={editingProject ? "Modify Project Configuration" : "Register New Spreadsheet Project"}
-        icon={<FolderKanban className="h-5 w-5 shrink-0 text-indigo-400" />}
+        icon={<FolderKanban className="h-5 w-5 shrink-0 text-brass-400" />}
         description={
           editingProject
             ? undefined
@@ -469,7 +465,7 @@ export default function AdminProjects() {
             <button
               type="button"
               onClick={() => setIsModalOpen(false)}
-              className="cursor-pointer rounded-xl border border-white/10 px-5 py-2.5 text-xs font-semibold uppercase tracking-wider text-zinc-400 transition hover:text-zinc-200"
+              className="btn btn-secondary"
             >
               Cancel
             </button>
@@ -480,7 +476,7 @@ export default function AdminProjects() {
               type="submit"
               form="project-form"
               disabled={isAutoDetectMode && !editingProject && Object.keys(detectedTabsMap).length === 0}
-              className="cursor-pointer rounded-xl bg-indigo-600 px-5 py-2.5 text-xs font-semibold uppercase tracking-wider text-white shadow-lg transition hover:bg-indigo-500 disabled:cursor-not-allowed disabled:opacity-50"
+              className="btn btn-primary"
             >
               Save Changes
             </button>
@@ -488,13 +484,13 @@ export default function AdminProjects() {
         }
       >
             {!editingProject && (
-              <div className="flex gap-4 border-b border-white/5 pb-3 mb-4">
+              <div className="flex gap-4 border-b border-[var(--color-rule)] pb-3 mb-4">
                 <button
                   type="button"
                   onClick={() => setIsAutoDetectMode(true)}
                   className={`text-xs font-semibold uppercase pb-1 tracking-wider border-b-2 transition ${isAutoDetectMode
-                    ? "border-indigo-500 text-indigo-400"
-                    : "border-transparent text-zinc-500 hover:text-zinc-300"
+                    ? "border-brass-500 text-brass-400"
+                    : "border-transparent text-ink-500 hover:text-ink-300"
                     }`}
                 >
                   Auto-Detect Wizard
@@ -503,8 +499,8 @@ export default function AdminProjects() {
                   type="button"
                   onClick={() => setIsAutoDetectMode(false)}
                   className={`text-xs font-semibold uppercase pb-1 tracking-wider border-b-2 transition ${!isAutoDetectMode
-                    ? "border-indigo-500 text-indigo-400"
-                    : "border-transparent text-zinc-500 hover:text-zinc-300"
+                    ? "border-brass-500 text-brass-400"
+                    : "border-transparent text-ink-500 hover:text-ink-300"
                     }`}
                 >
                   Manual Mode
@@ -513,10 +509,10 @@ export default function AdminProjects() {
             )}
 
             {errorMsg && (
-              <div className="p-3 mb-2 bg-rose-500/10 border border-rose-500/20 text-rose-400 text-sm rounded-xl flex items-center gap-3">
+              <div className="p-3 mb-2 bg-[color-mix(in_srgb,var(--color-failed)_10%,transparent)] border border-[color-mix(in_srgb,var(--color-failed)_25%,transparent)] text-failed text-sm rounded-xl flex items-center gap-3">
                 <AlertTriangle className="h-4 w-4 shrink-0" />
                 <span className="break-all">{errorMsg}</span>
-                <button type="button" onClick={() => setErrorMsg("")} className="ml-auto shrink-0 p-1 hover:bg-white/5 rounded transition cursor-pointer">
+                <button type="button" onClick={() => setErrorMsg("")} className="ml-auto shrink-0 p-1 hover:bg-ink-800 rounded transition cursor-pointer">
                   <X className="h-3.5 w-3.5" />
                 </button>
               </div>
@@ -524,23 +520,23 @@ export default function AdminProjects() {
 
             <form id="project-form" onSubmit={handleSave} className="space-y-5">
               {isAutoDetectMode && !editingProject ? (
-                <div className="space-y-5 animate-slide-up">
+                <div className="space-y-5 animate-rise">
                   {/* Step 1: URL input */}
-                  <div className="space-y-1.5 bg-white/[0.01] border border-white/5 p-4 rounded-xl">
-                    <label className="text-xs font-semibold uppercase text-zinc-400 block">Google Sheets URL or ID</label>
+                  <div className="space-y-1.5 bg-ink-900 border border-[var(--color-rule)] p-4 rounded-xl">
+                    <label className="label-micro block">Google Sheets URL or ID</label>
                     <div className="flex gap-2">
                       <input
                         type="text"
                         value={spreadsheetUrl}
                         onChange={(e) => setSpreadsheetUrl(e.target.value)}
                         placeholder="https://docs.google.com/spreadsheets/d/..."
-                        className="flex-1 bg-[#120e2e] border border-white/10 rounded-xl px-4 py-2.5 text-sm text-zinc-100 placeholder-zinc-500 focus:outline-none focus:border-indigo-500"
+                        className="flex-1 bg-ink-950 border border-[var(--color-rule-strong)] rounded-xl px-4 py-2.5 text-sm text-ink-100 placeholder-ink-500 focus:outline-none focus:border-brass-500"
                       />
                       <button
                         type="button"
                         onClick={handleAnalyzeSheet}
                         disabled={isAnalyzing}
-                        className="bg-indigo-600 hover:bg-indigo-500 text-white font-semibold px-4 rounded-xl text-xs uppercase tracking-wider transition disabled:opacity-50 flex items-center justify-center min-w-[120px]"
+                        className="bg-brass-400 hover:bg-brass-300 text-white font-semibold px-4 rounded-xl text-xs uppercase tracking-wider transition disabled:opacity-50 flex items-center justify-center min-w-[120px]"
                       >
                         {isAnalyzing ? "Analyzing..." : "Analyze"}
                       </button>
@@ -549,33 +545,33 @@ export default function AdminProjects() {
 
                   {/* Step 2: Display results if found */}
                   {Object.keys(detectedTabsMap).length > 0 ? (
-                    <div className="space-y-5 animate-slide-up">
+                    <div className="space-y-5 animate-rise">
                       <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                         <div className="space-y-1.5">
-                          <label className="text-xs font-semibold uppercase text-zinc-400">Project Name</label>
+                          <label className="label-micro">Project Name</label>
                           <input
                             type="text"
                             required
                             value={projectName}
                             onChange={(e) => setProjectName(e.target.value)}
-                            className="w-full bg-[#120e2e] border border-white/10 rounded-xl px-4 py-2.5 text-sm text-zinc-100 focus:outline-none focus:border-indigo-500"
+                            className="w-full bg-ink-950 border border-[var(--color-rule-strong)] rounded-xl px-4 py-2.5 text-sm text-ink-100 focus:outline-none focus:border-brass-500"
                             placeholder="e.g. Finance Migration"
                           />
                         </div>
                         <div className="space-y-1.5">
-                          <label className="text-xs font-semibold uppercase text-zinc-400">Company Prefix</label>
+                          <label className="label-micro">Company Prefix</label>
                           <input
                             type="text"
                             required
                             value={companyPrefix}
                             onChange={(e) => handleCompanyPrefixChange(e.target.value)}
-                            className="w-full bg-[#120e2e] border border-white/10 rounded-xl px-4 py-2.5 text-sm text-zinc-100 focus:outline-none focus:border-indigo-500"
+                            className="w-full bg-ink-950 border border-[var(--color-rule-strong)] rounded-xl px-4 py-2.5 text-sm text-ink-100 focus:outline-none focus:border-brass-500"
                           />
                         </div>
                       </div>
 
                       <div className="space-y-2">
-                        <label className="text-xs font-semibold uppercase text-zinc-400 block">Select Tracker Tabs & Configure Fields</label>
+                        <label className="label-micro block">Select Tracker Tabs & Configure Fields</label>
                         <div className="space-y-3">
                           {Object.keys(detectedTabsMap).map(tab => {
                             const tabSchema = detectedTabsMap[tab] || {}
@@ -586,8 +582,8 @@ export default function AdminProjects() {
                               <div
                                 key={tab}
                                 className={`rounded-xl border transition p-4 ${isTabSelected
-                                  ? "bg-indigo-600/10 border-indigo-500/30"
-                                  : "bg-white/[0.01] border-white/5 opacity-60"
+                                  ? "bg-brass-400/10 border-brass-500/30"
+                                  : "bg-ink-900 border-[var(--color-rule)] opacity-60"
                                   }`}
                               >
                                 <div className="flex items-center justify-between">
@@ -596,42 +592,42 @@ export default function AdminProjects() {
                                       type="checkbox"
                                       checked={isTabSelected}
                                       onChange={() => handleToggleTab(tab)}
-                                      className="h-4 w-4 rounded border-white/10 text-indigo-600 focus:ring-0 focus:ring-offset-0 cursor-pointer"
+                                      className="h-4 w-4 cursor-pointer accent-[var(--color-brass-400)]"
                                     />
-                                    <span className="text-sm font-bold text-zinc-200">{tab} Tab</span>
+                                    <span className="text-sm font-bold text-ink-200">{tab} Tab</span>
                                   </label>
                                   {isTabSelected && (
-                                    <span className="text-[10px] uppercase font-bold text-emerald-400 bg-emerald-500/10 px-2 py-0.5 rounded border border-emerald-500/20">
+                                    <span className="text-[10px] uppercase font-bold text-applied bg-[color-mix(in_srgb,var(--color-applied)_10%,transparent)] px-2 py-0.5 rounded border border-[color-mix(in_srgb,var(--color-applied)_25%,transparent)]">
                                       Auto-Detected
                                     </span>
                                   )}
                                 </div>
 
                                 {isTabSelected && (
-                                  <div className="mt-3 pt-3 border-t border-white/5 grid grid-cols-2 gap-2 text-xs text-zinc-400">
+                                  <div className="mt-3 pt-3 border-t border-[var(--color-rule)] grid grid-cols-2 gap-2 text-xs text-ink-400">
                                     <div>
-                                      <span className="text-zinc-500">ID Col:</span>{" "}
-                                      <span className="text-zinc-200 font-medium">{tabSchema.primary_id_column || "RICEFW ID"} ({tabSchema.primary_id_position || "B"})</span>
+                                      <span className="text-ink-500">ID Col:</span>{" "}
+                                      <span className="text-ink-200 font-medium">{tabSchema.primary_id_column || "RICEFW ID"} ({tabSchema.primary_id_position || "B"})</span>
                                     </div>
                                     <div>
-                                      <span className="text-zinc-500">Status Col:</span>{" "}
-                                      <span className="text-zinc-200 font-medium">{tabSchema.status_column || "Dev Status"}</span>
+                                      <span className="text-ink-500">Status Col:</span>{" "}
+                                      <span className="text-ink-200 font-medium">{tabSchema.status_column || "Dev Status"}</span>
                                     </div>
                                     <div>
-                                      <span className="text-zinc-500">Module Col:</span>{" "}
-                                      <span className="text-zinc-200 font-medium">{tabSchema.module_column || "Module"}</span>
+                                      <span className="text-ink-500">Module Col:</span>{" "}
+                                      <span className="text-ink-200 font-medium">{tabSchema.module_column || "Module"}</span>
                                     </div>
                                     <div>
-                                      <span className="text-zinc-500">Assignee Col:</span>{" "}
-                                      <span className="text-zinc-200 font-medium">{tabSchema.assignee_column || "Technical Resource"}</span>
+                                      <span className="text-ink-500">Assignee Col:</span>{" "}
+                                      <span className="text-ink-200 font-medium">{tabSchema.assignee_column || "Technical Resource"}</span>
                                     </div>
 
                                     {critFields.length > 0 && (
                                       <div className="col-span-2 mt-2">
-                                        <span className="text-zinc-500 block mb-1">Critical Display Fields:</span>
+                                        <span className="text-ink-500 block mb-1">Critical Display Fields:</span>
                                         <div className="flex flex-wrap gap-1.5">
                                           {critFields.map((f: string) => (
-                                            <span key={f} className="px-2 py-0.5 bg-[#120e2e] border border-white/10 rounded text-[11px] text-indigo-300 font-mono">
+                                            <span key={f} className="px-2 py-0.5 bg-ink-950 border border-[var(--color-rule-strong)] rounded text-[11px] text-brass-300 font-mono">
                                               {f}
                                             </span>
                                           ))}
@@ -648,11 +644,11 @@ export default function AdminProjects() {
 
                       <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                         <div className="space-y-1.5">
-                          <label className="text-xs font-semibold uppercase text-zinc-400">Default Tab</label>
+                          <label className="label-micro">Default Tab</label>
                           <select
                             value={defaultTab}
                             onChange={(e) => setDefaultTab(e.target.value)}
-                            className="w-full bg-[#120e2e] border border-white/10 rounded-xl px-4 py-2.5 text-sm text-zinc-100 focus:outline-none focus:border-indigo-500 cursor-pointer"
+                            className="w-full bg-ink-950 border border-[var(--color-rule-strong)] rounded-xl px-4 py-2.5 text-sm text-ink-100 focus:outline-none focus:border-brass-500 cursor-pointer"
                           >
                             {Object.keys(selectedTabs).filter(t => selectedTabs[t]).map(t => (
                               <option key={t} value={t}>{t}</option>
@@ -660,70 +656,70 @@ export default function AdminProjects() {
                           </select>
                         </div>
                         <div className="space-y-1.5">
-                          <label className="text-xs font-semibold uppercase text-zinc-400">Spreadsheet ID</label>
+                          <label className="label-micro">Spreadsheet ID</label>
                           <input
                             type="text"
                             disabled
                             value={spreadsheetId}
-                            className="w-full bg-[#120e2e]/50 border border-white/10 rounded-xl px-4 py-2.5 text-sm text-zinc-400 select-all font-mono opacity-60"
+                            className="w-full bg-ink-950 border border-[var(--color-rule-strong)] rounded-xl px-4 py-2.5 text-sm text-ink-400 select-all font-mono opacity-60"
                           />
                         </div>
                       </div>
                     </div>
                   ) : (
-                    <div className="glass-panel p-6 text-center text-zinc-500 rounded-xl border border-white/5">
+                    <div className="panel p-6 text-center text-ink-500 rounded-xl border border-[var(--color-rule)]">
                       Enter URL above and click Analyze to discover sheets.
                     </div>
                   )}
                 </div>
               ) : (
-                <div className="space-y-5 animate-slide-up">
+                <div className="space-y-5 animate-rise">
                   <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                     <div className="space-y-1.5">
-                      <label className="text-xs font-semibold uppercase text-zinc-400">Project Name</label>
+                      <label className="label-micro">Project Name</label>
                       <input
                         type="text"
                         required
                         value={projectName}
                         onChange={(e) => setProjectName(e.target.value)}
-                        className="w-full bg-[#120e2e] border border-white/10 rounded-xl px-4 py-2.5 text-sm text-zinc-100 placeholder-zinc-500 focus:outline-none focus:border-indigo-500"
+                        className="field"
                         placeholder="e.g. Finance Migration"
                       />
                     </div>
 
                     <div className="space-y-1.5">
-                      <label className="text-xs font-semibold uppercase text-zinc-400">Spreadsheet ID</label>
+                      <label className="label-micro">Spreadsheet ID</label>
                       <input
                         type="text"
                         required
                         disabled={!!editingProject}
                         value={spreadsheetId}
                         onChange={(e) => setSpreadsheetId(e.target.value)}
-                        className="w-full bg-[#120e2e] border border-white/10 rounded-xl px-4 py-2.5 text-sm text-zinc-100 placeholder-zinc-500 focus:outline-none focus:border-indigo-500 disabled:opacity-50 disabled:cursor-not-allowed"
+                        className="field disabled:cursor-not-allowed"
                         placeholder="Spreadsheet long hex ID"
                       />
                     </div>
 
                     <div className="space-y-1.5">
-                      <label className="text-xs font-semibold uppercase text-zinc-400">Default Tab</label>
+                      <label className="label-micro">Default Tab</label>
                       <input
                         type="text"
                         required
                         value={defaultTab}
                         onChange={(e) => setDefaultTab(e.target.value)}
-                        className="w-full bg-[#120e2e] border border-white/10 rounded-xl px-4 py-2.5 text-sm text-zinc-100 focus:outline-none focus:border-indigo-500"
+                        className="w-full bg-ink-950 border border-[var(--color-rule-strong)] rounded-xl px-4 py-2.5 text-sm text-ink-100 focus:outline-none focus:border-brass-500"
                         placeholder="e.g. SD"
                       />
                     </div>
 
                     <div className="space-y-1.5">
-                      <label className="text-xs font-semibold uppercase text-zinc-400">Company Prefix</label>
+                      <label className="label-micro">Company Prefix</label>
                       <input
                         type="text"
                         required
                         value={companyPrefix}
                         onChange={(e) => handleCompanyPrefixChange(e.target.value)}
-                        className="w-full bg-[#120e2e] border border-white/10 rounded-xl px-4 py-2.5 text-sm text-zinc-100 focus:outline-none focus:border-indigo-500"
+                        className="w-full bg-ink-950 border border-[var(--color-rule-strong)] rounded-xl px-4 py-2.5 text-sm text-ink-100 focus:outline-none focus:border-brass-500"
                         placeholder="e.g. FFC"
                       />
                     </div>
@@ -736,9 +732,9 @@ export default function AdminProjects() {
                         id="isActiveCheck"
                         checked={isActive}
                         onChange={(e) => setIsActive(e.target.checked)}
-                        className="h-4 w-4 bg-[#120e2e] border border-white/10 text-indigo-600 rounded focus:ring-indigo-500 focus:ring-offset-0 cursor-pointer"
+                        className="h-4 w-4 cursor-pointer accent-[var(--color-brass-400)]"
                       />
-                      <label htmlFor="isActiveCheck" className="text-xs font-semibold uppercase text-zinc-300 cursor-pointer">
+                      <label htmlFor="isActiveCheck" className="text-xs font-semibold uppercase text-ink-300 cursor-pointer">
                         Active & Enable for agent interactions
                       </label>
                     </div>
@@ -746,12 +742,12 @@ export default function AdminProjects() {
 
                   {/* JSON Column Mappings Config */}
                   <div className="space-y-1.5">
-                    <label className="text-xs font-semibold uppercase text-zinc-400">Schema Mappings (JSON Format)</label>
+                    <label className="label-micro">Schema Mappings (JSON Format)</label>
                     <textarea
                       rows={8}
                       value={schemaConfigStr}
                       onChange={(e) => setSchemaConfigStr(e.target.value)}
-                      className="w-full bg-[#030014] border border-white/10 rounded-xl p-4 text-xs font-mono text-indigo-300 focus:outline-none focus:border-indigo-500"
+                      className="w-full bg-ink-950 border border-[var(--color-rule-strong)] rounded-xl p-4 text-xs font-mono text-brass-300 focus:outline-none focus:border-brass-500"
                       placeholder='{"primary_id_position": "B", ...}'
                     />
                   </div>
