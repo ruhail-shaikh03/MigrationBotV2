@@ -15,7 +15,7 @@ services:
     # No `ports:` mapping. Every consumer reaches Postgres over the compose network
     # as `postgres:5432`; publishing it to the host only exposes it to the internet.
     # Docker writes its own iptables rules that bypass UFW, so a host firewall does
-    # NOT contain a published port — see TDD.md §17.
+    # NOT contain a published port — see TDD.md §15.1.
     restart: unless-stopped
 
   redis:

@@ -321,6 +321,19 @@ the write silently, leaving only an audit row if the exception happened to be ca
   (`worker.py:DEAD_LETTER_KEY`) instead of being retried forever, and `events.py:publish_queue_update`
   fires a `"failed"` `queue_update` so the user learns the write didn't go through rather than
   waiting on it indefinitely.
+- **Redis fault tolerance**: `start_worker`'s `BLMOVE` originally guarded only `TimeoutError`, so
+  any other Redis fault killed the loop and let `restart: unless-stopped` bring the container back.
+  In production that surfaced as six consecutive
+  `ReadOnlyError: You can't write against a read only replica` crashes — and because each restart
+  re-ran `recover_stale_jobs`, each one spent a `MAX_ATTEMPTS` budget on jobs that had done nothing
+  wrong, so a long enough Redis outage would dead-letter perfectly valid writes. `ReadOnlyError` is
+  a `ResponseError`, **not** a `ConnectionError`, so catching `ConnectionError` would never have
+  covered it; `worker.py:REDIS_TRANSIENT_ERRORS` names it explicitly. Redis-level faults now back
+  off in place (1 s doubling to 60 s, `REDIS_BACKOFF_INITIAL_SECONDS`/`_MAX_SECONDS`), the backoff
+  resets on the first successful `BLMOVE` (including the idle no-job return), startup recovery
+  failing no longer prevents the worker reaching its main loop, and a failed post-write `LREM` is
+  logged rather than fatal — the write is already applied and audited by then, so a later replay
+  beats losing the worker.
 - **Job-state key**: `migrationbot:job_state:<job_id>` (`queue/schemas.py:JOB_STATE_PREFIX`,
   7-day TTL) is set to `"queued"` at enqueue time (`producer.py:enqueue_write_job`) and updated
   through `"processing"` → `"done"` (or `"error"`, if picked up but not cleanly finished — see
@@ -490,7 +503,8 @@ serializer for whichever map ends up active, called from `agentic_loop.py:run_ag
 - **DSML leakage guard** — content containing `<｜｜DSML｜｜>` triggers one retry against
   `deepseek-chat`, inline in `agentic_loop.py:run_agentic_loop`.
 - **CoT suppression** — `reasoning_content` is logged, never forwarded.
-- **Self-repair** — a failed tool result gets a `[System Recovery Note]` appended.
+- **Self-repair** — a failed tool result gets a `[System Note]` appended, with guidance chosen for
+  that failure's class (§8.2). Only argument-level failures invite a retry.
 - **Honest queued-write note** — a result with `status: "queued"` gets a `[System Note]` telling
   the model not to claim the write is done — added in Phase 3, since it has to live in the tool
   message content, not just the system prompt, to survive the iteration-1+ prompt swap above.
@@ -504,6 +518,40 @@ serializer for whichever map ends up active, called from `agentic_loop.py:run_ag
 
 Nine tools in `core/tool_schemas.py:TOOLS`: `get_row`, `update_cell`, `format_row`, `add_row`,
 `bulk_update`, `search_rows`, `summarize`, `switch_module`, `data_quality`.
+
+### 8.2 Failure classification
+
+`dispatch_tool` used to return `{"ok": False, "error": str(e)}` for every failure, and the loop
+appended the same *"if this was due to column alias or RICEFW ID mismatch, formulate a corrected
+tool call"* note to all of them. Both halves of that were wrong for anything that wasn't an
+argument error, and the 2026-08 incident showed the cost: a `ReadOnlyError` from Redis reached the
+model as an undifferentiated string, so it kept rewriting a call that could not succeed, and
+reached the user as *"this is a read-only replica"* — which they reasonably read as a permissions
+problem with their own spreadsheet.
+
+`core/errors.py:classify_error` maps an exception to one of eight kinds:
+
+| Kind | Raised by | Model told to retry? |
+|---|---|---|
+| `invalid_request` | `KeyError`/`ValueError`/`TypeError`/`IndexError`, Google 4xx | yes, once, with corrected arguments |
+| `not_found` | Google 404 | yes — locate the record with `search_rows` first |
+| `permission` | RBAC denial (`agentic_loop.py`), Google 403 | **no** |
+| `auth` | `RefreshError`/`GoogleAuthError`, Google 401 | **no** — user must re-authenticate |
+| `rate_limit` | Google 429, 403 with a quota reason | **no** |
+| `infrastructure` | `redis.ReadOnlyError`/`ConnectionError`/`TimeoutError`, SQLAlchemy `OperationalError`/`InterfaceError`/`DBAPIError`, `OSError` | **no** |
+| `upstream` | Google 5xx | **no** |
+| `unknown` | anything else | **no** — report rather than repeat |
+
+A failure result now carries three things instead of one: `error` (raw, for logs and the audit
+row), `error_kind`, and `user_message` — the last written without infrastructure nouns, since
+"replica" and "asyncpg" mean nothing to someone editing a tracker.
+`core/errors.py:failure_note` builds the per-kind `[System Note]`, and only the first two rows
+above invite a retry; the rest say *do not retry* explicitly, because a retry there merely burns
+iterations against the 8-iteration cap before the user hears anything.
+
+`worker.py:process_job` sends the classified `user_message` to the `queue_update` event while the
+audit row keeps the raw exception, and `chat/page.tsx`'s toast renders that reason instead of
+discarding it behind "encountered an error" (§14).
 
 ---
 
@@ -539,7 +587,7 @@ Any other `type` is ignored rather than misread as chat text (`chat.py:websocket
 | `tab_switched` | `{type, active_tab}` | `chat.py:websocket_chat_endpoint` | `useWebSocket.ts:connect` (`onmessage`) | `setActiveTab(active_tab)` — the client no longer sets it optimistically (§14) |
 | `error` | `{type, message}` | `chat.py:authenticate_ws_user`, `chat.py:websocket_chat_endpoint` (multiple sites incl. the `switch_tab` handler and the top-level exception handler); `agentic_loop.py:run_agentic_loop` (RBAC denial, exception, iteration-cap exhaustion) | `useWebSocket.ts:connect` (`onmessage`) | appends a `system` message, deduped against an identical predecessor |
 | `pong` | `{type: "pong"}` | `chat.py:websocket_chat_endpoint` | `useWebSocket.ts:connect` (`onmessage`) | no-op |
-| `queue_update` | `{type, job_id, status, tool_name, args, session_id, error}` | `events.py:publish_queue_update` via `worker.py:process_job`, relayed by `chat.py:forward_queue_updates` | `useWebSocket.ts:connect` (`onmessage`) → DOM `CustomEvent` → `chat/page.tsx` (`queue_update` listener) | toast keyed on `status` |
+| `queue_update` | `{type, job_id, status, tool_name, args, session_id, error}` | `events.py:publish_queue_update` via `worker.py:process_job`, relayed by `chat.py:forward_queue_updates` | `useWebSocket.ts:connect` (`onmessage`) → DOM `CustomEvent` → `chat/page.tsx` (`queue_update` listener) | toast keyed on `status`; a `failed` toast appends `error`, which the worker fills with the classified `user_message` (§8.2) |
 
 `status` is `"completed"` or `"failed"` (`worker.py:process_job`); the frontend also handles a
 generic "other" branch (`chat/page.tsx`, the `queue_update` listener), which nothing currently
@@ -759,18 +807,38 @@ construction, so the store never advertises a socket still in `CONNECTING`.
 
 ### 15.1 Compose topology
 
-| Service | Build | Command | Ports |
+| Service | Build | Command | Published ports |
 |---|---|---|---|
-| `postgres` | `postgres:16` | default | `5433:5432` |
-| `redis` | `redis:7-alpine` | default | `6379:6379` |
-| `backend` | `./backend` | `uvicorn app.main:app --host 0.0.0.0 --port 8000` | `8000:8000` |
+| `postgres` | `postgres:16` | default | **none** |
+| `redis` | `redis:7-alpine` | `redis-server --requirepass $REDIS_PASSWORD` | **none** |
+| `backend` | `./backend` | `uvicorn app.main:app --host 0.0.0.0 --port 8000` | **none** |
 | `worker` | `./backend` | `python -m app.queue.worker` | none |
-| `frontend` | `./frontend` | `node server.js` | `3000:3000` |
+| `frontend` | `./frontend` | `node server.js` | **none** |
 | `caddy` | `caddy:2-alpine` | default | `80:80`, `443:443` |
 
+**Only Caddy publishes.** Until 2026-08 this table read `5433:5432`, `6379:6379`, `8000:8000` and
+`3000:3000` — every one of which put a service on the public internet, since a compose `ports:`
+mapping binds `0.0.0.0` by default. Nothing needed them: Caddy reverse-proxies to `backend:8000`
+and `frontend:3000` over the compose network, and every other consumer addresses services by name.
+
+The exposed, unauthenticated Redis is how the production host was compromised. Redis ships with no
+authentication, and an attacker who can reach it can `CONFIG SET dir /root/.ssh` +
+`CONFIG SET dbfilename authorized_keys` + `SAVE` to write their own key — which is what happened,
+followed by two long-running C2 processes and several TB of egress before Hetzner's abuse
+notifications were traced back. **A host firewall does not mitigate this**: Docker installs its own
+`iptables` rules ahead of the `INPUT` chain, so a published port bypasses UFW entirely — a
+`ufw deny 6379/tcp` was in place on that host and had no effect. Port filtering has to happen
+either at the cloud provider's firewall (outside the VM) or by not publishing the port at all.
+
+So, defence in depth: no mapping *and* `--requirepass`. `DB_PASSWORD` and `REDIS_PASSWORD` use
+compose's `${VAR:?message}` form, which aborts startup when either is unset rather than
+substituting an empty string and quietly starting a passwordless database or an open Redis — the
+precise failure mode that started this.
+
 `backend` and `worker` both load `.env` via `env_file` (`docker-compose.yml`, both services) with
-`DATABASE_URL`/`REDIS_URL` overridden to compose service names. Volumes: `pgdata`, `caddy_data`,
-`caddy_config` — **Redis has none**, so the write queue is memory-only.
+`DATABASE_URL`/`REDIS_URL` overridden to compose service names (the `.env` values are for running
+outside Docker only). Volumes: `pgdata`, `caddy_data`, `caddy_config` — **Redis has none**, so the
+write queue is memory-only.
 
 Caddy routes in order (`Caddyfile`, the `route` block): `/api/me` → backend (carved out before the
 NextAuth wildcard), `/api/auth/*` → frontend, `/api/*` → backend, `/ws*` → backend, `*` → frontend.
@@ -802,7 +870,9 @@ that bypasses a PR (or that CI would have failed) can no longer deploy. The SSH 
 `git fetch origin main && git reset --hard origin/main`, `docker compose build` (no `--no-cache`
 — `requirements.txt` has been exact-pinned since Phase 0, so a cached build is just as
 reproducible), `up -d`, then verifies the deploy: checks `docker compose ps` for any container
-stuck `Restarting`, polls `GET /api/ready` for up to 75 s, and `exit 1`s with the last 80 log
+stuck `Restarting`, polls `GET /api/ready` for up to 75 s — from *inside* the backend container
+via `docker compose exec`, since the backend no longer publishes a host port (§15.1) — and
+`exit 1`s with the last 80 log
 lines on either failure — closing the exact gap that let the 2026-08-06 CORS_ORIGINS outage run
 unnoticed for ~21 hours (§3). `set -e` is now on the whole remote script, so a failed `git reset`
 no longer silently continues into deploying stale code.
@@ -817,8 +887,9 @@ touch ignored files — but any *other* untracked file in the repo directory is 
 
 ### 15.3 Tests
 
-28 tests across `tests/test_db.py` (4), `tests/test_core/test_core_logic.py` (8),
-`tests/test_sheets/test_sheets_logic.py` (12), `tests/integration/test_integration_logic.py` (4).
+55 test functions (58 collected cases, one being parametrised) across `tests/test_db.py` (4),
+`tests/test_core/test_core_logic.py` (24), `tests/test_sheets/test_sheets_logic.py` (22),
+`tests/integration/test_integration_logic.py` (5).
 `test_db.py` and the integration suite each define their own `setup_*` and `db_session` fixtures
 locally, both autouse.
 
@@ -847,13 +918,28 @@ changed and when.
 `google_access_token` **and, since Phase 4, `google_refresh_token`** as plain fields,
 JSON-serialised into the Redis entry (`producer.py:enqueue_write_job`) so the worker can rebuild a
 self-refreshing client (`worker.py:process_job`). Live user credentials — now including a
-long-lived refresh token, not just an hour-lived access token — sit in a Redis instance with no
-auth and port 6379 published to the host (`docker-compose.yml`, `redis` service) for as long as
-the job is queued. Inherent to the OAuth-only design plus the queue boundary; noted, not solved.
+long-lived refresh token, not just an hour-lived access token — sit in Redis for as long as the
+job is queued. That Redis is no longer published or unauthenticated (§15.1), which removes the
+network path that made this critical rather than medium, but the tokens are still at rest in
+plaintext in a process whose compromise would hand over live Google access.
+Inherent to the OAuth-only design plus the queue boundary; noted, not solved.
 Threading the refresh token through was a deliberate Phase 4 tradeoff — the alternative (queued
 writes dying whenever the access token expires before the worker gets to them) was worse — but it
 does widen what's exposed here, and a token-reference indirection (store tokens server-side, pass
 the queue only an opaque reference) remains the real fix, not attempted here.
+
+### 16.2 Recovery can replay a write that already succeeded
+**Severity: low, but `add_row` is not idempotent.** A job is cleared from `PROCESSING_KEY` by an
+`LREM` that runs *after* `process_job` returns. If that `LREM` doesn't land — Redis drops out in
+the window between the Sheets write and the clear — the job stays in `PROCESSING_KEY` and
+`recover_stale_jobs` re-queues it on the next worker start, applying the write a second time.
+
+This is not new behaviour: previously the worker crashed at that point, leaving the job in exactly
+the same state, so the replay happened either way. Re-applying `update_cell`, `bulk_update` or
+`format_row` is harmless (they set an absolute value), but `add_row` computes a fresh sequential
+ID via `meta.py:next_ricefw_id` and would insert a **duplicate row**. The real fix is an
+idempotency key checked before the mutation rather than after it; the window is small enough that
+it hasn't been observed, and it is recorded here rather than papered over.
 
 ---
 
@@ -873,6 +959,7 @@ the queue only an opaque reference) remains the real fix, not attempted here.
 | **`DEFAULT_SPREADSHEET_ID`** | declared `config.py:Settings` | **required — no default**; referenced nowhere in `backend/app/` |
 | `DEFAULT_SHEET_TAB` / `_LABEL` | declared `config.py:Settings` | defaults present; referenced nowhere in `backend/app/` |
 | `NEXTAUTH_SECRET` / `NEXTAUTH_URL` | `auth.ts`, `docker-compose.yml` (`frontend` service env) | secret falls back to `JWT_SECRET` |
-| `DB_PASSWORD` | `docker-compose.yml` (`postgres`/`backend`/`worker` services) | none — compose only |
+| **`DB_PASSWORD`** | `docker-compose.yml` (`postgres`/`backend`/`worker` services) | **required under compose** — `${DB_PASSWORD:?…}` aborts startup if unset (§15.1) |
+| **`REDIS_PASSWORD`** | `docker-compose.yml` (`redis` `--requirepass`, substituted into `backend`/`worker` `REDIS_URL`) | **required under compose** — `${REDIS_PASSWORD:?…}` aborts startup if unset (§15.1) |
 | `NEXT_PUBLIC_WS_URL` | `useWebSocket.ts:connect` | empty in compose (`docker-compose.yml`, `frontend` service env) |
 | `VPS_HOST` / `VPS_USER` / `VPS_SSH_KEY` / `VPS_PASSWORD` | `deploy.yml` (`appleboy/ssh-action` inputs) | GitHub secrets |
