@@ -2,7 +2,7 @@
 
 import { useSession, signOut } from "next-auth/react"
 import { useRouter } from "next/navigation"
-import { useEffect, useState, useRef } from "react"
+import { useEffect, useMemo, useRef, useState } from "react"
 import { useChatStore, Project, Message } from "@/store/useChatStore"
 import { useWebSocket } from "@/hooks/useWebSocket"
 import MarkdownMessage from "@/components/MarkdownMessage"
@@ -18,7 +18,9 @@ export default function ChatPage() {
 
   // Local UI States
   const [input, setInput] = useState("")
-  const [ledger, setLedger] = useState<LedgerEntry[]>([])
+  // Terminal outcomes keyed by job_id, plus the ids the user has cleared.
+  const [outcomes, setOutcomes] = useState<Record<string, LedgerEntry>>({})
+  const [dismissed, setDismissed] = useState<Set<string>>(new Set())
   const [isAdminState, setIsAdminState] = useState(false)
   const messagesEndRef = useRef<HTMLDivElement | null>(null)
 
@@ -127,13 +129,7 @@ export default function ChatPage() {
         error: typeof data.error === "string" && data.error.trim() ? data.error.trim() : undefined,
       }
 
-      setLedger((prev) => {
-        const existing = prev.findIndex((l) => l.jobId === entry.jobId)
-        if (existing === -1) return [...prev, entry]
-        const next = [...prev]
-        next[existing] = { ...next[existing], ...entry }
-        return next
-      })
+      setOutcomes((prev) => ({ ...prev, [entry.jobId]: entry }))
     }
 
     window.addEventListener("queue_update", handleQueueUpdate)
@@ -141,6 +137,53 @@ export default function ChatPage() {
       window.removeEventListener("queue_update", handleQueueUpdate)
     }
   }, [])
+
+  // The queued half of the ledger, derived during render rather than pushed into
+  // state from an effect — deriving it in an effect means a second render pass
+  // for every message update, and React lints against it for that reason.
+  //
+  // It has to come from here at all because queue/worker.py publishes a
+  // queue_update only on TERMINAL states; there is no in-flight frame on the
+  // socket. Verified against a real write, which arrived already "applied". The
+  // enqueue result carries job_id and status:"queued" back to us
+  // (tool_dispatch.py), so that is the queued row, and the terminal frame in
+  // `outcomes` replaces it by job_id below.
+  const ledger: LedgerEntry[] = useMemo(() => {
+    const rows: LedgerEntry[] = []
+    const seen = new Set<string>()
+
+    for (const msg of messages) {
+      for (const tool of msg.toolCalls ?? []) {
+        const res = tool.result
+        if (!res || res.status !== "queued" || !res.job_id) continue
+        const jobId = String(res.job_id)
+        if (seen.has(jobId) || dismissed.has(jobId)) continue
+        seen.add(jobId)
+
+        const args = tool.args || {}
+        const firstUpdate = Array.isArray(args.updates) ? args.updates[0] : undefined
+        rows.push(
+          outcomes[jobId] ?? {
+            jobId,
+            target: args.ricefw_id || "—",
+            tab: activeTab || "—",
+            field: firstUpdate?.field ?? args.set_field,
+            value: firstUpdate?.value ?? args.set_value,
+            tool: tool.name,
+            state: "queued",
+          }
+        )
+      }
+    }
+
+    // An outcome with no matching tool call — a job recovered by the worker
+    // after a restart, say — still deserves a line.
+    for (const [jobId, entry] of Object.entries(outcomes)) {
+      if (!seen.has(jobId) && !dismissed.has(jobId)) rows.push(entry)
+    }
+
+    return rows
+  }, [messages, outcomes, dismissed, activeTab])
 
   // Handle message send
   const handleSend = (e: React.FormEvent) => {
@@ -398,7 +441,10 @@ export default function ChatPage() {
             belong together: you make a change here and watch it land there. */}
         <footer className="border-t border-[var(--color-rule)] bg-ink-950 p-4 sm:px-6">
           <div className="mx-auto w-full max-w-4xl space-y-3">
-            <WriteLedger entries={ledger} onDismiss={() => setLedger([])} />
+            <WriteLedger
+              entries={ledger}
+              onDismiss={() => setDismissed(new Set(ledger.map((l) => l.jobId)))}
+            />
 
             <form onSubmit={handleSend} className="flex items-center gap-2">
               <input
