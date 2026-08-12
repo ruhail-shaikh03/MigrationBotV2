@@ -888,6 +888,13 @@ the product, since the page metadata still described an "SAP S/4HANA WRICEF Assi
   in the sheet's own A1 vocabulary (`SD!B7`, a row ID, a tab). Unlike decorative `01/02/03`
   numbering it carries information the reader needs, and it reuses the coordinate system the
   backend already speaks (§7.1).
+- **Component classes live in `@layer components`, and must.** Unlayered CSS beats *any* layered
+  rule in the cascade, so while `.field` / `.btn` / `.panel` sat unlayered they silently defeated
+  every Tailwind utility written alongside them: `field pl-9` computed the 12px from `.field`'s
+  `padding` shorthand instead of 36px (the audit filter's search icon rendered on top of its own
+  placeholder), and `px-5 py-3` on the sign-in button and `py-1.5` on the sheet selector were
+  discarded outright. Putting a class in the layer is what opts it into being overridable, which is
+  the entire point of having component classes rather than repeating utility strings.
 - Glassmorphism was removed rather than restyled: `backdrop-filter` under a dense table costs real
   legibility. `.panel` / `.card` / `.well` are flat layered surfaces with hairline `--color-rule`
   borders. `:focus-visible` now paints a ring — almost every control sets `focus:outline-none` for
