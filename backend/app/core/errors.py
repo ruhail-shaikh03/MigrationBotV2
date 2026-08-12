@@ -77,6 +77,11 @@ MODEL_GUIDANCE: Dict[str, str] = {
 
 # Shown to the user. Deliberately free of infrastructure nouns — "Redis",
 # "replica" and "asyncpg" mean nothing to someone editing a tracker.
+#
+# UNKNOWN is the exception: it means classification found nothing to say, so the
+# raw exception text is the *only* information available and suppressing it would
+# leave the user with a bare "Something went wrong". `error_result` appends the
+# detail for that kind alone — see _MAX_DETAIL_CHARS below.
 USER_MESSAGE: Dict[str, str] = {
     INVALID_REQUEST: "That didn't match the sheet's structure.",
     NOT_FOUND: "I couldn't find that record in this tab.",
@@ -87,6 +92,27 @@ USER_MESSAGE: Dict[str, str] = {
     UPSTREAM: "Google Sheets rejected that operation.",
     UNKNOWN: "Something went wrong.",
 }
+
+
+# Toasts are one line; a Google HttpError's repr can run to several hundred
+# characters of URL and HTML, so an appended detail is capped.
+_MAX_DETAIL_CHARS = 180
+
+
+def user_message_for(kind: str, detail: str) -> str:
+    """The message a human should see for this failure.
+
+    For every classified kind the curated sentence is strictly better than the
+    exception text — "You can't write against a read only replica" reads as a
+    spreadsheet permissions problem, which it isn't. For UNKNOWN there is no
+    curated knowledge to substitute, so the detail is carried through instead.
+    """
+    base = USER_MESSAGE.get(kind, USER_MESSAGE[UNKNOWN])
+    if kind != UNKNOWN or not detail:
+        return base
+    trimmed = detail if len(detail) <= _MAX_DETAIL_CHARS else detail[: _MAX_DETAIL_CHARS - 1] + "…"
+    # rstrip the sentence-ending period so the join doesn't read "wrong.: detail".
+    return f"{base.rstrip('.')}: {trimmed}"
 
 
 def _http_status(exc: Exception) -> int:
@@ -180,7 +206,7 @@ def error_result(exc: Exception, tool_name: str = "") -> Dict[str, Any]:
         "ok": False,
         "error": detail,
         "error_kind": kind,
-        "user_message": USER_MESSAGE.get(kind, USER_MESSAGE[UNKNOWN]),
+        "user_message": user_message_for(kind, detail),
     }
 
 
