@@ -20,7 +20,7 @@ interface Project {
 
 export default function AdminProjects() {
   const { data: session } = useSession()
-  const apiToken = (session as any)?.apiToken || ""
+  const apiToken = session?.apiToken || ""
 
   // Data lists state
   const [projects, setProjects] = useState<Project[]>([])
@@ -138,8 +138,8 @@ export default function AdminProjects() {
     setErrorMsg("")
     setIsAnalyzing(true)
     try {
-      const googleToken = (session as any)?.googleAccessToken || ""
-      const googleRefreshToken = (session as any)?.googleRefreshToken || ""
+      const googleToken = session?.googleAccessToken || ""
+      const googleRefreshToken = session?.googleRefreshToken || ""
 
       if (!googleToken) {
         setErrorMsg("Google access token is missing. Please sign out and sign back in.")
@@ -289,8 +289,8 @@ export default function AdminProjects() {
           company_prefix: companyPrefix || "FFC",
           schema_config: (parsedSchema && Object.keys(parsedSchema).length > 0) ? parsedSchema : null
         }
-        const googleToken = (session as any)?.googleAccessToken || ""
-        const googleRefreshToken = (session as any)?.googleRefreshToken || ""
+        const googleToken = session?.googleAccessToken || ""
+        const googleRefreshToken = session?.googleRefreshToken || ""
         const res = await fetch(`${baseUrl}/api/admin/projects`, {
           method: "POST",
           headers: {

@@ -25,7 +25,7 @@ export default function AdminLayout({
       return
     }
     if (status === "authenticated") {
-      const apiToken = (session as any)?.apiToken
+      const apiToken = session?.apiToken
       if (!apiToken) {
         setAdminStatus("loading")
         return

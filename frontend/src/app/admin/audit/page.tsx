@@ -25,7 +25,7 @@ interface AuditLog {
 
 export default function AdminAudit() {
   const { data: session } = useSession()
-  const apiToken = (session as any)?.apiToken || ""
+  const apiToken = session?.apiToken || ""
 
   // Data lists state
   const [audits, setAudits] = useState<AuditLog[]>([])

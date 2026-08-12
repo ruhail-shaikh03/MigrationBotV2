@@ -25,7 +25,7 @@ interface Project {
 
 export default function AdminUsers() {
   const { data: session } = useSession()
-  const apiToken = (session as any)?.apiToken || ""
+  const apiToken = session?.apiToken || ""
 
   // Data lists state
   const [permissions, setPermissions] = useState<PermissionRecord[]>([])

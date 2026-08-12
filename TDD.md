@@ -843,15 +843,32 @@ layout.
 
 | Route | File | Purpose |
 |---|---|---|
-| `/` | `app/page.tsx` | landing, `signIn` |
-| `/chat` | `app/chat/page.tsx` | main chat UI |
-| `/admin` | `app/admin/page.tsx` | dashboard; four parallel fetches, Recharts |
+| `/` | `app/page.tsx` | landing + `signIn`; leads with a worked transcript (question → answer → ledger line) rather than feature cards |
+| `/chat` | `app/chat/page.tsx` | main chat UI; feed, sheet tabs, composer, write ledger |
+| `/admin` | `app/admin/page.tsx` | overview; four parallel fetches, Recharts |
 | `/admin/projects` | `app/admin/projects/page.tsx` | project CRUD + tab detection; sends Google token headers |
 | `/admin/users` | `app/admin/users/page.tsx` | permission upsert/delete |
 | `/admin/audit` | `app/admin/audit/page.tsx` | filtered audit browser |
 
+Shared components:
+
+| Component | Purpose |
+|---|---|
+| `components/Modal.tsx` | the only dialog shell; portalled, focus-trapped, scroll-correct (§14.0.1) |
+| `components/WriteLedger.tsx` | persistent record of queued/applied/failed writes (§14.3) |
+| `components/MarkdownMessage.tsx` | assistant text as GFM (§14.1) |
+| `components/ToolResultCard.tsx` | charts, meters and tables for read-tool payloads (§14.2) |
+
 State lives in one Zustand store (`useChatStore.ts:useChatStore`) holding `projects`,
-`activeProject`, `activeTab`, `isConnected`, `messages`, `ws`, and session metadata.
+`activeProject`, `activeTab`, `isConnected`, `messages`, `ws`, and session metadata. The write
+ledger is deliberately **not** in the store — it is derived per-render in `chat/page.tsx` from
+`messages` plus a `job_id`-keyed map of terminal outcomes (§14.3).
+
+Admin copy is written from the reader's side of the screen and carries no SAP vocabulary: the
+headings are "Connected sheets", "Who can do what" and "Change history", not "Projects
+Configuration Manager" / "User Security & RBAC Policies" / "Security Audits & History Log", and
+the auto-detect failure no longer instructs people to look for a "RICEFW ID" column on a product
+that reads any tracker (§16.3 covers what remains SAP-shaped *below* the UI).
 
 ### 14.0 Design system — "Ledger"
 
@@ -988,11 +1005,16 @@ the enqueue result itself, which already carries `job_id` and `status: "queued"`
 Without it a slow or stuck write would display nothing while it waited, which is precisely the case
 the ledger exists for.
 
-The
-line is stamped with its tab and row ID (§14.0), shows `field → value` where the tool reported
+The line is stamped with its tab and row ID (§14.0), shows `field → value` where the tool reported
 them, and renders the classified `user_message` from `core/errors.py` (§8.2) inline on failure.
-Entries persist for the session until dismissed. The listener reads the active tab through a ref so
-the subscription is not torn down and re-established on every tab change.
+Entries persist for the session until dismissed; dismissal hides by `job_id` rather than emptying a
+list, because the rows are derived rather than stored. The `queue_update` listener reads the active
+tab through a ref so the subscription is not torn down and re-established on every tab change.
+
+Verified against production with a real `update_cell` on a live sheet, sampling the DOM every
+400 ms: the row appeared at ~5 s as `queued` and became `applied` at ~6 s, staying a **single row**
+across the transition — which is the whole point, and the thing two toasts could not do. The
+`failed` path has still only been seen with mock data; provoking it needs an actual write failure.
 
 Tab switching is an explicit control frame, not prompt-driven (`chat/page.tsx:handleTabChange`):
 the client sends `{type: "switch_tab", tab_name}` and only applies the new `activeTab` once the
@@ -1111,6 +1133,32 @@ normally.
 `requirements.txt` is now pinned to exact versions (Phase 0) rather than `>=` floors, and `pandas`
 — unused anywhere in `backend/` — was dropped.
 
+**Backend coverage gap worth knowing.** `core/errors.py:user_message_for` carries the detail
+through for `UNKNOWN` and truncates it at 180 characters (§8.2). The carry-through is covered
+indirectly by `test_worker_notifies_client_on_failure`, which is what caught the regression in CI
+in the first place; the truncation is covered by nothing. Both deserve unit tests in
+`test_core_logic.py` next to the existing three `classify_error` cases.
+
+### 15.4 What the automated checks do not establish
+
+Recorded because it cost real time this session. `tsc --noEmit`, `next build` and `npm run lint`
+all passed while **four** genuine frontend defects were live, and every one of them was found only
+by driving the deployed app in a browser:
+
+| Defect | Why the checks missed it |
+|---|---|
+| Dialog overlay captured by a transformed ancestor (§14.0.1) | valid TS, valid CSS; only wrong at runtime, and only on pages that need an authenticated backend |
+| `next/font/google` fetching gstatic during `next build` | the fetch succeeded locally and Next cached it — the failure is environmental, and surfaced only in the Docker builder |
+| Component classes unlayered, silently eating every Tailwind utility (§14.0) | both stylesheets are valid; the cascade resolves quietly to the wrong value |
+| Write ledger's `queued` state unreachable (§14.3) | frontend and backend are each self-consistent; the gap is in the contract between them |
+
+The generalisable part: none of these are type errors or syntax errors, and three of the four are
+invisible without a running backend. A green build says the frontend *compiles*, not that it
+works. Local `npm run dev` covers `/` only — `/chat` and everything under `/admin` need a real
+session and a live API, so they cannot be exercised on a machine without the stack running. Until
+there is a way to run the app end to end locally (or a browser-driven smoke test in CI), changes
+to those pages should be verified against a deploy before being called done.
+
 ---
 
 ## 16. Known Issues & Technical Debt
@@ -1146,7 +1194,8 @@ the same state, so the replay happened either way. Re-applying `update_cell`, `b
 ID via `meta.py:next_ricefw_id` and would insert a **duplicate row**. The real fix is an
 idempotency key checked before the mutation rather than after it; the window is small enough that
 it hasn't been observed, and it is recorded here rather than papered over.
-### 16.2 SAP-specific assumptions still remain outside the prompt and tool schemas
+
+### 16.3 SAP-specific assumptions still remain outside the prompt and tool schemas
 **Severity: medium.** The hard blocks were removed (§7.3, §8.1) but the product goal — running
 against *any* company tracking sheet, not only a WRICEF tracker — is not fully met:
 
@@ -1166,7 +1215,7 @@ against *any* company tracking sheet, not only a WRICEF tracker — is not fully
   in Postgres, possibly the hardcoded fallback. Re-running tab detection from `/admin/projects` is
   the migration path — there is no automatic backfill.
 
-### 16.3 Dependency advisories are outstanding
+### 16.4 Dependency advisories are outstanding
 **Severity: medium, unverified.** `npm audit` in `frontend/` reports 2 critical and 6 high, all in
 pre-existing dependencies: `@auth/core` / `next-auth` (existence-based auth bypass, and `getToken()`
 raising on a malformed bearer), `next` (middleware/proxy bypass in App Router with Turbopack),

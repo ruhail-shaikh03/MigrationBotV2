@@ -21,7 +21,7 @@ interface Metric {
 
 export default function AdminDashboard() {
   const { data: session } = useSession()
-  const apiToken = (session as any)?.apiToken || ""
+  const apiToken = session?.apiToken || ""
   
   // Data States
   const [projectsCount, setProjectsCount] = useState(0)
