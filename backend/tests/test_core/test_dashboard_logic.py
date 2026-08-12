@@ -65,6 +65,35 @@ def test_descriptor_matching_survives_header_whitespace():
     assert cols[0]["kind"] == "person"
 
 
+def test_columns_empty_in_every_row_are_flagged():
+    """The reference sheet ends in a dozen untouched "Column 15"-style headers."""
+    rows = [
+        {"ID": "SD-001", "Notes": "", "Column 15": ""},
+        {"ID": "SD-002", "Notes": "", "Column 15": ""},
+    ]
+    cols = _column_descriptors(_schema(), ["ID", "Notes", "Column 15"], rows)
+    by_header = {c["header"]: c["has_data"] for c in cols}
+    assert by_header == {"ID": True, "Notes": False, "Column 15": False}
+
+
+def test_a_single_populated_cell_keeps_a_column_visible():
+    """Emptiness must mean *no* row has a value — one entry is still real data."""
+    rows = [{"Notes": ""}, {"Notes": "needs review"}, {"Notes": "   "}]
+    cols = _column_descriptors(_schema(), ["Notes"], rows)
+    assert cols[0]["has_data"] is True
+
+
+def test_whitespace_only_cells_do_not_count_as_data():
+    cols = _column_descriptors(_schema(), ["Notes"], [{"Notes": "   "}])
+    assert cols[0]["has_data"] is False
+
+
+def test_descriptors_default_to_visible_when_no_rows_are_supplied():
+    """Callers that don't pass rows must not have every column silently hidden."""
+    cols = _column_descriptors(_schema(), ["ID", "Notes"])
+    assert all(c["has_data"] for c in cols)
+
+
 def test_legacy_assignee_only_project_still_marks_its_one_role():
     cols = _column_descriptors({"assignee_column": TECH}, ["ID", "Technical Resource"])
     assert [c["kind"] for c in cols] == ["plain", "person"]

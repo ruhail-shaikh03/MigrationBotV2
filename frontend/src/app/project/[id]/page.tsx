@@ -7,7 +7,7 @@ import {
   Bar, BarChart, Cell, LabelList, ResponsiveContainer, Tooltip, XAxis, YAxis,
 } from "recharts"
 import {
-  AlertTriangle, ArrowLeft, Grid3x3, RefreshCw, Search, Users,
+  AlertTriangle, ArrowLeft, Grid3x3, Pencil, RefreshCw, Search, Users,
 } from "lucide-react"
 
 import {
@@ -31,6 +31,9 @@ interface ColumnDescriptor {
   label: string
   key: string | null
   kind: "person" | "effort" | "plain"
+  /** False when the column is empty in every scanned row. Real trackers carry a long
+   *  tail of untouched columns; showing them pushes the useful ones off-screen. */
+  has_data: boolean
 }
 
 interface RoleColumn {
@@ -41,6 +44,7 @@ interface RoleColumn {
 
 interface RowsResponse {
   tab: string
+  project_name: string
   columns: ColumnDescriptor[]
   people_columns: RoleColumn[]
   primary_id_column: string | null
@@ -76,6 +80,8 @@ interface AnalyticsResponse {
   workload: WorkloadEntry[]
   people_columns: RoleColumn[]
   days_source: "column" | "dates" | "mixed" | null
+  /** Rows that actually produced a day figure — the denominator for days_source. */
+  effort_rows: number
   has_due_dates: boolean
   truncated: boolean
 }
@@ -96,6 +102,7 @@ export default function ProjectDashboard() {
 
   const [pending, setPending] = useState<Record<string, PendingEdit>>({})
   const [editing, setEditing] = useState<string | null>(null)
+  const [showEmptyColumns, setShowEmptyColumns] = useState(false)
 
   // Filters
   const [q, setQ] = useState("")
@@ -258,9 +265,20 @@ export default function ProjectDashboard() {
     return Array.from(names).sort((a, b) => a.localeCompare(b))
   }, [analytics])
 
-  const gridColumns = useMemo(
-    () => (rowsData?.columns || []).map((c) => c.header),
+  // Columns that are empty in every row of the tab are hidden by default. The reference
+  // sheet ends in a dozen untouched columns literally named "Column 15"…"Column 26";
+  // rendering them buries the columns a PM came for behind a horizontal scrollbar.
+  const emptyColumnCount = useMemo(
+    () => (rowsData?.columns || []).filter((c) => !c.has_data).length,
     [rowsData]
+  )
+
+  const gridColumns = useMemo(
+    () =>
+      (rowsData?.columns || [])
+        .filter((c) => showEmptyColumns || c.has_data)
+        .map((c) => c.header),
+    [rowsData, showEmptyColumns]
   )
   const columnLabels = useMemo(() => {
     const map: Record<string, string> = {}
@@ -320,7 +338,9 @@ export default function ProjectDashboard() {
               Chat
             </button>
             <div>
-              <h1 className="display-md">Project Dashboard</h1>
+              {/* The sheet's own name, not a generic page label — a PM working three
+                  trackers needs to know which one is on screen. */}
+              <h1 className="display-md">{rowsData?.project_name || "Project"}</h1>
               {rowsData && (
                 <p className="text-[11px] text-ink-500">
                   {rowsData.tab} · {total} {total === 1 ? "row" : "rows"}
@@ -416,6 +436,7 @@ export default function ProjectDashboard() {
           <label className="flex cursor-pointer select-none items-center gap-2 pb-2.5 text-sm text-ink-300">
             <input
               type="checkbox"
+              aria-label="Show overdue rows only"
               checked={overdueOnly}
               onChange={(e) => { setOverdueOnly(e.target.checked); setOffset(0) }}
               className="h-4 w-4 cursor-pointer accent-[var(--color-brass-400)]"
@@ -432,9 +453,21 @@ export default function ProjectDashboard() {
               <p className="text-sm text-ink-500">No rows match these filters.</p>
             ) : (
               <>
+                {emptyColumnCount > 0 && (
+                  <button
+                    onClick={() => setShowEmptyColumns((s) => !s)}
+                    className="text-[11px] text-ink-500 transition hover:text-ink-300 cursor-pointer"
+                  >
+                    {showEmptyColumns
+                      ? `Hide ${emptyColumnCount} empty ${emptyColumnCount === 1 ? "column" : "columns"}`
+                      : `${emptyColumnCount} empty ${emptyColumnCount === 1 ? "column is" : "columns are"} hidden — show`}
+                  </button>
+                )}
                 <DataTable
                   rows={labelledRows}
                   columns={gridColumns.map((h) => columnLabels[h] || h)}
+                  maxHeight="calc(100vh - 320px)"
+                  clampCells
                   renderCell={(label, value, rowIndex) => {
                     const header = headerByLabel[label]
                     const isPerson = personHeaders.has(header)
@@ -467,20 +500,28 @@ export default function ProjectDashboard() {
                       )
                     }
 
+                    // The dotted underline is the affordance. Without it an editable cell
+                    // is visually identical to a read-only one, so the feature is
+                    // undiscoverable — nobody clicks a table cell on spec.
                     return (
                       <button
                         onClick={() => setEditing(cellId)}
-                        title={edit?.error || "Click to reassign"}
-                        className="w-full cursor-pointer text-left hover:text-brass-300"
+                        title={edit?.error || `Reassign ${label}`}
+                        className="group flex w-full cursor-pointer items-center gap-1 text-left"
                       >
-                        <span className={edit?.state === "failed" ? "text-failed" : undefined}>
-                          {edit ? edit.value : value || <span className="text-ink-600">—</span>}
+                        <span
+                          className={`decoration-dotted underline-offset-4 group-hover:text-brass-300 group-hover:underline ${
+                            edit?.state === "failed" ? "text-failed" : "underline decoration-ink-600"
+                          }`}
+                        >
+                          {edit ? edit.value : value || <span className="text-ink-600">Unassigned</span>}
                         </span>
+                        <Pencil className="h-3 w-3 shrink-0 text-ink-600 opacity-0 transition group-hover:opacity-100" />
                         {edit?.state === "queued" && (
-                          <span className="status status-queued ml-1.5">queued</span>
+                          <span className="status status-queued ml-1">queued</span>
                         )}
                         {edit?.state === "failed" && (
-                          <span className="status status-failed ml-1.5">failed</span>
+                          <span className="status status-failed ml-1">failed</span>
                         )}
                       </button>
                     )
@@ -530,15 +571,28 @@ function WorkloadPanel({
   if (isLoading && !analytics) return <p className="text-sm text-ink-500">Reading the sheet…</p>
   if (!analytics) return <p className="text-sm text-ink-500">Workload data is unavailable.</p>
 
-  const { workload, by_status, days_source, has_due_dates } = analytics
-  // days_source === null means the sheet records no effort anywhere. Plotting zeros would
-  // assert that everyone has no work, so the chart measures item counts and says so.
-  const measuresDays = days_source !== null
+  const { workload, by_status, days_source, has_due_dates, effort_rows, total_rows } = analytics
+
+  // Day figures are only worth charting when most rows actually produce one. On a sheet
+  // where 40 of 412 rows carry both dates, a "days" chart ranks three people above
+  // thirty who show as 0 — which says they have no work rather than no dates. Items are
+  // the honest measure below that threshold, and every row has one.
+  const effortCoverage = total_rows > 0 ? (effort_rows ?? 0) / total_rows : 0
+  const measuresDays = days_source !== null && effortCoverage >= 0.5
   const unit = measuresDays ? "days" : "items"
-  const bars = workload.slice(0, MAX_BARS).map((w) => ({
-    person: w.person,
-    value: measuresDays ? Math.round(w.total_days * 10) / 10 : w.total_items,
-  }))
+
+  // Rank by the value being drawn. Sorting by item count while plotting days put
+  // zero-length bars above shorter non-zero ones, so the ordering contradicted the
+  // lengths — the one thing a bar chart must not do.
+  const bars = [...workload]
+    .map((w) => ({
+      person: w.person,
+      value: measuresDays ? Math.round(w.total_days * 10) / 10 : w.total_items,
+    }))
+    .filter((b) => b.value > 0)
+    .sort((a, b) => b.value - a.value)
+    .slice(0, MAX_BARS)
+
   const totalOverdue = workload.reduce((sum, w) => sum + w.overdue_items, 0)
 
   return (
@@ -552,48 +606,63 @@ function WorkloadPanel({
           sub={has_due_dates ? undefined : "no due-date column"}
         />
         <StatTile
-          label={measuresDays ? "Total days" : "Total items"}
-          value={String(
-            measuresDays
-              ? Math.round(workload.reduce((s, w) => s + w.total_days, 0))
-              : workload.reduce((s, w) => s + w.total_items, 0)
-          )}
-          sub={
-            days_source === "dates"
-              ? "derived from dates"
-              : days_source === "mixed"
-                ? "mixed sources"
-                : days_source === null
-                  ? "no effort column"
-                  : undefined
-          }
+          label="Assignments"
+          value={String(workload.reduce((s, w) => s + w.total_items, 0))}
+          sub="one per person per role"
         />
       </div>
 
+      {/* Days get their own tile only when the sheet records them, and always with the
+          denominator: "525 days" over 40 of 412 rows is a tenth of the work, not a total. */}
+      {days_source !== null && (
+        <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
+          <StatTile
+            label="Days recorded"
+            value={String(Math.round(workload.reduce((s, w) => s + w.total_days, 0)))}
+            sub={`across ${effort_rows ?? 0} of ${total_rows} rows${
+              days_source === "dates"
+                ? " — derived from start and due dates"
+                : days_source === "mixed"
+                  ? " — mixed sources"
+                  : ""
+            }`}
+          />
+          {!measuresDays && (
+            <div className="rounded-lg border border-[var(--color-rule-strong)] bg-white/[0.03] px-3 py-2.5">
+              <div className="text-[11px] uppercase tracking-wider text-ink-500">Why items, not days</div>
+              <p className="mt-1 text-[12px] leading-relaxed text-ink-400">
+                Too few rows carry the dates a day figure needs, so ranking by days would
+                show most people as having no work rather than no dates.
+              </p>
+            </div>
+          )}
+        </div>
+      )}
+
       {bars.length > 0 && (
         <ChartFrame
-          title={measuresDays ? "Workload by person (days)" : "Workload by person (items)"}
+          title={measuresDays ? "Busiest by days" : "Busiest by assignment count"}
           subtitle={
-            days_source === "column"
-              ? "From the sheet's effort column"
-              : days_source === "dates"
-                ? "Derived from start and due dates — the sheet records no effort column"
-                : days_source === "mixed"
-                  ? "Mixed: some rows from an effort column, some derived from dates"
-                  : "The sheet records no effort, so this counts items rather than days"
+            measuresDays
+              ? days_source === "column"
+                ? "From the sheet's effort column"
+                : "Derived from start and due dates"
+              : `Top ${bars.length} of ${workload.length} people, by number of assigned rows`
           }
         >
-          <ResponsiveContainer width="100%" height={Math.max(120, bars.length * 34)}>
-            <BarChart data={bars} layout="vertical" margin={{ top: 0, right: 44, bottom: 0, left: 0 }}>
+          {/* 40px per row, not 34: real names wrap to two lines at this width, and the
+              tighter figure clipped the last bar out of the frame. */}
+          <ResponsiveContainer width="100%" height={Math.max(140, bars.length * 40)}>
+            <BarChart data={bars} layout="vertical" margin={{ top: 0, right: 48, bottom: 0, left: 0 }}>
               <XAxis type="number" hide />
               <YAxis
                 type="category"
                 dataKey="person"
-                width={168}
+                width={176}
                 tick={{ fill: "#a1a1aa", fontSize: 12 }}
                 tickLine={false}
                 axisLine={false}
-                tickFormatter={(v: string) => (v.length > 24 ? `${v.slice(0, 23)}…` : v)}
+                tickFormatter={(v: string) => (v.length > 22 ? `${v.slice(0, 21)}…` : v)}
               />
               <Tooltip content={<HoverTip unit={unit} />} cursor={{ fill: "rgba(255,255,255,0.04)" }} />
               <Bar dataKey="value" fill={SERIES_HUE} radius={[0, 4, 4, 0]} barSize={14}>
