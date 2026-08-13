@@ -168,27 +168,38 @@ def resolve_effort(
 def collect_assignments(
     row: Dict[str, Any],
     people_columns: List[Dict[str, Any]],
+    resolver: Optional[Any] = None,
 ) -> List[Dict[str, str]]:
     """Every (role, person) pair named by this row.
 
-    One row can name the same person in several roles; each is returned separately so
-    callers can show a per-role split as well as a total. A cell holding several names
-    is treated as a single value on purpose: splitting on commas would turn a
-    "Shaikh, Rohail" style cell into two people who do not exist, and inventing
-    colleagues is a worse failure than under-splitting a shared assignment.
+    One cell can name several people and one person can hold several roles; each pairing
+    is returned separately so callers can show a per-role split as well as a total.
+
+    A cell used to be treated as a single value on the reasoning that splitting
+    "Shaikh, Rohail" would invent two people who do not exist. That reasoning is about
+    *commas*; it was over-applied to slashes and ampersands, and on the reference tracker
+    60 of 257 assigned cells consequently credited a composite like "Minhaj Alam & Dawood"
+    while the two real people got nothing. `split_cell` splits on / and & only.
+
+    `resolver` is a `PersonResolver` applying the project's admin-confirmed alias map. It
+    is optional and defaults to splitting alone, so attribution keeps working when the
+    database is unreachable — degrading to unmerged names rather than to an error.
     """
+    from app.core.aliases import PersonResolver  # local: aliases.py imports this module
+
+    resolver = resolver or PersonResolver()
     out: List[Dict[str, str]] = []
     for col in people_columns or []:
         header = col.get("header")
         if not header:
             continue
-        name = display_person(row.get(header))
-        if not name:
-            continue
-        out.append({
-            "role_key": col.get("key") or slugify_role(col.get("label") or header),
-            "role_label": col.get("label") or str(header).strip(),
-            "person": name,
-            "person_key": normalise_person(name),
-        })
+        for name in resolver.resolve_cell(row.get(header)):
+            out.append({
+                "role_key": col.get("key") or slugify_role(col.get("label") or header),
+                "role_label": col.get("label") or str(header).strip(),
+                "person": name,
+                # Keyed off the *resolved* name, or an alias would show a merged label
+                # over totals that were never actually merged.
+                "person_key": normalise_person(name),
+            })
     return out

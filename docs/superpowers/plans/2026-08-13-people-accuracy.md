@@ -791,7 +791,12 @@ cd backend && DATABASE_URL="postgresql+asyncpg://u:p@localhost/db" REDIS_URL="re
   python -m pytest tests/test_core tests/test_sheets -q
 ```
 
-Expected: all PASS. `test_people_schema.py` has an existing test asserting a multi-name cell stays one value — it will now fail. **Update it rather than reverting this change**: rename it to `test_a_comma_cell_is_still_one_value` and assert on `"Shaikh, Rohail"`, which is the behaviour that was actually being protected.
+Expected: all PASS, including `test_people_schema.py`'s existing
+`test_multi_name_cell_is_one_value_not_two_invented_people` — **unchanged**. An earlier
+draft of this plan warned that test would break. It does not: it asserts on
+`"Shaikh, Rohail"`, a *comma* cell, which `split_cell` deliberately leaves whole. That
+test is in fact the regression guard for the delimiter choice, so leave it exactly as it
+is. Verified during implementation.
 
 - [ ] **Step 5: Commit**
 

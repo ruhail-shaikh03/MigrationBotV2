@@ -110,3 +110,51 @@ def test_order_of_first_appearance_is_preserved():
 
 def test_an_empty_resolver_still_splits():
     assert PersonResolver().resolve_cell("Ahmed Qamar/Asif") == ["Ahmed Qamar", "Asif"]
+
+
+# --- assignments ------------------------------------------------------------
+
+from app.core.people import collect_assignments  # noqa: E402
+
+DEV = {"key": "developer_name", "label": "Developer Name", "header": "Developer Name"}
+CONSULTANT = {"key": "consultant", "label": "Consultant", "header": "Consultant"}
+
+
+def test_a_shared_cell_becomes_one_assignment_per_person():
+    out = collect_assignments({"Developer Name": "Minhaj Alam & Dawood"}, [DEV])
+    assert [a["person"] for a in out] == ["Minhaj Alam", "Dawood"]
+    assert {a["role_label"] for a in out} == {"Developer Name"}
+
+
+def test_aliases_apply_when_a_resolver_is_supplied():
+    r = _resolver(**{"dawood": "Muhammad Dawood Umer"})
+    out = collect_assignments({"Developer Name": "Minhaj Alam & Dawood"}, [DEV], r)
+    assert [a["person"] for a in out] == ["Minhaj Alam", "Muhammad Dawood Umer"]
+
+
+def test_splitting_happens_without_a_resolver():
+    """Attribution must not depend on the database being reachable."""
+    out = collect_assignments({"Developer Name": "Ahmed Qamar/Asif"}, [DEV], None)
+    assert len(out) == 2
+
+
+def test_one_person_in_two_roles_yields_two_assignments():
+    """Existing behaviour, preserved: the workload panel counts per person per role."""
+    r = _resolver(**{"madiha": "Madiha Shah Bukhari"})
+    out = collect_assignments(
+        {"Consultant": "Madiha", "Developer Name": "Madiha Shah Bukhari"}, [CONSULTANT, DEV], r
+    )
+    assert [a["role_key"] for a in out] == ["consultant", "developer_name"]
+    assert {a["person_key"] for a in out} == {"madiha shah bukhari"}
+
+
+def test_person_key_is_derived_from_the_resolved_name():
+    """Otherwise the alias would show a merged label over unmerged totals."""
+    r = _resolver(**{"babar": "Babar Ali"})
+    out = collect_assignments({"Developer Name": "BABAR"}, [DEV], r)
+    assert out[0]["person"] == "Babar Ali"
+    assert out[0]["person_key"] == "babar ali"
+
+
+def test_a_blank_cell_yields_nothing():
+    assert collect_assignments({"Developer Name": "  "}, [DEV]) == []
