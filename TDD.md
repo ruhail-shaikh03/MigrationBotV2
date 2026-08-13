@@ -1682,14 +1682,18 @@ idempotency key checked before the mutation rather than after it; the window is 
 it hasn't been observed, and it is recorded here rather than papered over.
 
 ### 16.3 SAP-specific assumptions still remain outside the prompt and tool schemas
-**Severity: medium.** The hard blocks were removed (§7.3, §8.1) but the product goal — running
-against *any* company tracking sheet, not only a WRICEF tracker — is not fully met:
+**Severity: medium.** The hard blocks were removed (§7.3, §8.1) and *who a row is assigned to* is
+now derived from value shape rather than English role vocabulary (§7.5), which was the largest
+remaining gap. What follows is what is still not generic:
 
 - **Inline column defaults.** `read.py`/`write.py`/`worker.py` still default
-  `primary_id_column` → `"RICEFW ID"`, `status_column` → `"Dev Status"`, `assignee_column` →
-  `"Technical Resource "`, and the `overdue` report defaults `go_live` → `"Go-Live Date"` (§7.1).
-  These only apply when `schema_config` omits the key — which on a non-SAP sheet is exactly when
-  they are wrong, and they fail as "column not found" rather than as a misconfiguration.
+  `primary_id_column` → `"RICEFW ID"`, `status_column` → `"Dev Status"` and `assignee_column` →
+  `"Technical Resource "` (§7.1). These only apply when `schema_config` omits the key — which on a
+  non-SAP sheet is exactly when they are wrong, and they fail as "column not found" rather than as
+  a misconfiguration. They are now written as `x or "default"` rather than `.get(key, "default")`,
+  so a key present-but-null no longer defeats the fallback; that spelling is what broke the overdue
+  report on every project (§16.5). The deadline column no longer has an inline default at all —
+  `schema.py:get_due_column` resolves it, falling back to a header scan.
 - **`add_row` requires `module` and `type`.** Both are `required` in the tool schema and consumed
   by `worker.py:process_job`. A sheet with no category or type column cannot satisfy them. Making
   them optional means touching the write path, so it was left alone.
@@ -1703,7 +1707,11 @@ against *any* company tracking sheet, not only a WRICEF tracker — is not fully
   (§7.4): an un-migrated project resolves to the single synthesised role derived from its legacy
   `assignee_column`, so a second resource column stays invisible until someone re-detects that tab
   or adds it by hand in the role editor. The degradation is silent — the UI cannot distinguish
-  "this sheet has one resource column" from "this project was never re-detected".
+  "this sheet has one resource column" from "this project was never re-detected". This is now the
+  *only* reason a people column goes missing: detection itself no longer depends on recognising
+  English role vocabulary (§7.5), so a re-detected tab finds people columns whatever they are
+  called. Re-detection remains a deliberate admin act — `detect-metadata` returns a config and
+  never writes one.
 
 ### 16.4 Dependency advisories are outstanding
 **Severity: medium, unverified.** `npm audit` in `frontend/` reports 2 critical and 6 high, all in
