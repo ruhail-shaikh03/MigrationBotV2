@@ -830,13 +830,20 @@ which columns hold people — it is told, so a sheet naming a "QA Owner" renders
 change. Rows are zipped by `_row_dicts`, which **pads** short rows: Sheets omits trailing empty
 cells, and truncating the header list to match would silently drop real columns from the grid.
 
+It also returns `tabs` — every tab in the project, from `get_available_tabs`. `?tab=` was always
+honoured (`_tab_for` falls back to `default_tab` only when it is absent), but without this list the
+client had no way to learn another tab existed, so it never sent one and the dashboard was pinned
+to the default tab of a 12-tab tracker (§14.6).
+
 Filters are `q` (any cell), `status`, `person` (+ optional `role_key` to scope to one role) and
 `overdue`. Person matching goes through `people.py:normalise_person`, so it is exact after
 case/whitespace folding rather than a substring test — a substring match would fold "Sara" and
-"Sara Khan" into one person. `_is_overdue` treats a row as overdue when its due/go-live date has
-passed and its status does not read as finished; the finished-word list is deliberately narrow
-(no `"live"`, which would clear "Go-Live Pending") because hiding an overdue item is the worse
-error — nobody chases what they cannot see.
+"Sara Khan" into one person. The deadline column comes from `schema.py:get_due_column`, shared with
+the agent's `summarize(overdue)` so the two surfaces cannot disagree about what a deadline is
+(§16.5). `_is_overdue` treats a row as overdue when that date has passed and its status does not
+read as finished; the finished-word list is deliberately narrow (no `"live"`, which would clear
+"Go-Live Pending") because hiding an overdue item is the worse error — nobody chases what they
+cannot see.
 
 `project_analytics` aggregates over `people.py:collect_assignments`, so one person appearing in two
 role columns yields one workload entry carrying a per-role split and a combined total.
@@ -1299,6 +1306,41 @@ through `useWebSocket.ts:teardownSocket`, which detaches handlers before closing
 close can never schedule a reconnect (§9.3). `setWs` is called from `onopen` rather than at
 construction, so the store never advertises a socket still in `CONNECTING`.
 
+### 14.6 Corrections from the second live run
+
+Three defects reported after a week of real use, all reproduced against the deployed instance
+before being touched. They are unrelated in symptom and turned out to share nothing but the
+method that found them — measuring the running system rather than reasoning about the source.
+
+**Long answers could not be scrolled.** The chat column is
+`h-screen` → `flex flex-1 flex-col` → `flex-1 overflow-y-auto`. The middle wrapper carried the
+default `min-height: auto`, which for a flex item resolves to its *content* height, so it grew to
+the height of the whole conversation — measured at 2962 px inside a 620 px root. The feed below it
+then received a `flex-1` height equal to its own content, so its `overflow-y-auto` never engaged
+(`scrollHeight === clientHeight`), and everything past the first viewport was clipped by the root's
+`overflow-hidden`. The content was not merely hidden but *unreachable*: `overflow: hidden` is not
+scrollable by wheel or keyboard, though `scrollIntoView` still moved it programmatically, which is
+why the view jumped to the bottom of an answer that could not then be scrolled back up. One
+`min-h-0` on the wrapper fixes it.
+
+The follow-through matters as much: with scrolling restored, the unconditional
+`scrollToBottom()` on every `messages` change became a hijack. `messages` changes identity on every
+socket frame — each `tool_start`, each `tool_result` — so a run calling eight tools yanked the
+reader to the bottom eight times. It now scrolls only when the reader is already within 120 px of
+the bottom, and scrolls the container directly rather than through `scrollIntoView`, which walks
+and scrolls every scrollable ancestor.
+
+**The dashboard was pinned to one tab.** `GET /api/projects/{id}/rows` has always accepted `?tab=`,
+and `_tab_for` falls back to `project.default_tab` only when it is absent — but nothing ever told
+the client which other tabs existed, so nothing sent it. On a 12-tab tracker eleven tabs were
+unreachable from the dashboard while chat could switch freely. The rows response now carries
+`tabs` (`get_available_tabs`), and the page renders the same switcher the chat header uses.
+Switching clears the person and role filters with it, since those values are tab-specific and
+carrying them across lands the user on an empty grid that reads as an empty tab.
+
+**"What's overdue?" burned all eight iterations and answered nothing.** See §16.5 — the root cause
+is a schema-resolution bug, not a prompt or model problem, and the fix is described there.
+
 ---
 
 ## 15. Deployment, CI/CD & Tests
@@ -1496,6 +1538,63 @@ raising on a malformed bearer), `next` (middleware/proxy bypass in App Router wi
 plus `postcss`, `sharp`, `nanoid`, `js-yaml`, `brace-expansion`. The two auth advisories bear
 directly on §4's token chain. Not triaged against the versions actually in `package-lock.json`, and
 no upgrade attempted — `next-auth` is on a beta pin, so bumping it is not a patch-level change.
+
+### 16.5 The overdue report was unreachable on every project — RESOLVED
+**Severity: was high.** `summarize(report_type="overdue")` failed on both registered trackers, and
+the failure cascaded: with its one purpose-built tool returning an error, the model improvised with
+`search_rows`, filtering on date *substrings* (`Expected Completetion Date contains "2025"`) and on
+`Status = Completed` — the inverse of the question. It spent all eight iterations that way and, per
+the loop's exhaustion branch, delivered an error frame and none of the nine tool results it had
+collected. Reproduced live before diagnosis; the tool-call trace is what identified the origin as
+step 0 rather than a model-behaviour problem.
+
+Four distinct defects, each individually sufficient to break the report:
+
+1. **A default that never applied.** `date_cols.get("go_live", "Go-Live Date")` looks defaulted, but
+   detection writes the key holding a literal `null`, and `dict.get` returns a stored `None` in
+   preference to the default. Every project had `go_live: null`, so the lookup yielded `None` and
+   the column check failed immediately.
+2. **No slot for a plain due date.** Detection mapped `go_live`, `signoff`, `start` and
+   `completion`. The reference sheet's deadline column is "Expected Completetion Date", which is
+   none of those, so it mapped nowhere — while "Date Completion", recording when work *actually*
+   finished, was mapped as `completion`. Detection now has a `due` slot, matched before
+   `completion` and on stricter words (`due`, `deadline`, `expected`, `planned`, `target`, `eta`),
+   because the deadline header contains the substring "completion" and would otherwise be claimed
+   by it.
+3. **A date parser that could not read the sheet's dates.** `summarize` carried its own format tuple
+   omitting the dotted form (`10.05.2026`) the sheet uses. Even with the column resolved, every
+   date would have failed to parse and the report would have returned zero overdue items — worse
+   than an error, because zero reads as good news. It now shares `people.py:parse_date`, and reports
+   `unparsed_dates` so an unreadable column is visible rather than silent.
+4. **A result too thin to answer from.** The report returned `{id, go_live_date, dev_status,
+   days_overdue}` — bare identifiers. Answering "what's overdue?" from that requires a `get_row` per
+   item, which is exactly the loop the system prompt forbids while offering no alternative. The
+   report now carries the description and every people-column value, so one call answers the
+   question.
+
+The resolution lives in `core/schema.py:get_due_column`, used by `read.py:summarize` *and* both
+dashboard endpoints so the two surfaces cannot disagree about what a deadline is. It prefers a
+mapped `due`, then `go_live`, then falls back to scanning the real headers for deadline wording —
+that last step is what recovers the already-registered projects, since nothing re-detects them
+automatically (§16.3). It deliberately never falls back to a completion or sign-off column:
+measuring against when work finished reports finished work as overdue, and `None` — "this sheet
+records no deadline" — is a true and useful answer where a guess is not.
+
+The same resolver fixed a defect nobody had reported: the dashboard's `has_due_dates` was `false`
+on both trackers for the same reason, so its Overdue tile read "—" and its overdue filter silently
+matched nothing.
+
+Two supporting changes in `agentic_loop.py`. On the final permitted iteration the tools are now
+withdrawn from the request and a system note instructs the model to answer from what it already
+has, so exhausting the budget yields a partial answer instead of nothing; the loop's `else` branch
+remains as a safety net. And the DSML-leakage retry reuses the outer call's kwargs rather than
+rebuilding them with `tools=TOOLS`, which would otherwise reopen the tool path on the very
+iteration that just closed it.
+
+**Not addressed:** `resolve_effort` still derives day spans from `start` → `completion` rather than
+the newly-resolved due column, so effort coverage stays at ~40 of 412 rows on the reference sheet.
+Switching it to the deadline would raise coverage substantially but silently change every day
+figure already on screen, so it is left as a deliberate follow-up rather than folded into a bug fix.
 
 ---
 

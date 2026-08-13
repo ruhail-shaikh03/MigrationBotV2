@@ -44,6 +44,10 @@ interface RoleColumn {
 
 interface RowsResponse {
   tab: string
+  /** Every tab in the project. A multi-tab tracker was previously stuck on its default
+   *  tab here: the endpoint has always accepted `?tab=`, but nothing told the client
+   *  which other tabs existed, so nothing ever sent it. */
+  tabs: string[]
   project_name: string
   columns: ColumnDescriptor[]
   people_columns: RoleColumn[]
@@ -104,6 +108,10 @@ export default function ProjectDashboard() {
   const [editing, setEditing] = useState<string | null>(null)
   const [showEmptyColumns, setShowEmptyColumns] = useState(false)
 
+  // "" means "whatever the project's default tab is" — the server decides, so the page
+  // renders correctly on first paint without first fetching the tab list.
+  const [tab, setTab] = useState("")
+
   // Filters
   const [q, setQ] = useState("")
   const [person, setPerson] = useState("")
@@ -132,14 +140,19 @@ export default function ProjectDashboard() {
     setErrorMsg("")
     try {
       const query = new URLSearchParams({ limit: String(PAGE_SIZE), offset: String(offset) })
+      if (tab) query.set("tab", tab)
       if (q.trim()) query.set("q", q.trim())
       if (person) query.set("person", person)
       if (roleKey) query.set("role_key", roleKey)
       if (overdueOnly) query.set("overdue", "true")
 
+      // Analytics takes the tab too, or the workload panel would describe a different
+      // tab than the grid beside it.
+      const analyticsQuery = tab ? `?tab=${encodeURIComponent(tab)}` : ""
+
       const [rowsRes, analyticsRes] = await Promise.all([
         fetch(`/api/projects/${projectId}/rows?${query}`, { headers: authHeaders }),
-        fetch(`/api/projects/${projectId}/analytics`, { headers: authHeaders }),
+        fetch(`/api/projects/${projectId}/analytics${analyticsQuery}`, { headers: authHeaders }),
       ])
 
       if (!rowsRes.ok) {
@@ -156,7 +169,7 @@ export default function ProjectDashboard() {
     } finally {
       setIsLoading(false)
     }
-  }, [apiToken, projectId, offset, q, person, roleKey, overdueOnly, authHeaders])
+  }, [apiToken, projectId, tab, offset, q, person, roleKey, overdueOnly, authHeaders])
 
   useEffect(() => {
     load()
@@ -258,6 +271,17 @@ export default function ProjectDashboard() {
     [projectId, authHeaders, rowsData]
   )
 
+  // Switching tab invalidates the people- and role-filters with it: the names and role
+  // keys on one tab generally do not exist on another, so carrying them across would
+  // land the user on an empty grid that looks like the tab has no rows.
+  const changeTab = useCallback((next: string) => {
+    setTab(next)
+    setOffset(0)
+    setPerson("")
+    setRoleKey("")
+  }, [])
+
+  const tabs = rowsData?.tabs || []
   const peopleColumns = rowsData?.people_columns || analytics?.people_columns || []
   const everyone = useMemo(() => {
     const names = new Set<string>()
@@ -374,6 +398,31 @@ export default function ProjectDashboard() {
             </button>
           </div>
         </div>
+
+        {/* Tab switcher, styled to match the one in the chat header so the same sheet
+            reads the same way on both surfaces. Scrolls sideways rather than wrapping —
+            a 12-tab tracker would otherwise push the grid down a whole row. */}
+        {tabs.length > 1 && (
+          <div className="mt-3 flex max-w-full items-center gap-1 overflow-x-auto rounded-md border border-[var(--color-rule)] bg-ink-950 p-1">
+            {tabs.map((name) => {
+              const isActive = (rowsData?.tab || tab) === name
+              return (
+                <button
+                  key={name}
+                  onClick={() => changeTab(name)}
+                  aria-current={isActive ? "true" : undefined}
+                  className={`shrink-0 cursor-pointer rounded-sm px-3 py-1 font-mono text-[12px] font-medium transition ${
+                    isActive
+                      ? "bg-brass-400 text-ink-950"
+                      : "text-ink-400 hover:bg-ink-800 hover:text-ink-200"
+                  }`}
+                >
+                  {name}
+                </button>
+              )
+            })}
+          </div>
+        )}
       </header>
 
       <main className="mx-auto max-w-[1400px] space-y-5 p-6">

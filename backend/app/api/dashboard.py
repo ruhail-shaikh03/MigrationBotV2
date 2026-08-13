@@ -23,7 +23,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import settings
 from app.core.people import collect_assignments, normalise_person, parse_date, resolve_effort
 from app.core.permissions import get_user_permissions
-from app.core.schema import get_effort_columns, get_people_columns, get_tab_schema
+from app.core.schema import (
+    get_available_tabs, get_due_column, get_effort_columns, get_people_columns, get_tab_schema,
+)
 from app.db.engine import get_db
 from app.deps import get_current_user, get_google_auth
 from app.models.permission import Permission
@@ -171,8 +173,10 @@ async def list_rows(
 
     people = get_people_columns(tab_schema)
     status_header = tab_schema.get("status_column")
-    date_columns = tab_schema.get("date_columns") or {}
-    due_header = date_columns.get("due") or date_columns.get("go_live")
+    # Resolved against the real headers, so a sheet whose deadline column detection never
+    # mapped ("Expected Completetion Date") still filters by overdue instead of matching
+    # nothing at all. Same resolver the agent's summarize(overdue) uses.
+    due_header = get_due_column(tab_schema, headers)
 
     # Only the people-columns the caller asked about; role_key narrows a person filter to
     # one role so "overdue work Sara owns as functional consultant" is answerable.
@@ -203,6 +207,10 @@ async def list_rows(
 
     return {
         "tab": active_tab,
+        # Every tab the project has, so the grid can offer a switcher. Without it the
+        # client had no way to learn a tab existed, and `?tab=` — which the endpoint has
+        # always honoured — was never sent, pinning the dashboard to `default_tab`.
+        "tabs": get_available_tabs(project.schema_config or {}),
         "project_name": project.project_name,
         # Emptiness is judged across every scanned row, not the page being returned, so
         # which columns show up does not change as the user pages through.
@@ -370,7 +378,7 @@ async def project_analytics(
     effort = get_effort_columns(tab_schema)
     status_header = tab_schema.get("status_column")
     date_columns = tab_schema.get("date_columns") or {}
-    due_header = date_columns.get("due") or date_columns.get("go_live")
+    due_header = get_due_column(tab_schema, headers)
 
     by_status: Dict[str, int] = {}
     workload: Dict[str, Dict[str, Any]] = {}

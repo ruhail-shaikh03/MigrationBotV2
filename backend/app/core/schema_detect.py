@@ -131,7 +131,14 @@ Your goals:
      {{"label": "<the sheet's own wording>", "header": "<verbatim header>",
      "unit": "<days|hours|points, whichever the sheet means>"}}. Return [] if absent —
      many trackers record no effort at all, and [] is the correct answer, not a guess.
-   - "date_columns": Object mapping "go_live", "signoff", "start", "completion" to their respective headers, or null if missing.
+   - "date_columns": Object mapping "due", "go_live", "signoff", "start", "completion" to
+     their respective headers, or null if missing. "due" is the date the row is *supposed*
+     to be finished by — the deadline everything overdue is measured against — and is often
+     worded "Expected Completion Date", "Target Date", "Planned Finish" or "ETA". Keep it
+     distinct from "completion", which is the date work *actually* finished: a sheet
+     frequently has both, and confusing them reports finished work as overdue. If only one
+     such column exists, decide from its wording which it is; "expected"/"planned"/"target"
+     means "due".
 
 Every value below must be copied verbatim from THIS tab's header row, preserving exact
 spelling, casing and any trailing spaces. Never substitute a conventional name for what the
@@ -159,7 +166,8 @@ and must not be copied:
   "description_column": "Summary",
   "type_column": "Category",
   "date_columns": {{
-    "go_live": "Target Date",
+    "due": "Target Date",
+    "go_live": null,
     "signoff": null,
     "start": "Raised On",
     "completion": null
@@ -374,12 +382,20 @@ def _structural_fallback(raw_rows: List[List[Any]]) -> Dict[str, Any]:
 
     description_column = _match_header(non_empty, ["description", "desc", "summary", "title", "subject"])
 
+    # "due" is matched before "completion" and on stricter words. A header like
+    # "Expected Completetion Date" is a deadline, not a record of finished work, but it
+    # contains "completion" — so were completion matched first it would claim the column
+    # and the sheet would end up with no deadline at all.
     date_columns = {
-        "go_live": _match_header(non_empty, ["go-live", "go live", "golive", "due", "target", "deadline"]),
+        "due": _match_header(non_empty, ["due", "deadline", "expected", "planned", "target", "eta"]),
+        "go_live": _match_header(non_empty, ["go-live", "go live", "golive"]),
         "signoff": _match_header(non_empty, ["sign-off", "sign off", "signoff", "approved", "approval"]),
-        "start": _match_header(non_empty, ["start", "created", "opened"]),
+        "start": _match_header(non_empty, ["start", "created", "opened", "assigned"]),
         "completion": _match_header(non_empty, ["completion", "completed", "closed", "finished", "end date"]),
     }
+    # The same header cannot be both the deadline and the actual completion date.
+    if date_columns["due"] and date_columns["completion"] == date_columns["due"]:
+        date_columns["completion"] = None
 
     critical = [c for c in (
         primary_id_column, module_column, type_column,

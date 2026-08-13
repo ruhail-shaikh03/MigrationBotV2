@@ -57,7 +57,25 @@ async def run_agentic_loop(
                 "messages": messages,
                 "tools": TOOLS
             }
-            
+
+            # On the last permitted step, withdraw the tools so the model has to speak.
+            # Previously a loop that spent every iteration on tool calls ended with the
+            # `else` branch below — an error frame and nothing else — throwing away
+            # everything it had already read from the sheet. Observed in production on
+            # "what's overdue?": nine tool results gathered, zero delivered.
+            if iteration == max_iterations - 1:
+                api_kwargs["messages"] = messages + [{
+                    "role": "system",
+                    "content": (
+                        "This is your final step; no further tool calls are possible. "
+                        "Answer now using only what the tool results above already "
+                        "contain. If they are incomplete, state plainly what you did "
+                        "establish and what remains unknown, and suggest a narrower "
+                        "question. Do not apologise for running out of steps."
+                    ),
+                }]
+                api_kwargs.pop("tools")
+
             response = await llm_client.chat.completions.create(**api_kwargs)
             choice = response.choices[0]
             message = choice.message
@@ -67,10 +85,11 @@ async def run_agentic_loop(
             if "<｜｜DSML｜｜>" in content:
                 logger.warning("DSML Leakage detected! Aborting and retrying with deepseek-chat.")
                 # Force fallback to V3 Chat model for safety
+                # Same kwargs as the call that leaked, model forced to V3 — in particular
+                # the final-step variant must retry *without* tools too, or the retry
+                # reopens the tool path the outer call just closed.
                 retry_response = await llm_client.chat.completions.create(
-                    model="deepseek-chat",
-                    messages=messages,
-                    tools=TOOLS
+                    **{**api_kwargs, "model": "deepseek-chat"}
                 )
                 choice = retry_response.choices[0]
                 message = choice.message
