@@ -150,6 +150,21 @@ def suggest_merges(counts: Dict[str, int]) -> List[MergeSuggestion]:
             if set(tokens[name]) < set(tokens[other]):
                 candidates.append(other)
                 reason = reason or "subset"
+            elif set(tokens[other]) < set(tokens[name]) and counts[other] > counts[name]:
+                # The reverse merge: this name *contains* the other, and the other is
+                # commoner. Found on the live tracker, where the containment direction
+                # alone offered "Minhaj Alam (6 rows) -> Mr. Minhaj Alam (1 row)" as the
+                # only option — canonicalising six rows onto a one-off honorific. Three
+                # of nine suggestions pointed that way.
+                #
+                # Both directions are now offered rather than one being chosen, because
+                # neither containment nor frequency is reliable alone: an honorific adds
+                # a token without adding identity, while "Azfer" adds both, and nothing
+                # in a spreadsheet distinguishes them. Offering both keeps the module's
+                # rule intact — suggest, never decide — and the counts shown beside each
+                # candidate are what the admin actually judges by.
+                candidates.append(other)
+                reason = reason or "superset"
             elif other_key.startswith(key + " "):
                 candidates.append(other)
                 reason = reason or "prefix"
@@ -165,5 +180,15 @@ def suggest_merges(counts: Dict[str, int]) -> List[MergeSuggestion]:
         if candidates:
             out.append(MergeSuggestion(name=name, candidates=candidates, reason=reason))
 
-    out.sort(key=lambda s: (-counts[s.name], s.name))
+    # Plausible direction first, then by how much work the merge is worth.
+    #
+    # A merge whose candidate is *commoner* than the name being merged away is the one an
+    # admin almost always wants; the inverse is kept but sinks to the bottom. Ordering by
+    # frequency alone put "Minhaj Alam (6 rows) -> Mr. Minhaj Alam (1 row)" above its own
+    # reverse, so the first thing on screen was the option not to take.
+    def _rank(s: MergeSuggestion):
+        best = max(counts[c] for c in s.candidates)
+        return (0 if best >= counts[s.name] else 1, -counts[s.name], s.name)
+
+    out.sort(key=_rank)
     return out
