@@ -574,10 +574,10 @@ admin UI's raw-JSON textarea.
 - `normalise_person` — trim, collapse whitespace, case-fold, then **exact** comparison. No fuzzy
   matching: merging two colleagues into one workload row is silent corruption, while showing one
   person twice is visible and correctable. An admin alias map is the deliberate follow-up.
+- `split_cell` — every person one cell names, splitting on `/` and `&` **only**. See §7.5.
 - `collect_assignments` — every `(role, person)` pair a row names; the same person in two roles
-  yields two assignments, so callers can show a per-role split and a total. A cell holding several
-  names is treated as one value on purpose — splitting on commas turns `"Shaikh, Rohail"` into two
-  people who do not exist, and inventing colleagues is worse than under-splitting.
+  yields two assignments, so callers can show a per-role split and a total. It takes an optional
+  `PersonResolver` (§7.5) and emits one assignment per *resolved* person per role.
 - `resolve_effort` — returns `(value, source)` with source `"column" | "dates" | None`: an explicit
   effort column first, else a start→due/go-live span, else nothing. It never synthesises a number.
   `parse_effort` returns `None` rather than coercing junk to `0`, because a zero-day workload is a
@@ -586,12 +586,114 @@ admin UI's raw-JSON textarea.
 The structural fallback matches **all** people/effort headers via
 `schema_detect.py:_match_all_headers` and preserves each header verbatim through a stripped→raw
 map, since that path previously stripped every header and would have destroyed the trailing space
-it needs to address the column.
+it needs to address the column. It additionally unions in every column the profiler rates `likely`
+(§7.5), so it no longer depends solely on a keyword list it was handed.
+
+Both detection paths consume the profiler. `_structural_fallback` calls `people_confidence`
+directly, and `detect_schema_config` serialises the per-column statistics into the prompt under
+"Column value statistics", so the model reasons from evidence rather than from header vocabulary.
+`_header_row_index` is shared between the profiler and the fallback: profiling one row off would
+fold the header text into the value sample, and a tracker with a title row above its headers is
+routine.
 
 Detection is an LLM call over ten rows and will misfire, so `components/RoleColumnsEditor.tsx`
 (embedded in the `/admin/projects` detect wizard) lets an admin add, remove, relabel and set units
 on these columns against the tab's real header list. Headers are chosen, never typed, so the
 verbatim string cannot be corrupted by hand.
+
+### 7.5 Who a row is actually assigned to
+
+§7.4 made the *set* of people-columns generic. Measuring the result against two live trackers
+showed the app was still wrong about the people themselves, in three compounding ways.
+
+**Detection reasoned about header wording.** The HEDP tracker names people in two columns —
+`Consultant` (401 non-blank values, 33 distinct) and `Developer Name` (257, 37). Only the second
+was found: "Consultant" reads like a job title in English, so the model passed on it and 401
+assigned rows were invisible to every assignment view. Header wording is the least generic signal
+a sheet offers — the next one says `Owner`, `Assigned To`, `PIC`, or a header in another language,
+and the failure repeats one sheet at a time.
+
+`core/column_profile.py` replaces that with value shape, which is the same on every sheet in every
+domain. It never sees a column name: `profile_column(values)` returns `n`, `cardinality`,
+`mean_tokens`, `mean_length`, `alpha_ratio`, `title_case_ratio` and `repeat_ratio`, and
+`people_confidence` reduces those to `"likely" | "abstain" | "unlikely"`. Thresholds were fitted
+against every populated column of both trackers:
+
+```
+likely    Consultant          card=0.077 tok=2.10 len=12.0 title=0.83   <- detection missed this
+likely    Developer Name      card=0.132 tok=2.94 len=18.6 title=0.96
+unlikely  University          card=0.071 tok=1.12 len=4.8  title=0.03   short uppercase codes
+unlikely  Development Tyoe    card=0.063 tok=1.00 len=5.2  title=0.52   single-token labels
+unlikely  Development         card=0.788 tok=3.79 len=27.4 title=0.80   free text
+unlikely  WRICEF No.          card=0.965 tok=1.00 len=9.0  title=0.00   unique ids
+abstain   Status              card=0.015 tok=1.58 len=10.0 title=0.92   fails cardinality by 0.005
+```
+
+An earlier threshold set used cardinality and token count alone and classified the site-code column
+as people; `mean_length` and `title_case_ratio` are what separate a person from a category code.
+Note how close `University` sits to `Consultant` on cardinality and repetition — the two are nearly
+identical on those axes, which is why the fixtures in `test_column_profile.py` are pinned to the
+same cardinality band. A fixture rejected for having too few distinct values would prove nothing.
+
+**`abstain` is not a vote.** It covers `n < MIN_SAMPLE` (20) and a column missing by exactly one
+criterion. `Status` clears every test but the cardinality floor, by 0.005, and this is *not*
+tunable: a team of eight and a workflow of eight states are statistically identical, and only
+meaning separates them. That is why the LLM stays in the loop rather than being replaced — the two
+signals fail differently, so a column becomes a role if **either** positively claims it. Requiring
+agreement would have left `Consultant` undetected, since the LLM is the signal that missed it. A
+false positive is a visible, removable role and can never reach the spreadsheet.
+
+`title_case_ratio` and token counting are Latin-script assumptions. The profile fields are computed
+and thresholded independently so a CJK or Arabic sheet can lean on cardinality, length and
+repetition; the re-weighting is deliberately left until a sheet needs it.
+
+**A quarter of assignments were credited to people who do not exist.** 60 of 257 `Developer Name`
+cells name two people — `Minhaj Alam & Dawood`, `Ahmed Qamar/Asif`. Each became its own workload
+entry. `people.py:split_cell` splits on `/` and `&` and **never on a comma**: `"Shaikh, Rohail"` is
+plausibly one person written surname-first, and inventing a colleague is worse than under-splitting
+a shared assignment. That distinction is exactly what the original single-value rule got wrong — it
+was reasoning about commas and was over-applied to every delimiter.
+
+The splitter is **structural, not lexical**. An earlier draft stripped honorifics (`Mr.`, `Dr.`),
+which compiles one language's vocabulary into an engine whose first constraint is working with any
+sheet. `"Mr. Minhaj Alam"` → `"Minhaj Alam"` is an alias row instead — data an admin controls
+rather than code nobody can see. The general rule: **vocabulary lives in data, never in code.**
+
+**Spellings still did not collapse.** After splitting, 13 groups remain where one person appears
+under several names (`Madiha`/`Madiha Shah Bukhari`, `Babar`/`BABAR`/`Babar Ali`). The
+`person_aliases` table (`models/person_alias.py`) records one row per `(project_id, alias,
+canonical)` pair, so an alias may name several people — which expresses a comma-separated shared
+cell without teaching the splitter about commas. Per-project, because two organisations share no
+staff. No migration is needed: `init_db` calls `create_all`, which brings up new tables on deploy
+but **never alters an existing one** — which is why this is a new table rather than a column.
+
+`core/aliases.py:PersonResolver.resolve_cell` runs the pipeline in one place, so the dashboard and
+the agent cannot diverge:
+
+```
+whole-cell alias lookup   →  split_cell  →  per-fragment lookup  →  dedupe within the row
+```
+
+The whole-cell lookup coming **first** is what makes automatic splitting safe: a team named `R&D`,
+or a real name containing a slash, is corrected by one alias row. Every automatic decision has a
+manual answer. Resolution is exactly **one hop** — a canonical name is never looked up again — so a
+cycle is impossible by construction rather than by validation.
+
+The governing principle across all three: **automatic when it reveals, confirmed when it
+conflates.** Detecting a column and splitting a shared cell both reveal data that was hidden, and
+apply automatically. Merging two names hides one inside the other and the error is silent — nobody
+notices a colleague who stopped existing — so it always requires a human. `Abdullah` on the live
+sheet plausibly matches `Abdullah Ali`, `Abdullah Azfar` and `Abdullah Azfer`, and nothing in the
+sheet can say which; any rule confident enough to resolve that is confident enough to be wrong.
+
+`aliases.py:suggest_merges` therefore only ever suggests, from three signals: token-subset, prefix,
+and one token within edit distance 2 (the last catches `Azfar`/`Azfer`, which subset matching
+misses entirely — those tokens are not nested, they are misspelled). Direction is decided
+**per-signal**: subset and prefix are inherently directional and list every containing name however
+rare, while the symmetric typo signal breaks ties on frequency because without that it emits both
+directions, and an admin accepting both would create a two-row cycle. Deciding direction globally
+by frequency — an earlier implementation — dropped `Abdullah Azfer` from `Abdullah`'s candidates
+purely because it occurs twice rather than three times, hiding a person the admin might have meant.
 
 `build_column_map` (`column_mapper.py:build_column_map`), a two-pass LLM alias generator, is now
 called from `schema_detect.py:detect_all_tabs` for every tracker tab it detects — it generates an
@@ -845,6 +947,20 @@ read as finished; the finished-word list is deliberately narrow (no `"live"`, wh
 "Go-Live Pending") because hiding an overdue item is the worse error — nobody chases what they
 cannot see.
 
+Both endpoints build a `PersonResolver` per request through `dashboard.py:_resolver_for`, which
+degrades to unmerged names if the alias query fails rather than erroring — the same posture
+`rows_cache` takes toward an unreachable Redis. `list_rows` builds one only when a `person` filter
+is actually supplied, since that is the only place it changes the answer; without it, selecting a
+merged person from the dropdown (which *is* aliased, being populated from the analytics workload)
+would return nothing, and a shared cell would match neither of the people it names.
+
+The agent path resolves too: `tool_dispatch.py:_resolver_for_spreadsheet` looks the project up from
+the spreadsheet id and passes a resolver into `summarize`, which applies it to `count_by_field`
+**only when the grouping column is one of the tab's people columns**. Otherwise chat would report
+`"Minhaj Alam & Dawood"` as a person while the dashboard beside it reported two, from the same
+sheet on the same tab. A non-people column is left exactly as it was — an ampersand in
+`"Sales & Distribution"` is not two modules, and there is a regression test for that.
+
 `project_analytics` aggregates over `people.py:collect_assignments`, so one person appearing in two
 role columns yields one workload entry carrying a per-role split and a combined total.
 `days_source` reports where the day figures came from — `"column"`, `"dates"`, `"mixed"`, or `null`
@@ -872,6 +988,28 @@ the checker's message names the fields they lack — which is what they need to 
 
 The pre-read is best-effort and wrapped, matching `tool_dispatch.py`: a failure to capture the old
 value degrades the audit diff rather than refusing the edit.
+
+### 10.3 Person alias endpoints
+
+| Method | Path | Purpose | Citation |
+|---|---|---|---|
+| GET | `/api/projects/{id}/people` | observed names + counts, merge suggestions, recorded aliases | `aliases.py:list_people` |
+| POST | `/api/projects/{id}/aliases` | record that one spelling means one person | `aliases.py:create_alias` |
+| DELETE | `/api/projects/{id}/aliases/{alias_id}` | undo a merge | `aliases.py:delete_alias` |
+
+These live in `api/aliases.py` rather than `api/admin.py`, which is already long enough that a
+fourth resource would make it hard to read in one pass. All three carry
+`dependencies=[Depends(require_admin)]`: an alias changes how *every* user's dashboard reads the
+sheet, so it is configuration, not a per-user preference. Project visibility still routes through
+`dashboard.py:_resolve_project`, so the 404-not-403 disclosure rule of §10.1 holds here too.
+
+`list_people` counts names **after splitting and before aliasing** — the admin has to see what the
+sheet actually says, including the variants they are about to merge away. `create_alias` is
+idempotent on `(project, alias, canonical)` and refuses an alias pointing at itself; `delete_alias`
+exists because some merges will be wrong and every one of them has to be reversible.
+
+None of these endpoints writes to the spreadsheet. The alias map is a read layer: the sheet keeps
+saying `Madiha` in that cell forever, and only the app's reading of it changes.
 
 ---
 
@@ -1341,6 +1479,42 @@ carrying them across lands the user on an empty grid that reads as an empty tab.
 **"What's overdue?" burned all eight iterations and answered nothing.** See §16.5 — the root cause
 is a schema-resolution bug, not a prompt or model problem, and the fix is described there.
 
+### 14.7 The person triage screen
+
+`/admin/people` (`app/admin/people/page.tsx`) is where an admin turns the sheet's spellings into
+people. It lists the observed names for a tab with occurrence counts, the merge suggestions from
+`aliases.py:suggest_merges`, and the aliases already recorded, each removable.
+
+Its whole design follows from **automatic when it reveals, confirmed when it conflates** (§7.5).
+The roles and the splits are already applied by the time this screen loads; nothing on it is
+blocking. What it exists for is the one operation the app will not perform on its own.
+
+So a suggestion offers **one button per candidate** and a first-class `Leave separate`, and where a
+name matches several people it says so — "Matches 3 people — pick one, or leave separate" — with
+every candidate rendered identically and none defaulted. Occurrence counts sit beside each name and
+each candidate, because the sheet's dominant spelling is usually the one to keep and that is a fact
+the admin should be able to read rather than guess. Presenting a best guess would be the app making
+precisely the judgement it is not entitled to make, and on the reference tracker `Abdullah` is a
+live example: three candidates, no evidence anywhere in the sheet as to which.
+
+The copy states the blast radius directly — "Merging changes how the app reads the sheet — the
+spreadsheet itself is never modified, and every merge can be undone" — because an admin about to
+merge two colleagues needs to know it is reversible and non-destructive before they click, not
+after.
+
+It sits in the sidebar as **People**, after Projects Manager and deliberately not beside User
+Permissions: those are accounts that can sign in, these are names inside a spreadsheet, and
+adjacency would imply they are the same thing.
+
+**Known lint debt, not introduced here.** The page carries one instance of
+`Calling setState synchronously within an effect`, the React Compiler rule's well-known false
+positive on fetch-on-mount. There were already six across the codebase — `admin/layout.tsx`,
+`project/[id]/page.tsx` and others — making it the second most common error class. This is the
+seventh, matching the established shape rather than being suppressed in one file only; the codebase
+carries no `eslint-disable` anywhere, and adding the first one here would be worse than the
+inconsistency. Fixing all seven is a single-pass job for whenever the data-fetching pattern is
+revisited.
+
 ---
 
 ## 15. Deployment, CI/CD & Tests
@@ -1508,14 +1682,18 @@ idempotency key checked before the mutation rather than after it; the window is 
 it hasn't been observed, and it is recorded here rather than papered over.
 
 ### 16.3 SAP-specific assumptions still remain outside the prompt and tool schemas
-**Severity: medium.** The hard blocks were removed (§7.3, §8.1) but the product goal — running
-against *any* company tracking sheet, not only a WRICEF tracker — is not fully met:
+**Severity: medium.** The hard blocks were removed (§7.3, §8.1) and *who a row is assigned to* is
+now derived from value shape rather than English role vocabulary (§7.5), which was the largest
+remaining gap. What follows is what is still not generic:
 
 - **Inline column defaults.** `read.py`/`write.py`/`worker.py` still default
-  `primary_id_column` → `"RICEFW ID"`, `status_column` → `"Dev Status"`, `assignee_column` →
-  `"Technical Resource "`, and the `overdue` report defaults `go_live` → `"Go-Live Date"` (§7.1).
-  These only apply when `schema_config` omits the key — which on a non-SAP sheet is exactly when
-  they are wrong, and they fail as "column not found" rather than as a misconfiguration.
+  `primary_id_column` → `"RICEFW ID"`, `status_column` → `"Dev Status"` and `assignee_column` →
+  `"Technical Resource "` (§7.1). These only apply when `schema_config` omits the key — which on a
+  non-SAP sheet is exactly when they are wrong, and they fail as "column not found" rather than as
+  a misconfiguration. They are now written as `x or "default"` rather than `.get(key, "default")`,
+  so a key present-but-null no longer defeats the fallback; that spelling is what broke the overdue
+  report on every project (§16.5). The deadline column no longer has an inline default at all —
+  `schema.py:get_due_column` resolves it, falling back to a header scan.
 - **`add_row` requires `module` and `type`.** Both are `required` in the tool schema and consumed
   by `worker.py:process_job`. A sheet with no category or type column cannot satisfy them. Making
   them optional means touching the write path, so it was left alone.
@@ -1529,7 +1707,11 @@ against *any* company tracking sheet, not only a WRICEF tracker — is not fully
   (§7.4): an un-migrated project resolves to the single synthesised role derived from its legacy
   `assignee_column`, so a second resource column stays invisible until someone re-detects that tab
   or adds it by hand in the role editor. The degradation is silent — the UI cannot distinguish
-  "this sheet has one resource column" from "this project was never re-detected".
+  "this sheet has one resource column" from "this project was never re-detected". This is now the
+  *only* reason a people column goes missing: detection itself no longer depends on recognising
+  English role vocabulary (§7.5), so a re-detected tab finds people columns whatever they are
+  called. Re-detection remains a deliberate admin act — `detect-metadata` returns a config and
+  never writes one.
 
 ### 16.4 Dependency advisories are outstanding
 **Severity: medium, unverified.** `npm audit` in `frontend/` reports 2 critical and 6 high, all in

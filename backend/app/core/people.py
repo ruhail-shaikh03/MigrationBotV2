@@ -19,6 +19,12 @@ from typing import Any, Dict, List, Optional, Tuple
 _WHITESPACE = re.compile(r"\s+")
 _NON_SLUG = re.compile(r"[^a-z0-9]+")
 
+# Delimiters that unambiguously separate two people. A comma is deliberately absent:
+# "Shaikh, Rohail" is plausibly one person written surname-first, and inventing a
+# colleague is a worse failure than under-splitting a shared assignment. A slash or an
+# ampersand has no such reading.
+_CELL_DELIMITERS = re.compile(r"[/&]+")
+
 # Ordered, tried in sequence. Ambiguous all-numeric dates (03/04/2026) are read
 # day-first, matching the sheets this runs against; the format list is the single place
 # to change that. Anything unparseable yields None rather than a guess — a wrong date
@@ -55,6 +61,24 @@ def display_person(raw: Any) -> str:
     if raw is None:
         return ""
     return _WHITESPACE.sub(" ", str(raw).strip())
+
+
+def split_cell(raw: Any) -> List[str]:
+    """Every person named by one people-cell, in the order the sheet names them.
+
+    Structural only: this knows delimiters and nothing else. It deliberately does not
+    strip honorifics, titles or any other word — that would be one language's vocabulary
+    compiled into the engine, on an app whose first constraint is working with any sheet.
+    "Mr. Minhaj Alam" -> "Minhaj Alam" is expressible as an alias row instead, which is
+    data an admin controls rather than code nobody can see.
+
+    On the reference tracker 60 of 257 assigned cells name two people; before this each
+    became its own workload entry, crediting a composite who does not exist.
+    """
+    text = display_person(raw)
+    if not text:
+        return []
+    return [part for part in (display_person(p) for p in _CELL_DELIMITERS.split(text)) if part]
 
 
 def slugify_role(label: str) -> str:
@@ -144,27 +168,38 @@ def resolve_effort(
 def collect_assignments(
     row: Dict[str, Any],
     people_columns: List[Dict[str, Any]],
+    resolver: Optional[Any] = None,
 ) -> List[Dict[str, str]]:
     """Every (role, person) pair named by this row.
 
-    One row can name the same person in several roles; each is returned separately so
-    callers can show a per-role split as well as a total. A cell holding several names
-    is treated as a single value on purpose: splitting on commas would turn a
-    "Shaikh, Rohail" style cell into two people who do not exist, and inventing
-    colleagues is a worse failure than under-splitting a shared assignment.
+    One cell can name several people and one person can hold several roles; each pairing
+    is returned separately so callers can show a per-role split as well as a total.
+
+    A cell used to be treated as a single value on the reasoning that splitting
+    "Shaikh, Rohail" would invent two people who do not exist. That reasoning is about
+    *commas*; it was over-applied to slashes and ampersands, and on the reference tracker
+    60 of 257 assigned cells consequently credited a composite like "Minhaj Alam & Dawood"
+    while the two real people got nothing. `split_cell` splits on / and & only.
+
+    `resolver` is a `PersonResolver` applying the project's admin-confirmed alias map. It
+    is optional and defaults to splitting alone, so attribution keeps working when the
+    database is unreachable — degrading to unmerged names rather than to an error.
     """
+    from app.core.aliases import PersonResolver  # local: aliases.py imports this module
+
+    resolver = resolver or PersonResolver()
     out: List[Dict[str, str]] = []
     for col in people_columns or []:
         header = col.get("header")
         if not header:
             continue
-        name = display_person(row.get(header))
-        if not name:
-            continue
-        out.append({
-            "role_key": col.get("key") or slugify_role(col.get("label") or header),
-            "role_label": col.get("label") or str(header).strip(),
-            "person": name,
-            "person_key": normalise_person(name),
-        })
+        for name in resolver.resolve_cell(row.get(header)):
+            out.append({
+                "role_key": col.get("key") or slugify_role(col.get("label") or header),
+                "role_label": col.get("label") or str(header).strip(),
+                "person": name,
+                # Keyed off the *resolved* name, or an alias would show a merged label
+                # over totals that were never actually merged.
+                "person_key": normalise_person(name),
+            })
     return out

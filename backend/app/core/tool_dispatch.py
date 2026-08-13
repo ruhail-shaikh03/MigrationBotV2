@@ -5,6 +5,34 @@ from app.core.errors import error_result, INVALID_REQUEST, USER_MESSAGE
 
 logger = logging.getLogger("tool_dispatch")
 
+
+async def _resolver_for_spreadsheet(db_session: Any, spreadsheet_id: str):
+    """The alias map for whichever project owns this spreadsheet.
+
+    The agent path carries a spreadsheet id rather than a project id, so the project is
+    looked up on the way. Best-effort: an unreachable database degrades to unmerged names
+    rather than failing the read, matching `dashboard.py:_resolver_for`.
+    """
+    from app.core.aliases import PersonResolver
+
+    try:
+        from sqlalchemy import select
+        from app.models.person_alias import PersonAlias
+        from app.models.project import Project
+
+        project = (await db_session.execute(
+            select(Project).where(Project.spreadsheet_id == spreadsheet_id)
+        )).scalar()
+        if not project:
+            return PersonResolver()
+        rows = (await db_session.execute(
+            select(PersonAlias).where(PersonAlias.project_id == project.id)
+        )).scalars().all()
+        return PersonResolver.from_rows(rows)
+    except Exception as e:
+        logger.warning(f"Alias map unavailable for {spreadsheet_id}: {e}")
+        return PersonResolver()
+
 async def dispatch_tool(
     tool_name: str,
     args: dict,
@@ -48,7 +76,14 @@ async def dispatch_tool(
                 )
             elif tool_name == "summarize":
                 from app.sheets.read import summarize
-                return await summarize(spreadsheet_id, active_tab, args, schema_config, column_map, service)
+                # count_by_field on a people column must split shared cells and apply the
+                # alias map, or chat reports "Minhaj Alam & Dawood" as a person while the
+                # dashboard beside it reports two, from the same sheet and the same tab.
+                resolver = await _resolver_for_spreadsheet(db_session, spreadsheet_id)
+                return await summarize(
+                    spreadsheet_id, active_tab, args, schema_config, column_map, service,
+                    resolver=resolver,
+                )
             elif tool_name == "switch_module":
                 from app.sheets.meta import switch_module
                 return await switch_module(spreadsheet_id, args.get("tab_name"), db_session, user_email, session_id, service)

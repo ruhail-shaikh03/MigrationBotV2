@@ -21,6 +21,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
+from app.core.aliases import PersonResolver
 from app.core.overdue import is_finished_status
 from app.core.people import collect_assignments, normalise_person, parse_date, resolve_effort
 from app.core.permissions import get_user_permissions
@@ -30,6 +31,7 @@ from app.core.schema import (
 from app.db.engine import get_db
 from app.deps import get_current_user, get_google_auth
 from app.models.permission import Permission
+from app.models.person_alias import PersonAlias
 from app.models.project import Project
 from app.models.session import Session as UserSession
 from app.models.user import User
@@ -134,6 +136,21 @@ def _column_descriptors(
     return descriptors
 
 
+async def _resolver_for(db: AsyncSession, project_id: int) -> PersonResolver:
+    """The project's alias map, built once per request.
+
+    Failure degrades to unmerged names rather than to an error, matching how the row
+    cache treats an unreachable Redis: a dashboard showing one person twice is worth far
+    more than a dashboard showing an exception.
+    """
+    try:
+        result = await db.execute(select(PersonAlias).where(PersonAlias.project_id == project_id))
+        return PersonResolver.from_rows(result.scalars().all())
+    except Exception as e:
+        logger.warning(f"Alias map unavailable for project {project_id}: {e}")
+        return PersonResolver()
+
+
 def _matches(row: Dict[str, str], header: Optional[str], needle: str) -> bool:
     if not header or not needle:
         return True
@@ -183,6 +200,10 @@ async def list_rows(
     # one role so "overdue work Sara owns as functional consultant" is answerable.
     scoped_people = [p for p in people if p["key"] == role_key] if role_key else people
     person_norm = normalise_person(person) if person else ""
+    # The filter dropdown is populated from the analytics workload, which is aliased and
+    # split. Matching raw cells here would mean selecting a merged person returns nothing,
+    # and a shared cell never matches either of the people it names.
+    resolver = await _resolver_for(db, project_id) if person_norm else PersonResolver()
 
     filtered = []
     for row in rows:
@@ -191,7 +212,11 @@ async def list_rows(
         if status and not _matches(row, status_header, status):
             continue
         if person_norm:
-            names = {normalise_person(row.get(p["header"], "")) for p in scoped_people}
+            names = {
+                normalise_person(n)
+                for p in scoped_people
+                for n in resolver.resolve_cell(row.get(p["header"]))
+            }
             if person_norm not in names:
                 continue
         if overdue:
@@ -371,6 +396,7 @@ async def project_analytics(
 
     people = get_people_columns(tab_schema)
     effort = get_effort_columns(tab_schema)
+    resolver = await _resolver_for(db, project_id)
     status_header = tab_schema.get("status_column")
     date_columns = tab_schema.get("date_columns") or {}
     due_header = get_due_column(tab_schema, headers)
@@ -393,7 +419,7 @@ async def project_analytics(
         due = parse_date(row.get(due_header)) if due_header else None
         is_overdue = bool(due) and _is_overdue(due, row, status_header)
 
-        for assignment in collect_assignments(row, people):
+        for assignment in collect_assignments(row, people, resolver):
             entry = workload.setdefault(assignment["person_key"], {
                 "person": assignment["person"],
                 "total_items": 0,
