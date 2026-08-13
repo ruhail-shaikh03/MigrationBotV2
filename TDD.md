@@ -574,10 +574,10 @@ admin UI's raw-JSON textarea.
 - `normalise_person` — trim, collapse whitespace, case-fold, then **exact** comparison. No fuzzy
   matching: merging two colleagues into one workload row is silent corruption, while showing one
   person twice is visible and correctable. An admin alias map is the deliberate follow-up.
+- `split_cell` — every person one cell names, splitting on `/` and `&` **only**. See §7.5.
 - `collect_assignments` — every `(role, person)` pair a row names; the same person in two roles
-  yields two assignments, so callers can show a per-role split and a total. A cell holding several
-  names is treated as one value on purpose — splitting on commas turns `"Shaikh, Rohail"` into two
-  people who do not exist, and inventing colleagues is worse than under-splitting.
+  yields two assignments, so callers can show a per-role split and a total. It takes an optional
+  `PersonResolver` (§7.5) and emits one assignment per *resolved* person per role.
 - `resolve_effort` — returns `(value, source)` with source `"column" | "dates" | None`: an explicit
   effort column first, else a start→due/go-live span, else nothing. It never synthesises a number.
   `parse_effort` returns `None` rather than coercing junk to `0`, because a zero-day workload is a
@@ -592,6 +592,100 @@ Detection is an LLM call over ten rows and will misfire, so `components/RoleColu
 (embedded in the `/admin/projects` detect wizard) lets an admin add, remove, relabel and set units
 on these columns against the tab's real header list. Headers are chosen, never typed, so the
 verbatim string cannot be corrupted by hand.
+
+### 7.5 Who a row is actually assigned to
+
+§7.4 made the *set* of people-columns generic. Measuring the result against two live trackers
+showed the app was still wrong about the people themselves, in three compounding ways.
+
+**Detection reasoned about header wording.** The HEDP tracker names people in two columns —
+`Consultant` (401 non-blank values, 33 distinct) and `Developer Name` (257, 37). Only the second
+was found: "Consultant" reads like a job title in English, so the model passed on it and 401
+assigned rows were invisible to every assignment view. Header wording is the least generic signal
+a sheet offers — the next one says `Owner`, `Assigned To`, `PIC`, or a header in another language,
+and the failure repeats one sheet at a time.
+
+`core/column_profile.py` replaces that with value shape, which is the same on every sheet in every
+domain. It never sees a column name: `profile_column(values)` returns `n`, `cardinality`,
+`mean_tokens`, `mean_length`, `alpha_ratio`, `title_case_ratio` and `repeat_ratio`, and
+`people_confidence` reduces those to `"likely" | "abstain" | "unlikely"`. Thresholds were fitted
+against every populated column of both trackers:
+
+```
+likely    Consultant          card=0.077 tok=2.10 len=12.0 title=0.83   <- detection missed this
+likely    Developer Name      card=0.132 tok=2.94 len=18.6 title=0.96
+unlikely  University          card=0.071 tok=1.12 len=4.8  title=0.03   short uppercase codes
+unlikely  Development Tyoe    card=0.063 tok=1.00 len=5.2  title=0.52   single-token labels
+unlikely  Development         card=0.788 tok=3.79 len=27.4 title=0.80   free text
+unlikely  WRICEF No.          card=0.965 tok=1.00 len=9.0  title=0.00   unique ids
+abstain   Status              card=0.015 tok=1.58 len=10.0 title=0.92   fails cardinality by 0.005
+```
+
+An earlier threshold set used cardinality and token count alone and classified the site-code column
+as people; `mean_length` and `title_case_ratio` are what separate a person from a category code.
+Note how close `University` sits to `Consultant` on cardinality and repetition — the two are nearly
+identical on those axes, which is why the fixtures in `test_column_profile.py` are pinned to the
+same cardinality band. A fixture rejected for having too few distinct values would prove nothing.
+
+**`abstain` is not a vote.** It covers `n < MIN_SAMPLE` (20) and a column missing by exactly one
+criterion. `Status` clears every test but the cardinality floor, by 0.005, and this is *not*
+tunable: a team of eight and a workflow of eight states are statistically identical, and only
+meaning separates them. That is why the LLM stays in the loop rather than being replaced — the two
+signals fail differently, so a column becomes a role if **either** positively claims it. Requiring
+agreement would have left `Consultant` undetected, since the LLM is the signal that missed it. A
+false positive is a visible, removable role and can never reach the spreadsheet.
+
+`title_case_ratio` and token counting are Latin-script assumptions. The profile fields are computed
+and thresholded independently so a CJK or Arabic sheet can lean on cardinality, length and
+repetition; the re-weighting is deliberately left until a sheet needs it.
+
+**A quarter of assignments were credited to people who do not exist.** 60 of 257 `Developer Name`
+cells name two people — `Minhaj Alam & Dawood`, `Ahmed Qamar/Asif`. Each became its own workload
+entry. `people.py:split_cell` splits on `/` and `&` and **never on a comma**: `"Shaikh, Rohail"` is
+plausibly one person written surname-first, and inventing a colleague is worse than under-splitting
+a shared assignment. That distinction is exactly what the original single-value rule got wrong — it
+was reasoning about commas and was over-applied to every delimiter.
+
+The splitter is **structural, not lexical**. An earlier draft stripped honorifics (`Mr.`, `Dr.`),
+which compiles one language's vocabulary into an engine whose first constraint is working with any
+sheet. `"Mr. Minhaj Alam"` → `"Minhaj Alam"` is an alias row instead — data an admin controls
+rather than code nobody can see. The general rule: **vocabulary lives in data, never in code.**
+
+**Spellings still did not collapse.** After splitting, 13 groups remain where one person appears
+under several names (`Madiha`/`Madiha Shah Bukhari`, `Babar`/`BABAR`/`Babar Ali`). The
+`person_aliases` table (`models/person_alias.py`) records one row per `(project_id, alias,
+canonical)` pair, so an alias may name several people — which expresses a comma-separated shared
+cell without teaching the splitter about commas. Per-project, because two organisations share no
+staff. No migration is needed: `init_db` calls `create_all`, which brings up new tables on deploy
+but **never alters an existing one** — which is why this is a new table rather than a column.
+
+`core/aliases.py:PersonResolver.resolve_cell` runs the pipeline in one place, so the dashboard and
+the agent cannot diverge:
+
+```
+whole-cell alias lookup   →  split_cell  →  per-fragment lookup  →  dedupe within the row
+```
+
+The whole-cell lookup coming **first** is what makes automatic splitting safe: a team named `R&D`,
+or a real name containing a slash, is corrected by one alias row. Every automatic decision has a
+manual answer. Resolution is exactly **one hop** — a canonical name is never looked up again — so a
+cycle is impossible by construction rather than by validation.
+
+The governing principle across all three: **automatic when it reveals, confirmed when it
+conflates.** Detecting a column and splitting a shared cell both reveal data that was hidden, and
+apply automatically. Merging two names hides one inside the other and the error is silent — nobody
+notices a colleague who stopped existing — so it always requires a human. `Abdullah` on the live
+sheet plausibly matches `Abdullah Ali`, `Abdullah Azfar` and `Abdullah Azfer`, and nothing in the
+sheet can say which; any rule confident enough to resolve that is confident enough to be wrong.
+
+`aliases.py:suggest_merges` therefore only ever suggests, from three signals: token-subset, prefix,
+and one token within edit distance 2 (the last catches `Azfar`/`Azfer`, which subset matching
+misses entirely — those tokens are not nested, they are misspelled). Direction is decided
+**per-signal**: subset and prefix are inherently directional and list every containing name however
+rare, while the symmetric typo signal breaks ties on frequency because without that it emits both
+directions, and an admin accepting both would create a two-row cycle. Deciding direction globally
+by frequency — an earlier implementation — dropped `Abdullah Azfer` from `Abdullah`'s candidates
+purely because it occurs twice rather than three times, hiding a person the admin might have meant.
 
 `build_column_map` (`column_mapper.py:build_column_map`), a two-pass LLM alias generator, is now
 called from `schema_detect.py:detect_all_tabs` for every tracker tab it detects — it generates an
