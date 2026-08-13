@@ -695,6 +695,24 @@ directions, and an admin accepting both would create a two-row cycle. Deciding d
 by frequency — an earlier implementation — dropped `Abdullah Azfer` from `Abdullah`'s candidates
 purely because it occurs twice rather than three times, hiding a person the admin might have meant.
 
+Containment alone then proved insufficient in the other direction, which only showed up once the
+screen was pointed at the live tracker: **three of nine suggestions merged the common spelling into
+a rare one.** `Minhaj Alam` (6 rows) offered exactly one option — merge into `Mr. Minhaj Alam`
+(1 row) — because `{minhaj, alam} ⊂ {mr., minhaj, alam}`. The containment is real; the
+canonicalisation is backwards.
+
+Neither signal fixes this alone. An honorific adds a token without adding identity while `Azfer`
+adds both, and nothing in a spreadsheet distinguishes them — the very reason honorifics live in the
+alias map rather than in the splitter. So `suggest_merges` emits a `superset` suggestion as well
+whenever the containing name is the *rarer* one, and both directions are offered. That keeps the
+module's rule intact — suggest, never decide — and the counts rendered beside every candidate are
+what the admin actually judges by.
+
+Ordering carries the rest of the weight: suggestions whose candidate is commoner than the name rank
+first, the inverses sink to the bottom. Sorting by frequency alone placed `Minhaj Alam (6)` above
+its own reverse, so the first thing on screen was the option not to take. On the live tracker the
+list is now nine sensible merges followed by two inverses.
+
 `build_column_map` (`column_mapper.py:build_column_map`), a two-pass LLM alias generator, is now
 called from `schema_detect.py:detect_all_tabs` for every tracker tab it detects — it generates an
 alias map from that tab's own real headers and attaches it as `column_map` in the tab's schema,
@@ -1004,7 +1022,13 @@ sheet, so it is configuration, not a per-user preference. Project visibility sti
 `dashboard.py:_resolve_project`, so the 404-not-403 disclosure rule of §10.1 holds here too.
 
 `list_people` counts names **after splitting and before aliasing** — the admin has to see what the
-sheet actually says, including the variants they are about to merge away. `create_alias` is
+sheet actually says, including the variants they are about to merge away — but by *normalised* key,
+labelled with whichever spelling dominates (`aliases.py:_count_observed_names`). Counting raw
+display strings, as the first implementation did, showed `Ahmed Qamar` (16) and `ahmed qamar` (1)
+as two separate people on the screen while the workload panel beside it correctly reported one
+person with 18, and offered the lower-case spelling as a merge candidate for a name that already
+resolved to the same person. Case is folded by `normalise_person` everywhere else; this was the one
+place it was not. `create_alias` is
 idempotent on `(project, alias, canonical)` and refuses an alias pointing at itself; `delete_alias`
 exists because some merges will be wrong and every one of them has to be reversible.
 

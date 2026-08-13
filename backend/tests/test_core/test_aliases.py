@@ -217,6 +217,76 @@ def test_suggestions_are_ordered_by_how_often_the_variant_occurs():
     assert [s.name for s in out] == ["Madiha", "Umair"]
 
 
+# --- direction, as found on the live tracker --------------------------------
+#
+# Subset is directional, so the shorter name always merged into the longer one whatever
+# the counts said. Right for Haider(2) -> Syed Ali Haider(52); wrong for
+# Minhaj Alam(6) -> Mr. Minhaj Alam(1), where the only option offered was to canonicalise
+# six rows onto a one-off honorific. Three of nine live suggestions pointed that way.
+
+def test_the_reverse_merge_is_offered_when_the_longer_name_is_rarer():
+    """The honorific case. Both directions are offered; neither is hidden."""
+    out = _by_name(suggest_merges({"Minhaj Alam": 6, "Mr. Minhaj Alam": 1}))
+    assert out["Mr. Minhaj Alam"].candidates == ["Minhaj Alam"]
+    assert out["Mr. Minhaj Alam"].reason == "superset"
+    # The containment direction survives too — nothing is suppressed.
+    assert out["Minhaj Alam"].candidates == ["Mr. Minhaj Alam"]
+
+
+def test_the_plausible_direction_is_listed_first():
+    """Both directions exist, but the admin should meet the sensible one first. Ordering
+    by frequency alone put the 6-row name above its own reverse, so the first thing on
+    screen was the option not to take."""
+    out = suggest_merges({"Minhaj Alam": 6, "Mr. Minhaj Alam": 1})
+    assert out[0].name == "Mr. Minhaj Alam"      # merge the 1 into the 6
+    assert out[-1].name == "Minhaj Alam"          # the inverse, kept but demoted
+
+
+def test_no_reverse_merge_when_the_longer_name_is_commoner():
+    """Haider(2) -> Syed Ali Haider(52) needs no second option; adding one is noise."""
+    out = _by_name(suggest_merges({"Haider": 2, "Syed Ali Haider": 52}))
+    assert out["Haider"].candidates == ["Syed Ali Haider"]
+    assert "Syed Ali Haider" not in out
+
+
+@pytest.mark.parametrize("counts,alias,canonical", [
+    ({"Minhaj Alam": 6, "Mr. Minhaj Alam": 1}, "Mr. Minhaj Alam", "Minhaj Alam"),
+    ({"Asif": 3, "Muhammad Asif": 1}, "Muhammad Asif", "Asif"),
+])
+def test_every_backwards_case_from_the_live_tracker_now_offers_the_right_direction(
+    counts, alias, canonical
+):
+    assert canonical in _by_name(suggest_merges(counts))[alias].candidates
+
+
+def test_observed_names_fold_case_the_way_the_workload_does():
+    """api/aliases.py:list_people used to count raw display strings, so the screen showed
+    "Ahmed Qamar" (16) and "ahmed qamar" (1) as two names while the workload panel beside
+    it correctly reported one person with 18. It also emitted the redundant "ahmed qamar"
+    as a merge candidate for a name that already resolved to the same person."""
+    from app.api.aliases import _count_observed_names
+
+    rows = [
+        {"Dev": "Ahmed Qamar"}, {"Dev": "Ahmed Qamar"}, {"Dev": "ahmed qamar"},
+        {"Dev": "AHMED QAMAR"}, {"Dev": "Babar Ali"},
+    ]
+    counts = _count_observed_names(rows, [{"header": "Dev"}])
+
+    # One entry, totalling every spelling, labelled with the dominant one.
+    assert counts == {"Ahmed Qamar": 4, "Babar Ali": 1}
+    # And therefore no self-referential suggestion.
+    assert suggest_merges(counts) == []
+
+
+def test_observed_names_still_split_shared_cells():
+    from app.api.aliases import _count_observed_names
+
+    counts = _count_observed_names(
+        [{"Dev": "Minhaj Alam & Dawood"}, {"Dev": "Dawood"}], [{"header": "Dev"}]
+    )
+    assert counts == {"Minhaj Alam": 1, "Dawood": 2}
+
+
 def test_observed_name_counts_feed_the_suggestion_engine():
     """The shape api/aliases.py:list_people builds before calling suggest_merges: raw
     names counted after splitting, before aliasing."""
