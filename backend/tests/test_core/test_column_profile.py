@@ -89,3 +89,54 @@ def test_empty_column_abstains():
 def test_profile_fields_are_computed_independently(field):
     """Signals stay separable so a non-Latin sheet can lean on the script-agnostic ones."""
     assert isinstance(getattr(profile_column(_rep(PEOPLE, 100)), field), float)
+
+
+# --- detection ---------------------------------------------------------------
+
+from app.core.schema_detect import _structural_fallback  # noqa: E402
+
+
+def _sheet(header, values):
+    return [[header]] + [[v] for v in values]
+
+
+def test_fallback_detects_a_people_column_a_keyword_list_would_miss():
+    """The motivating bug: a header whose wording reads like a job title rather than an
+    owner field. Value shape does not care what the column is called."""
+    rows = _sheet("Focal Point", _rep(PEOPLE, 100))
+    people = [c["header"] for c in _structural_fallback(rows)["people_columns"]]
+    assert people == ["Focal Point"]
+
+
+def test_fallback_does_not_promote_short_code_columns():
+    rows = _sheet("Site", _rep(UPPER_CODES, 100))
+    assert _structural_fallback(rows)["people_columns"] == []
+
+
+def test_fallback_keeps_keyword_matches_the_profiler_abstains_on():
+    """Union, not intersection: a sparsely-filled "Owner" column abstains statistically
+    but is still obviously a role by its name."""
+    rows = _sheet("Owner", PEOPLE[:4])
+    people = [c["header"] for c in _structural_fallback(rows)["people_columns"]]
+    assert people == ["Owner"]
+
+
+def test_fallback_preserves_the_verbatim_header():
+    rows = _sheet("Focal Point ", _rep(PEOPLE, 100))
+    assert _structural_fallback(rows)["people_columns"][0]["header"] == "Focal Point "
+
+
+def test_a_column_is_never_listed_twice():
+    """A header matching a keyword AND profiling as people must yield one entry."""
+    rows = _sheet("Resource Owner", _rep(PEOPLE, 100))
+    assert len(_structural_fallback(rows)["people_columns"]) == 1
+
+
+def test_profiling_ignores_a_title_row_above_the_header():
+    """Trackers put a title or spacer above the real header row. Profiling one row off
+    would fold the header text into the value sample."""
+    rows = [["Q3 Tracker", ""], ["ID", "Focal Point"]] + [
+        [f"T-{i}", PEOPLE[i % len(PEOPLE)]] for i in range(100)
+    ]
+    people = [c["header"] for c in _structural_fallback(rows)["people_columns"]]
+    assert people == ["Focal Point"]

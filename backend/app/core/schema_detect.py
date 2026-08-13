@@ -4,6 +4,7 @@ import re
 from typing import List, Dict, Any, Optional
 from openai import AsyncOpenAI
 from app.core.column_mapper import build_column_map
+from app.core.column_profile import ColumnProfile, people_confidence, profile_column
 from app.core.people import slugify_role
 
 logger = logging.getLogger("schema_detect")
@@ -122,6 +123,14 @@ Your goals:
      Do NOT invent a role the sheet does not have, and do NOT rename a role to a
      conventional term — if the header says "Functinal Resource", the label is
      "Functinal Resource", not "Functional Consultant".
+     Judge from the VALUES, not the header wording. A column whose values are personal
+     names is a people column whatever it is called — "Consultant", "Focal Point",
+     "PIC" — and a column named like a role but holding categories, codes or team names
+     is not. Header wording differs by team and by language; the values do not. The
+     "Column value statistics" block at the end of this prompt gives, per column, the
+     ratio of distinct values, the mean token count and length, and how often values are
+     title-cased: personal names are typically 2-3 tokens, 8-30 characters and
+     consistently title-cased, while category codes are single-token and short.
    - "assignee_column": The header of the FIRST entry in people_columns, or null if there are
      none. Retained for backward compatibility with existing tools.
    - "description_column": Header for details/description (e.g., Description, Task Name, Summary, Details). Set to null if missing.
@@ -175,6 +184,9 @@ and must not be copied:
   "critical_fields": ["Ticket Ref", "Workstream", "Category", "Summary", "Current State"]
 }}
 
+Column value statistics (computed from this tab's own rows, not guessed):
+{profile_json}
+
 Return ONLY a valid JSON object with those keys."""
 
 
@@ -194,6 +206,23 @@ async def detect_schema_config(
     raw_rows_json = json.dumps(raw_rows, ensure_ascii=False)
     tab_names_json = json.dumps(tab_names, ensure_ascii=False)
 
+    # The same evidence the structural fallback uses, so the model reasons from value
+    # shape rather than from header vocabulary — which is what made it skip a
+    # "Consultant" column naming 33 people. Rounded because the exact figures do not
+    # matter to the judgement and long floats waste tokens.
+    profile_json = json.dumps(
+        {
+            header: {
+                "distinct_ratio": round(p.cardinality, 3),
+                "mean_tokens": round(p.mean_tokens, 2),
+                "mean_length": round(p.mean_length, 1),
+                "title_case": round(p.title_case_ratio, 2),
+            }
+            for header, p in _profile_columns(raw_rows).items()
+        },
+        ensure_ascii=False,
+    )
+
     try:
         response = await client.chat.completions.create(
             model="deepseek-chat",
@@ -202,7 +231,8 @@ async def detect_schema_config(
                 "content": SCHEMA_DETECTION_PROMPT.format(
                     tab_name=tab_name,
                     raw_rows_json=raw_rows_json,
-                    tab_names_json=tab_names_json
+                    tab_names_json=tab_names_json,
+                    profile_json=profile_json
                 )
             }],
             max_tokens=2048,
@@ -323,6 +353,42 @@ def _match_all_headers(headers: List[str], keywords: List[str]) -> List[str]:
     return [h for h in headers if any(kw in h.lower() for kw in keywords)]
 
 
+def _header_row_index(raw_rows: List[List[Any]]) -> int:
+    """Earliest row with the most non-empty cells.
+
+    Trackers routinely put a title or a blank spacer above the real header row, which is
+    why this is not simply row 0. Extracted so that _profile_columns and
+    _structural_fallback cannot pick different header rows for the same sheet — profiling
+    one row off would fold the header text into the value sample.
+    """
+    header_idx = 0
+    best_filled = -1
+    for idx, row in enumerate((raw_rows or [])[:10]):
+        filled = sum(1 for cell in row if str(cell).strip())
+        if filled > best_filled:
+            best_filled = filled
+            header_idx = idx
+    return header_idx
+
+
+def _profile_columns(
+    raw_rows: List[List[Any]], header_idx: Optional[int] = None
+) -> Dict[str, ColumnProfile]:
+    """Value-shape statistics per verbatim header, over the rows below the header row."""
+    rows = raw_rows or []
+    if header_idx is None:
+        header_idx = _header_row_index(rows)
+    header_row = rows[header_idx] if header_idx < len(rows) else []
+    data_rows = rows[header_idx + 1:]
+    profiles: Dict[str, ColumnProfile] = {}
+    for col_idx, header in enumerate(str(h) for h in header_row):
+        if not header.strip():
+            continue
+        values = [row[col_idx] for row in data_rows if col_idx < len(row)]
+        profiles[header] = profile_column(values)
+    return profiles
+
+
 def _structural_fallback(raw_rows: List[List[Any]]) -> Dict[str, Any]:
     """Best-effort schema from the sheet's actual headers, used when LLM detection fails.
 
@@ -337,15 +403,7 @@ def _structural_fallback(raw_rows: List[List[Any]]) -> Dict[str, Any]:
     constraint the model will enforce, and no vocabulary at all is the honest default.
     """
     rows = raw_rows or []
-    # Header row = the earliest row with the most non-empty cells. Trackers routinely put
-    # a title or blank spacer above the real header, which is why this isn't just row 0.
-    header_idx = 0
-    best_filled = -1
-    for idx, row in enumerate(rows[:10]):
-        filled = sum(1 for cell in row if str(cell).strip())
-        if filled > best_filled:
-            best_filled = filled
-            header_idx = idx
+    header_idx = _header_row_index(rows)
 
     raw_headers = [str(c) for c in rows[header_idx]] if header_idx < len(rows) else []
     headers = [h.strip() for h in raw_headers]
@@ -365,6 +423,19 @@ def _structural_fallback(raw_rows: List[List[Any]]) -> Dict[str, Any]:
         non_empty,
         ["assign", "owner", "resource", "responsible", "developer", "engineer", "consultant", "lead", "analyst"],
     )
+    # Two signals, unioned, because they fail differently. The keyword list reads header
+    # wording and is blind to any vocabulary it was not given — it is what missed a
+    # "Consultant" column naming 33 people. The profiler reads value shape and is blind
+    # to meaning — it cannot separate a small team from a short status enum. Requiring
+    # both to agree would have left the motivating case undetected, so either suffices;
+    # a false positive is a visible, removable role and can never reach the spreadsheet.
+    profiles = _profile_columns(rows, header_idx)
+    profiled_headers = [
+        h for h in non_empty
+        if people_confidence(profiles.get(verbatim.get(h, h)) or profile_column([])) == "likely"
+    ]
+    people_headers = list(dict.fromkeys(people_headers + profiled_headers))
+
     people_columns = [
         {"key": slugify_role(h), "label": h, "header": verbatim.get(h, h)}
         for h in people_headers

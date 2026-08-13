@@ -586,7 +586,15 @@ admin UI's raw-JSON textarea.
 The structural fallback matches **all** people/effort headers via
 `schema_detect.py:_match_all_headers` and preserves each header verbatim through a stripped→raw
 map, since that path previously stripped every header and would have destroyed the trailing space
-it needs to address the column.
+it needs to address the column. It additionally unions in every column the profiler rates `likely`
+(§7.5), so it no longer depends solely on a keyword list it was handed.
+
+Both detection paths consume the profiler. `_structural_fallback` calls `people_confidence`
+directly, and `detect_schema_config` serialises the per-column statistics into the prompt under
+"Column value statistics", so the model reasons from evidence rather than from header vocabulary.
+`_header_row_index` is shared between the profiler and the fallback: profiling one row off would
+fold the header text into the value sample, and a tracker with a title row above its headers is
+routine.
 
 Detection is an LLM call over ten rows and will misfire, so `components/RoleColumnsEditor.tsx`
 (embedded in the `/admin/projects` detect wizard) lets an admin add, remove, relabel and set units
