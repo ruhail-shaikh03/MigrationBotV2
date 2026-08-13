@@ -215,3 +215,28 @@ def test_the_more_common_spelling_is_the_candidate_not_the_name():
 def test_suggestions_are_ordered_by_how_often_the_variant_occurs():
     out = suggest_merges({"Madiha": 9, "Madiha Shah Bukhari": 30, "Umair": 2, "Umair Ziad": 15})
     assert [s.name for s in out] == ["Madiha", "Umair"]
+
+
+def test_observed_name_counts_feed_the_suggestion_engine():
+    """The shape api/aliases.py:list_people builds before calling suggest_merges: raw
+    names counted after splitting, before aliasing."""
+    rows = [
+        {"Developer Name": "Minhaj Alam & Dawood"},
+        {"Developer Name": "Muhammad Dawood Umer"},
+        {"Developer Name": "Muhammad Dawood Umer"},
+        {"Developer Name": "Muhammad Dawood Umer"},
+        {"Developer Name": "Mr. Minhaj Alam/ Dawood"},
+    ]
+    counts: dict = {}
+    for row in rows:
+        for name in split_cell(row["Developer Name"]):
+            counts[name] = counts.get(name, 0) + 1
+
+    assert counts["Dawood"] == 2
+    assert counts["Muhammad Dawood Umer"] == 3
+    # "Dawood" is a token-subset of "Muhammad Dawood Umer", which is directional
+    # regardless of frequency, so the fuller name is offered as the candidate.
+    suggestions = {s.name: s.candidates for s in suggest_merges(counts)}
+    assert "Muhammad Dawood Umer" in suggestions["Dawood"]
+    # The honorific is left to the alias map, so it shows up as its own observed name.
+    assert counts["Mr. Minhaj Alam"] == 1

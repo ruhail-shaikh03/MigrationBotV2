@@ -967,6 +967,28 @@ the checker's message names the fields they lack — which is what they need to 
 The pre-read is best-effort and wrapped, matching `tool_dispatch.py`: a failure to capture the old
 value degrades the audit diff rather than refusing the edit.
 
+### 10.3 Person alias endpoints
+
+| Method | Path | Purpose | Citation |
+|---|---|---|---|
+| GET | `/api/projects/{id}/people` | observed names + counts, merge suggestions, recorded aliases | `aliases.py:list_people` |
+| POST | `/api/projects/{id}/aliases` | record that one spelling means one person | `aliases.py:create_alias` |
+| DELETE | `/api/projects/{id}/aliases/{alias_id}` | undo a merge | `aliases.py:delete_alias` |
+
+These live in `api/aliases.py` rather than `api/admin.py`, which is already long enough that a
+fourth resource would make it hard to read in one pass. All three carry
+`dependencies=[Depends(require_admin)]`: an alias changes how *every* user's dashboard reads the
+sheet, so it is configuration, not a per-user preference. Project visibility still routes through
+`dashboard.py:_resolve_project`, so the 404-not-403 disclosure rule of §10.1 holds here too.
+
+`list_people` counts names **after splitting and before aliasing** — the admin has to see what the
+sheet actually says, including the variants they are about to merge away. `create_alias` is
+idempotent on `(project, alias, canonical)` and refuses an alias pointing at itself; `delete_alias`
+exists because some merges will be wrong and every one of them has to be reversible.
+
+None of these endpoints writes to the spreadsheet. The alias map is a read layer: the sheet keeps
+saying `Madiha` in that cell forever, and only the app's reading of it changes.
+
 ---
 
 ## 11. Google Sheets Integration
