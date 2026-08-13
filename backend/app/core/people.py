@@ -19,6 +19,12 @@ from typing import Any, Dict, List, Optional, Tuple
 _WHITESPACE = re.compile(r"\s+")
 _NON_SLUG = re.compile(r"[^a-z0-9]+")
 
+# Delimiters that unambiguously separate two people. A comma is deliberately absent:
+# "Shaikh, Rohail" is plausibly one person written surname-first, and inventing a
+# colleague is a worse failure than under-splitting a shared assignment. A slash or an
+# ampersand has no such reading.
+_CELL_DELIMITERS = re.compile(r"[/&]+")
+
 # Ordered, tried in sequence. Ambiguous all-numeric dates (03/04/2026) are read
 # day-first, matching the sheets this runs against; the format list is the single place
 # to change that. Anything unparseable yields None rather than a guess — a wrong date
@@ -55,6 +61,24 @@ def display_person(raw: Any) -> str:
     if raw is None:
         return ""
     return _WHITESPACE.sub(" ", str(raw).strip())
+
+
+def split_cell(raw: Any) -> List[str]:
+    """Every person named by one people-cell, in the order the sheet names them.
+
+    Structural only: this knows delimiters and nothing else. It deliberately does not
+    strip honorifics, titles or any other word — that would be one language's vocabulary
+    compiled into the engine, on an app whose first constraint is working with any sheet.
+    "Mr. Minhaj Alam" -> "Minhaj Alam" is expressible as an alias row instead, which is
+    data an admin controls rather than code nobody can see.
+
+    On the reference tracker 60 of 257 assigned cells name two people; before this each
+    became its own workload entry, crediting a composite who does not exist.
+    """
+    text = display_person(raw)
+    if not text:
+        return []
+    return [part for part in (display_person(p) for p in _CELL_DELIMITERS.split(text)) if part]
 
 
 def slugify_role(label: str) -> str:
