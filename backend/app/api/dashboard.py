@@ -21,6 +21,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
+from app.core.overdue import is_finished_status
 from app.core.people import collect_assignments, normalise_person, parse_date, resolve_effort
 from app.core.permissions import get_user_permissions
 from app.core.schema import (
@@ -232,20 +233,14 @@ async def list_rows(
 def _is_overdue(due: date, row: Dict[str, str], status_header: Optional[str]) -> bool:
     """Past its due date and not in a status that reads as finished.
 
-    "Finished" is matched against generic words rather than a configured allowlist,
-    because no sheet declares which of its statuses mean done. That makes this a
-    heuristic, and it is applied only to the `overdue` filter — never to a write.
-
-    The word list is kept narrow on purpose. Hiding a genuinely overdue item is the worse
-    error here — nobody chases what they cannot see — while an extra row in the list is
-    self-correcting. So "live" is deliberately absent: it would clear "Go-Live Pending".
+    The "reads as finished" half lives in `core/overdue.py` and is shared with the
+    agent's `summarize(overdue)`, which used to apply a different rule — see that
+    module for what the divergence cost.
     """
     if due >= date.today():
         return False
-    if status_header:
-        value = str(row.get(status_header, "")).lower().strip()
-        if any(word in value for word in ("done", "complete", "closed", "cancel", "deployed")):
-            return False
+    if status_header and is_finished_status(row.get(status_header)):
+        return False
     return True
 
 

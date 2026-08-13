@@ -5,6 +5,7 @@ from app.sheets.retry import _with_retry
 from app.sheets.meta import get_header_row, get_id_row_map
 from app.core.column_mapper import resolve_column
 from app.core.data_quality import DataQualityChecker
+from app.core.overdue import is_finished_status
 from app.core.people import parse_date
 from app.core.schema import get_due_column, get_people_columns, get_tab_schema
 from app.models.audit_log import AuditLog
@@ -458,15 +459,16 @@ async def summarize(
         overdue = []
         unparsed_dates = 0
 
-        # tool_schemas.py documents the default exclusion set as
-        # ['Complete', 'Done', 'Closed', 'Go-Live', 'Retired']; previously this was a
-        # different hard-coded set and the overdue_status_exclusions arg was never read.
-        exclusions = args.get("overdue_status_exclusions") or ["Complete", "Done", "Closed", "Go-Live", "Retired"]
-        done_statuses = {str(s).strip().lower() for s in exclusions}
+        # Shared with the dashboard so the two surfaces cannot give different answers
+        # (core/overdue.py). This was an exact set-membership test against
+        # ["Complete", "Done", ...]; the reference sheet's status is "Completed", which
+        # matches none of them, so all 171 finished rows were reported overdue while the
+        # dashboard — matching on substrings — correctly excluded them.
+        exclusions = args.get("overdue_status_exclusions") or None
 
         for r in rows:
-            status = str(r[status_idx]).strip().lower() if status_idx is not None else ""
-            if status in done_statuses:
+            status = str(r[status_idx]).strip() if status_idx is not None else ""
+            if is_finished_status(status, exclusions):
                 continue
             raw_date = str(r[date_idx]).strip()
             if not raw_date:
@@ -485,7 +487,7 @@ async def summarize(
             item = {
                 "id": str(r[id_idx]).strip(),
                 "due_date": raw_date,
-                "status": str(r[status_idx]).strip() if status_idx is not None else "",
+                "status": status,
                 "days_overdue": (today - due).days,
             }
             if desc_idx is not None:

@@ -1584,6 +1584,21 @@ The same resolver fixed a defect nobody had reported: the dashboard's `has_due_d
 on both trackers for the same reason, so its Overdue tile read "—" and its overdue filter silently
 matched nothing.
 
+A **fifth defect surfaced only when the fixed code was checked against the real rows**, and would
+have shipped otherwise. The two surfaces also disagreed on the other half of the definition —
+whether a status reads as finished. `summarize` tested membership of a *set*, i.e. exact equality,
+against `["Complete", "Done", "Closed", "Go-Live", "Retired"]`; `_is_overdue` matched substrings
+against a different list. The reference tracker's status value is `"Completed"`, which equals none
+of those, so with the date lookup repaired chat would have reported all 171 finished rows as
+overdue while the dashboard correctly excluded them. Both now route through
+`core/overdue.py:is_finished_status`, which matches substrings — including for a caller-supplied
+`overdue_status_exclusions`, since requiring the caller to predict the exact inflection is how the
+bug survived in the first place. Two answers to one question, from one sheet, is worse than either
+answer alone.
+
+That sheet also carries a malformed date (`17/0/2026`, month zero). It parses as nothing, is
+counted in `unparsed_dates` and is excluded rather than guessed at.
+
 Two supporting changes in `agentic_loop.py`. On the final permitted iteration the tools are now
 withdrawn from the request and a system note instructs the model to answer from what it already
 has, so exhausting the budget yields a partial answer instead of nothing; the loop's `else` branch

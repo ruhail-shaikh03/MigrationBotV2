@@ -12,6 +12,9 @@ deadline column, "Expected Completetion Date", mapped nowhere, while "Date Compl
 when work actually finished — was mapped as `completion`.
 """
 
+import pytest
+
+from app.core.overdue import is_finished_status
 from app.core.schema import get_due_column
 from app.core.schema_detect import _structural_fallback
 
@@ -92,3 +95,36 @@ def test_detected_schema_round_trips_through_the_resolver():
     headers = ["WRICEF No.", "Expected Completetion Date", "Date Completion", "Status"]
     schema = _structural_fallback([headers])
     assert get_due_column(schema, headers) == "Expected Completetion Date"
+
+
+# --- "reads as finished" ----------------------------------------------------
+#
+# summarize compared the status to its exclusion list by exact equality while the
+# dashboard matched substrings. The reference tracker's status is "Completed" and the
+# exclusion list said "Complete", so chat reported all 171 finished rows as overdue and
+# the dashboard did not. Both now route through core/overdue.py.
+
+@pytest.mark.parametrize("status", ["Completed", "Complete", "COMPLETED", "Dev Done", "Closed - duplicate", "Cancelled", "Retired"])
+def test_finished_statuses_are_excluded(status):
+    assert is_finished_status(status) is True
+
+
+@pytest.mark.parametrize("status", ["Not Started", "in process", "Hold", "In Testing", "Needs to be moved to PRD", ""])
+def test_unfinished_statuses_from_the_real_tracker_stay_overdue(status):
+    assert is_finished_status(status) is False
+
+
+def test_go_live_pending_is_not_finished():
+    """"live" is deliberately not a finished-word — this is an unfinished state."""
+    assert is_finished_status("Go-Live Pending") is False
+
+
+def test_caller_supplied_exclusions_replace_the_defaults():
+    assert is_finished_status("In Review", ["In Review"]) is True
+    assert is_finished_status("Completed", ["In Review"]) is False
+
+
+def test_supplied_exclusions_still_match_inflections():
+    """Callers name the state, not its exact spelling in every row."""
+    assert is_finished_status("Signed Off", ["signed off"]) is True
+    assert is_finished_status("Completed", ["Complete"]) is True
