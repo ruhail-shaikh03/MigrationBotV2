@@ -5,7 +5,9 @@ from app.sheets.retry import _with_retry
 from app.sheets.meta import get_header_row, get_id_row_map
 from app.core.column_mapper import resolve_column
 from app.core.data_quality import DataQualityChecker
-from app.core.schema import get_tab_schema
+from app.core.overdue import is_finished_status
+from app.core.people import parse_date
+from app.core.schema import get_due_column, get_people_columns, get_tab_schema
 from app.models.audit_log import AuditLog
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -414,60 +416,101 @@ async def summarize(
         }
 
     elif report_type == "overdue":
-        date_cols = schema_config.get("date_columns", {})
-        go_live_col = date_cols.get("go_live", "Go-Live Date")
-        status_col = schema_config.get("status_column", "Dev Status")
-        id_col = schema_config.get("primary_id_column", "RICEFW ID")
+        # Resolved centrally so this and the dashboard agree on what a deadline is.
+        # Note the schema is consulted with the *real* header list: on projects whose
+        # detection predates the "due" slot, the deadline column is recovered by name
+        # rather than reported as missing (core/schema.py:get_due_column).
+        due_col = get_due_column(schema_config, headers)
+        # `or` rather than a .get default: detection writes these keys with a literal
+        # null when it finds nothing, and a null value ignores the default — the exact
+        # trap that broke the date lookup here.
+        status_col = schema_config.get("status_column") or "Dev Status"
+        id_col = schema_config.get("primary_id_column") or "RICEFW ID"
 
-        date_idx = _col(go_live_col)
+        date_idx = _col(due_col)
         status_idx = _col(status_col)
         id_idx = _col(id_col)
 
         if date_idx is None:
-            return {"ok": False, "error": f"Date column '{go_live_col}' not found."}
+            # Name the columns that do exist. A bare "not found" gave the model nothing
+            # to correct against, so it fell back to guessing date substrings through
+            # search_rows until the loop hit its iteration cap.
+            return {
+                "ok": False,
+                "error": (
+                    "This sheet has no due-date column mapped, so overdue cannot be "
+                    "computed. Do not try to work it out with search_rows — answer that "
+                    "the sheet records no deadline, and suggest an admin map one in "
+                    f"/admin/projects. Columns present: {', '.join(h for h in headers if h)}."
+                ),
+            }
         if id_idx is None:
             return {"ok": False, "error": f"Primary ID column '{id_col}' not found; cannot report row IDs."}
 
+        # Enough context to answer "what's overdue?" from this one result. Returning bare
+        # IDs forced a get_row per item to find out what each one *was* — precisely the
+        # per-row loop the system prompt forbids, with no supported alternative.
+        desc_col = schema_config.get("description_column")
+        desc_idx = _col(desc_col)
+        people = get_people_columns(schema_config)
+        people_idx = [(p["label"], _col(p["header"])) for p in people]
+
         today = datetime.today().date()
         overdue = []
+        unparsed_dates = 0
 
-        # tool_schemas.py documents the default exclusion set as
-        # ['Complete', 'Done', 'Closed', 'Go-Live', 'Retired']; previously this was a
-        # different hard-coded set and the overdue_status_exclusions arg was never read.
-        exclusions = args.get("overdue_status_exclusions") or ["Complete", "Done", "Closed", "Go-Live", "Retired"]
-        done_statuses = {str(s).strip().lower() for s in exclusions}
+        # Shared with the dashboard so the two surfaces cannot give different answers
+        # (core/overdue.py). This was an exact set-membership test against
+        # ["Complete", "Done", ...]; the reference sheet's status is "Completed", which
+        # matches none of them, so all 171 finished rows were reported overdue while the
+        # dashboard — matching on substrings — correctly excluded them.
+        exclusions = args.get("overdue_status_exclusions") or None
 
         for r in rows:
-            status = str(r[status_idx]).strip().lower() if status_idx is not None else ""
-            if status in done_statuses:
+            status = str(r[status_idx]).strip() if status_idx is not None else ""
+            if is_finished_status(status, exclusions):
                 continue
             raw_date = str(r[date_idx]).strip()
             if not raw_date:
                 continue
-                
-            for fmt in ("%d/%m/%Y", "%m/%d/%Y", "%Y-%m-%d", "%d-%m-%Y"):
-                try:
-                    go_live = datetime.strptime(raw_date, fmt).date()
-                    if go_live < today:
-                        overdue.append({
-                            "id": str(r[id_idx]).strip(),
-                            "go_live_date": raw_date,
-                            "dev_status": str(r[status_idx]).strip() if status_idx is not None else "",
-                            "days_overdue": (today - go_live).days
-                        })
-                    break
-                except ValueError:
-                    continue
+
+            # Shared parser: the local format tuple here omitted the dotted form
+            # (10.05.2026) that the reference sheet actually uses, so every date silently
+            # failed to parse and the report returned zero overdue items.
+            due = parse_date(raw_date)
+            if due is None:
+                unparsed_dates += 1
+                continue
+            if due >= today:
+                continue
+
+            item = {
+                "id": str(r[id_idx]).strip(),
+                "due_date": raw_date,
+                "status": status,
+                "days_overdue": (today - due).days,
+            }
+            if desc_idx is not None:
+                item["description"] = str(r[desc_idx]).strip()[:120]
+            for label, idx in people_idx:
+                if idx is not None and str(r[idx]).strip():
+                    item[label] = str(r[idx]).strip()
+            overdue.append(item)
 
         overdue.sort(key=lambda x: -x["days_overdue"])
         return {
             "ok": True,
             "report": "overdue",
+            "date_column": due_col,
             "scope": scope_module or "all modules",
             "total_rows": total,
             "truncated": truncated,
             "overdue_count": len(overdue),
-            "items": overdue[:30]
+            # Surfaced rather than swallowed: a sheet full of dates this parser cannot
+            # read would otherwise report zero overdue items, which reads as good news.
+            "unparsed_dates": unparsed_dates,
+            "items": overdue[:30],
+            "items_shown": min(len(overdue), 30),
         }
 
     return {"ok": False, "error": f"Unknown report_type: {report_type}"}

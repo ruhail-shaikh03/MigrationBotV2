@@ -21,9 +21,12 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
+from app.core.overdue import is_finished_status
 from app.core.people import collect_assignments, normalise_person, parse_date, resolve_effort
 from app.core.permissions import get_user_permissions
-from app.core.schema import get_effort_columns, get_people_columns, get_tab_schema
+from app.core.schema import (
+    get_available_tabs, get_due_column, get_effort_columns, get_people_columns, get_tab_schema,
+)
 from app.db.engine import get_db
 from app.deps import get_current_user, get_google_auth
 from app.models.permission import Permission
@@ -171,8 +174,10 @@ async def list_rows(
 
     people = get_people_columns(tab_schema)
     status_header = tab_schema.get("status_column")
-    date_columns = tab_schema.get("date_columns") or {}
-    due_header = date_columns.get("due") or date_columns.get("go_live")
+    # Resolved against the real headers, so a sheet whose deadline column detection never
+    # mapped ("Expected Completetion Date") still filters by overdue instead of matching
+    # nothing at all. Same resolver the agent's summarize(overdue) uses.
+    due_header = get_due_column(tab_schema, headers)
 
     # Only the people-columns the caller asked about; role_key narrows a person filter to
     # one role so "overdue work Sara owns as functional consultant" is answerable.
@@ -203,6 +208,10 @@ async def list_rows(
 
     return {
         "tab": active_tab,
+        # Every tab the project has, so the grid can offer a switcher. Without it the
+        # client had no way to learn a tab existed, and `?tab=` — which the endpoint has
+        # always honoured — was never sent, pinning the dashboard to `default_tab`.
+        "tabs": get_available_tabs(project.schema_config or {}),
         "project_name": project.project_name,
         # Emptiness is judged across every scanned row, not the page being returned, so
         # which columns show up does not change as the user pages through.
@@ -224,20 +233,14 @@ async def list_rows(
 def _is_overdue(due: date, row: Dict[str, str], status_header: Optional[str]) -> bool:
     """Past its due date and not in a status that reads as finished.
 
-    "Finished" is matched against generic words rather than a configured allowlist,
-    because no sheet declares which of its statuses mean done. That makes this a
-    heuristic, and it is applied only to the `overdue` filter — never to a write.
-
-    The word list is kept narrow on purpose. Hiding a genuinely overdue item is the worse
-    error here — nobody chases what they cannot see — while an extra row in the list is
-    self-correcting. So "live" is deliberately absent: it would clear "Go-Live Pending".
+    The "reads as finished" half lives in `core/overdue.py` and is shared with the
+    agent's `summarize(overdue)`, which used to apply a different rule — see that
+    module for what the divergence cost.
     """
     if due >= date.today():
         return False
-    if status_header:
-        value = str(row.get(status_header, "")).lower().strip()
-        if any(word in value for word in ("done", "complete", "closed", "cancel", "deployed")):
-            return False
+    if status_header and is_finished_status(row.get(status_header)):
+        return False
     return True
 
 
@@ -370,7 +373,7 @@ async def project_analytics(
     effort = get_effort_columns(tab_schema)
     status_header = tab_schema.get("status_column")
     date_columns = tab_schema.get("date_columns") or {}
-    due_header = date_columns.get("due") or date_columns.get("go_live")
+    due_header = get_due_column(tab_schema, headers)
 
     by_status: Dict[str, int] = {}
     workload: Dict[str, Dict[str, Any]] = {}

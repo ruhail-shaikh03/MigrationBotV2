@@ -1,4 +1,4 @@
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from app.core.people import slugify_role
 
@@ -77,6 +77,48 @@ def get_effort_columns(tab_schema: Dict[str, Any]) -> List[Dict[str, Any]]:
             "unit": col.get("unit") or "days",
         })
     return out
+
+
+# Words that mark a column as a *deadline*. Deliberately excludes "completion",
+# "closed" and "sign-off": those record when something actually finished, and treating
+# one as a deadline reports finished work as overdue — the exact inversion of the
+# question being asked.
+_DUE_WORDS = ("due", "deadline", "target", "expected", "planned", "go-live", "go live", "golive", "eta")
+
+
+def get_due_column(tab_schema: Dict[str, Any], headers: Optional[List[str]] = None) -> Optional[str]:
+    """The column holding each row's deadline, verbatim, or None if the sheet has none.
+
+    Every consumer of "overdue" resolves through here so chat and the dashboard cannot
+    disagree about what the word means.
+
+    Two failures made this necessary, both observed in production:
+
+    * `date_columns.get("go_live", "Go-Live Date")` looks like it has a default, but
+      detection writes the key with a literal `null`, so `.get` returns None and the
+      default never applies. `summarize(report_type="overdue")` then failed on every
+      project, which is what sent the agent looping through search_rows guessing at date
+      substrings until it hit the iteration cap.
+    * Detection has no slot for a plain due date, so a sheet whose deadline column is
+      "Expected Completetion Date" mapped nothing, while "Date Completion" — the
+      *actual* completion date — was mapped as `completion`.
+
+    Hence the header scan: it recovers a deadline column on projects that will never be
+    re-detected (there is no automatic backfill). It is a read-path heuristic only,
+    never consulted for a write, and it returns None rather than settling for a
+    completion date — "no due-date column" is a true and useful answer.
+    """
+    dates = tab_schema.get("date_columns") or {}
+    for key in ("due", "go_live"):
+        value = dates.get(key)
+        if value and str(value).strip():
+            return value
+
+    for header in headers or []:
+        if header and any(word in str(header).casefold() for word in _DUE_WORDS):
+            return header
+
+    return None
 
 
 def get_available_tabs(schema_config: Dict[str, Any]) -> List[str]:

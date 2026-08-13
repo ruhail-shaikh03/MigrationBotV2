@@ -23,6 +23,7 @@ export default function ChatPage() {
   const [dismissed, setDismissed] = useState<Set<string>>(new Set())
   const [isAdminState, setIsAdminState] = useState(false)
   const messagesEndRef = useRef<HTMLDivElement | null>(null)
+  const feedRef = useRef<HTMLDivElement | null>(null)
 
   // Zustand Store
   const { 
@@ -94,13 +95,24 @@ export default function ChatPage() {
     }
   }, [status, apiToken, setProjects, setActiveProject, activeProject])
 
-  // Scroll to bottom of chat
-  const scrollToBottom = () => {
-    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" })
-  }
-
+  // Follow the conversation only while the reader is already at the bottom.
+  //
+  // `messages` changes identity on every frame the socket delivers — each tool_start,
+  // each tool_result, each assistant chunk — so an unconditional scroll-to-bottom fires
+  // repeatedly during a multi-step run and drags the reader away from whatever they
+  // scrolled up to look at. A run that calls eight tools does that eight times.
+  //
+  // The container is scrolled directly rather than via scrollIntoView, which also walks
+  // and scrolls every scrollable ancestor.
   useEffect(() => {
-    scrollToBottom()
+    const feed = feedRef.current
+    if (!feed) return
+    // 120px of slack: "near the bottom" has to tolerate the last row being partly cut
+    // off, otherwise following the conversation stops the moment a tall card lands.
+    const atBottom = feed.scrollHeight - feed.scrollTop - feed.clientHeight < 120
+    if (atBottom) {
+      feed.scrollTo({ top: feed.scrollHeight, behavior: "smooth" })
+    }
   }, [messages])
 
   // Background write outcomes feed the ledger, which keeps them until the user
@@ -214,8 +226,16 @@ export default function ChatPage() {
 
   return (
     <div className="relative flex h-screen flex-col overflow-hidden bg-ink-950 text-ink-100">
-      {/* Main chat window container */}
-      <div className="relative z-10 flex flex-1 flex-col">
+      {/* Main chat window container.
+          `min-h-0` is load-bearing, not cosmetic. A flex item defaults to
+          `min-height: auto`, which resolves to its *content* height, so this wrapper
+          grew to fit the whole conversation (measured at 2962px inside a 620px
+          `h-screen` root). That handed the messages feed below a flex-1 height equal to
+          its own content, so its `overflow-y-auto` never engaged, and everything past
+          the first viewport was clipped by this column's `overflow-hidden` — clipped in
+          a container the wheel cannot scroll, though scrollIntoView still moved it.
+          Long answers were therefore unreadable. */}
+      <div className="relative z-10 flex min-h-0 flex-1 flex-col">
         {/* Header Bar */}
         <header className="flex flex-wrap items-center justify-between gap-3 border-b border-[var(--color-rule)] bg-ink-900 px-4 py-3 sm:px-6">
           <div className="flex min-w-0 items-center gap-4 sm:gap-5">
@@ -313,7 +333,7 @@ export default function ChatPage() {
         {/* Messages Feed. The column is capped to the same max-w-4xl the input bar
             uses — it was full-bleed, so on a wide monitor the conversation sprawled
             edge to edge while the composer sat centred underneath it. */}
-        <div className="flex-1 overflow-y-auto px-4 py-8 sm:px-6">
+        <div ref={feedRef} className="min-h-0 flex-1 overflow-y-auto px-4 py-8 sm:px-6">
           <div className="mx-auto flex min-h-full w-full max-w-4xl flex-col space-y-6">
           {messages.length === 0 ? (
             // An empty screen is an invitation to act: the examples are real
