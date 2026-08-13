@@ -158,3 +158,60 @@ def test_person_key_is_derived_from_the_resolved_name():
 
 def test_a_blank_cell_yields_nothing():
     assert collect_assignments({"Developer Name": "  "}, [DEV]) == []
+
+
+# --- suggestions ------------------------------------------------------------
+
+from app.core.aliases import suggest_merges  # noqa: E402
+
+
+def _by_name(suggestions):
+    return {s.name: s for s in suggestions}
+
+
+def test_a_shorter_name_is_suggested_against_its_longer_form():
+    s = _by_name(suggest_merges({"Madiha": 4, "Madiha Shah Bukhari": 30}))
+    assert s["Madiha"].candidates == ["Madiha Shah Bukhari"]
+    assert s["Madiha"].reason == "subset"
+
+
+def test_a_single_token_name_matches_a_full_name_containing_it():
+    s = _by_name(suggest_merges({"Haider": 6, "Syed Ali Haider": 12}))
+    assert s["Haider"].candidates == ["Syed Ali Haider"]
+
+
+def test_a_one_character_typo_is_suggested():
+    """The subset rule misses this entirely — the tokens differ, they are not nested."""
+    s = _by_name(suggest_merges({"Abdullah Azfar": 9, "Abdullah Azfer": 2}))
+    assert s["Abdullah Azfer"].candidates == ["Abdullah Azfar"]
+    assert s["Abdullah Azfer"].reason == "typo"
+
+
+def test_an_ambiguous_name_lists_every_candidate_and_picks_none():
+    """"Abdullah" plausibly matches three people. Nothing in the sheet says which, so the
+    screen must show all three rather than default to one."""
+    s = _by_name(suggest_merges(
+        {"Abdullah": 3, "Abdullah Ali": 8, "Abdullah Azfar": 9, "Abdullah Azfer": 2}
+    ))
+    assert sorted(s["Abdullah"].candidates) == ["Abdullah Ali", "Abdullah Azfar", "Abdullah Azfer"]
+
+
+def test_unrelated_names_produce_no_suggestion():
+    assert suggest_merges({"Babar Ali": 5, "Neeha Nehal": 7}) == []
+
+
+def test_case_only_variants_are_not_suggested():
+    """normalise_person already folds them; suggesting a merge would be noise."""
+    assert suggest_merges({"Mashal Fida": 3, "mashal Fida": 2}) == []
+
+
+def test_the_more_common_spelling_is_the_candidate_not_the_name():
+    """The rare spelling is what gets merged away."""
+    s = suggest_merges({"Babar": 2, "Babar Ali": 20})
+    assert s[0].name == "Babar"
+    assert s[0].candidates == ["Babar Ali"]
+
+
+def test_suggestions_are_ordered_by_how_often_the_variant_occurs():
+    out = suggest_merges({"Madiha": 9, "Madiha Shah Bukhari": 30, "Umair": 2, "Umair Ziad": 15})
+    assert [s.name for s in out] == ["Madiha", "Umair"]
