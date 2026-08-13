@@ -307,9 +307,15 @@ async def summarize(
     args: dict,
     schema_config: dict,
     column_map: dict,
-    service: Any
+    service: Any,
+    resolver: Any = None,
 ) -> dict:
-    """Calculates report figures, counts, and completion metrics across a sheet."""
+    """Calculates report figures, counts, and completion metrics across a sheet.
+
+    `resolver` is an optional `PersonResolver`. It only affects count_by_field on a
+    people column, where it splits shared cells and applies the project's alias map so
+    this agrees with the dashboard's workload panel.
+    """
     schema_config = get_tab_schema(schema_config, active_tab)
     report_type = args.get("report_type")
     data_start_row = schema_config.get("data_start_row", 3)
@@ -347,11 +353,22 @@ async def summarize(
         if idx is None:
             return {"ok": False, "error": f"Grouping column '{group_by}' not found."}
 
+        # When the grouping column is one of this tab's people columns, count resolved
+        # people rather than raw cells — otherwise chat reports "Minhaj Alam & Dawood" as
+        # a person while the dashboard beside it reports two, from the same sheet.
+        people_headers = {p["header"].lower().strip() for p in get_people_columns(schema_config)}
+        is_people_column = canonical.lower().strip() in people_headers
+
         counts = {}
         for r in rows:
-            val = str(r[idx]).strip() or "(blank)"
-            counts[val] = counts.get(val, 0) + 1
-            
+            raw = str(r[idx]).strip()
+            if is_people_column and resolver is not None:
+                for name in (resolver.resolve_cell(raw) or ["(blank)"]):
+                    counts[name] = counts.get(name, 0) + 1
+            else:
+                val = raw or "(blank)"
+                counts[val] = counts.get(val, 0) + 1
+
         sorted_counts = sorted(counts.items(), key=lambda x: -x[1])
         return {
             "ok": True,

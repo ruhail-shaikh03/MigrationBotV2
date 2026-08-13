@@ -693,3 +693,76 @@ async def test_bulk_update_resolves_rows_with_one_id_scan():
     assert id_scan_call_count == 1  # one scan resolves both IDs, not one scan each
     assert result["ok"] is True
     assert set(result["succeeded"]) == {"SD-001", "SD-002"}
+
+
+# 15. summarize(count_by_field) on a people column must split shared cells and apply the
+# project's alias map, or chat reports "Minhaj Alam & Dawood" as a person while the
+# dashboard beside it reports two — from the same sheet, on the same tab.
+@pytest.mark.asyncio
+async def test_summarize_count_by_field_splits_and_aliases_a_people_column():
+    from app.core.aliases import PersonResolver
+
+    mock_service = _mock_service_for_sheet(
+        headers_row=["RICEFW ID", "Module", "Developer Name"],
+        data_rows=[
+            ["SD-001", "SD", "Minhaj Alam & Dawood"],
+            ["SD-002", "SD", "Muhammad Dawood Umer"],
+            ["SD-003", "SD", "Madiha"],
+        ],
+    )
+
+    result = await summarize(
+        spreadsheet_id="sheet-123",
+        active_tab="SD",
+        args={"report_type": "count_by_field", "group_by_field": "Developer Name"},
+        schema_config={
+            "data_start_row": 3,
+            "people_columns": [
+                {"key": "developer_name", "label": "Developer Name", "header": "Developer Name"}
+            ],
+        },
+        column_map={},
+        service=mock_service,
+        resolver=PersonResolver({
+            "dawood": ["Muhammad Dawood Umer"],
+            "madiha": ["Madiha Shah Bukhari"],
+        }),
+    )
+
+    assert result["ok"] is True
+    counts = {b["value"]: b["count"] for b in result["breakdown"]}
+    # The composite is gone; Dawood is credited for both rows that name him.
+    assert "Minhaj Alam & Dawood" not in counts
+    assert counts["Muhammad Dawood Umer"] == 2
+    assert counts["Minhaj Alam"] == 1
+    assert counts["Madiha Shah Bukhari"] == 1
+
+
+# 16. The same grouping on a NON-people column must be left exactly as it was: raw cell
+# values, no splitting. An ampersand in a module name is not two modules.
+@pytest.mark.asyncio
+async def test_summarize_count_by_field_does_not_split_a_plain_column():
+    from app.core.aliases import PersonResolver
+
+    mock_service = _mock_service_for_sheet(
+        headers_row=["RICEFW ID", "Module", "Developer Name"],
+        data_rows=[["SD-001", "Sales & Distribution", "A"], ["SD-002", "Sales & Distribution", "B"]],
+    )
+
+    result = await summarize(
+        spreadsheet_id="sheet-123",
+        active_tab="SD",
+        args={"report_type": "count_by_field", "group_by_field": "Module"},
+        schema_config={
+            "data_start_row": 3,
+            "people_columns": [
+                {"key": "developer_name", "label": "Developer Name", "header": "Developer Name"}
+            ],
+        },
+        column_map={},
+        service=mock_service,
+        resolver=PersonResolver(),
+    )
+
+    assert result["ok"] is True
+    assert {b["value"]: b["count"] for b in result["breakdown"]} == {"Sales & Distribution": 2}

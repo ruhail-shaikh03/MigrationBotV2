@@ -947,6 +947,20 @@ read as finished; the finished-word list is deliberately narrow (no `"live"`, wh
 "Go-Live Pending") because hiding an overdue item is the worse error — nobody chases what they
 cannot see.
 
+Both endpoints build a `PersonResolver` per request through `dashboard.py:_resolver_for`, which
+degrades to unmerged names if the alias query fails rather than erroring — the same posture
+`rows_cache` takes toward an unreachable Redis. `list_rows` builds one only when a `person` filter
+is actually supplied, since that is the only place it changes the answer; without it, selecting a
+merged person from the dropdown (which *is* aliased, being populated from the analytics workload)
+would return nothing, and a shared cell would match neither of the people it names.
+
+The agent path resolves too: `tool_dispatch.py:_resolver_for_spreadsheet` looks the project up from
+the spreadsheet id and passes a resolver into `summarize`, which applies it to `count_by_field`
+**only when the grouping column is one of the tab's people columns**. Otherwise chat would report
+`"Minhaj Alam & Dawood"` as a person while the dashboard beside it reported two, from the same
+sheet on the same tab. A non-people column is left exactly as it was — an ampersand in
+`"Sales & Distribution"` is not two modules, and there is a regression test for that.
+
 `project_analytics` aggregates over `people.py:collect_assignments`, so one person appearing in two
 role columns yields one workload entry carrying a per-role split and a combined total.
 `days_source` reports where the day figures came from — `"column"`, `"dates"`, `"mixed"`, or `null`
