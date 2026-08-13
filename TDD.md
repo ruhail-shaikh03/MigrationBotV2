@@ -1479,6 +1479,42 @@ carrying them across lands the user on an empty grid that reads as an empty tab.
 **"What's overdue?" burned all eight iterations and answered nothing.** See §16.5 — the root cause
 is a schema-resolution bug, not a prompt or model problem, and the fix is described there.
 
+### 14.7 The person triage screen
+
+`/admin/people` (`app/admin/people/page.tsx`) is where an admin turns the sheet's spellings into
+people. It lists the observed names for a tab with occurrence counts, the merge suggestions from
+`aliases.py:suggest_merges`, and the aliases already recorded, each removable.
+
+Its whole design follows from **automatic when it reveals, confirmed when it conflates** (§7.5).
+The roles and the splits are already applied by the time this screen loads; nothing on it is
+blocking. What it exists for is the one operation the app will not perform on its own.
+
+So a suggestion offers **one button per candidate** and a first-class `Leave separate`, and where a
+name matches several people it says so — "Matches 3 people — pick one, or leave separate" — with
+every candidate rendered identically and none defaulted. Occurrence counts sit beside each name and
+each candidate, because the sheet's dominant spelling is usually the one to keep and that is a fact
+the admin should be able to read rather than guess. Presenting a best guess would be the app making
+precisely the judgement it is not entitled to make, and on the reference tracker `Abdullah` is a
+live example: three candidates, no evidence anywhere in the sheet as to which.
+
+The copy states the blast radius directly — "Merging changes how the app reads the sheet — the
+spreadsheet itself is never modified, and every merge can be undone" — because an admin about to
+merge two colleagues needs to know it is reversible and non-destructive before they click, not
+after.
+
+It sits in the sidebar as **People**, after Projects Manager and deliberately not beside User
+Permissions: those are accounts that can sign in, these are names inside a spreadsheet, and
+adjacency would imply they are the same thing.
+
+**Known lint debt, not introduced here.** The page carries one instance of
+`Calling setState synchronously within an effect`, the React Compiler rule's well-known false
+positive on fetch-on-mount. There were already six across the codebase — `admin/layout.tsx`,
+`project/[id]/page.tsx` and others — making it the second most common error class. This is the
+seventh, matching the established shape rather than being suppressed in one file only; the codebase
+carries no `eslint-disable` anywhere, and adding the first one here would be worse than the
+inconsistency. Fixing all seven is a single-pass job for whenever the data-fetching pattern is
+revisited.
+
 ---
 
 ## 15. Deployment, CI/CD & Tests

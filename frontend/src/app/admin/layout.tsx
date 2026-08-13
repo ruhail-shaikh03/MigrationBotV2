@@ -4,7 +4,7 @@ import { useSession } from "next-auth/react"
 import { useRouter, usePathname } from "next/navigation"
 import { useEffect, useState } from "react"
 import { 
-  LayoutDashboard, FolderKanban, Users, ShieldAlert, 
+  LayoutDashboard, FolderKanban, Users, ShieldAlert, Contact,
   MessageSquare, LogOut, ArrowLeft, Database, ShieldX, RefreshCw
 } from "lucide-react"
 import Link from "next/link"
@@ -115,6 +115,9 @@ export default function AdminLayout({
     { name: "Overview", href: "/admin", icon: LayoutDashboard },
     { name: "Projects Manager", href: "/admin/projects", icon: FolderKanban },
     { name: "User Permissions", href: "/admin/users", icon: Users },
+    // People, not Users: this is about the names inside the sheet, not accounts that can
+    // sign in. Sitting next to Permissions would suggest otherwise, so it follows Projects.
+    { name: "People", href: "/admin/people", icon: Contact },
     { name: "Audit Viewer", href: "/admin/audit", icon: ShieldAlert },
   ]
 
