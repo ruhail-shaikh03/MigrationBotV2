@@ -8,6 +8,8 @@ from app.core.permissions import PermissionChecker
 from app.core.tool_dispatch import dispatch_tool
 from app.core.errors import failure_note, PERMISSION
 from app.core.schema import get_available_tabs
+from app.core.streaming import DSML_MARKER, DSMLLeak, complete
+from app.config import settings
 from app.core.column_mapper import get_column_map_json
 
 logger = logging.getLogger("agentic_loop")
@@ -31,10 +33,20 @@ async def run_agentic_loop(
 ) -> List[Dict[str, Any]]:
     """
     Executes the multi-turn agentic loop. Receives user queries, interacts with DeepSeek,
-    enforces RBAC permissions, routes tool requests to the dispatcher, and streams replies.
+    enforces RBAC permissions, routes tool requests to the dispatcher, and returns the
+    updated message history.
+
+    Replies are streamed only when `settings.STREAM_RESPONSES` is on; the default is a
+    single `assistant` frame carrying the whole reply. This docstring claimed token
+    streaming for months while the code contained no `stream=True` anywhere — the claim is
+    now conditional and true either way.
     """
     available_tabs = get_available_tabs(schema_config)
     column_map_json = get_column_map_json(column_map)
+
+    # Read once per turn rather than per iteration, so a config reload mid-turn cannot
+    # switch delivery modes halfway through one reply.
+    streaming = bool(getattr(settings, "STREAM_RESPONSES", False))
 
     # Generate initial full system prompt
     system_prompt = get_system_prompt(available_tabs, column_map_json)
@@ -76,59 +88,70 @@ async def run_agentic_loop(
                 }]
                 api_kwargs.pop("tools")
 
-            response = await llm_client.chat.completions.create(**api_kwargs)
-            choice = response.choices[0]
-            message = choice.message
-            content = message.content or ""
-            
-            # DSML Leakage Guard
-            if "<｜｜DSML｜｜>" in content:
+            async def emit_delta(fragment: str) -> None:
+                await send_websocket_msg({
+                    "type": "assistant",
+                    "content": fragment,
+                    "done": False,
+                })
+
+            try:
+                message = await complete(
+                    llm_client, api_kwargs, stream=streaming, on_delta=emit_delta
+                )
+            except DSMLLeak as leak:
+                # Caught here rather than inside the stream because retracting is the
+                # caller's business: the client has already rendered `leak.emitted`, and a
+                # retry appends to it. The reset frame tells it to clear that bubble first,
+                # or the user reads the good answer stapled to the tail of a poisoned one.
+                logger.warning("DSML Leakage detected mid-stream! Retrying with deepseek-chat.")
+                if leak.emitted:
+                    await send_websocket_msg({"type": "assistant", "content": "", "reset": True})
+                message = await complete(
+                    llm_client, {**api_kwargs, "model": "deepseek-chat"},
+                    stream=streaming, on_delta=emit_delta,
+                )
+
+            content = message.content
+
+            # DSML Leakage Guard, non-streaming path. Streaming is guarded inside
+            # `complete`, which has to stop the marker before it is emitted rather than
+            # after the reply is whole.
+            if DSML_MARKER in content:
                 logger.warning("DSML Leakage detected! Aborting and retrying with deepseek-chat.")
                 # Force fallback to V3 Chat model for safety
                 # Same kwargs as the call that leaked, model forced to V3 — in particular
                 # the final-step variant must retry *without* tools too, or the retry
                 # reopens the tool path the outer call just closed.
-                retry_response = await llm_client.chat.completions.create(
-                    **{**api_kwargs, "model": "deepseek-chat"}
-                )
-                choice = retry_response.choices[0]
-                message = choice.message
-                content = message.content or ""
+                message = await complete(llm_client, {**api_kwargs, "model": "deepseek-chat"})
+                content = message.content
             
             # Prevent Chain of Thought (CoT) leaking to client
             # Extract reasoning_content (logged internally only)
-            reasoning_content = getattr(message, "reasoning_content", None)
-            if reasoning_content:
-                logger.info(f"Reasoner CoT reasoning: {reasoning_content}")
+            if message.reasoning:
+                logger.info(f"Reasoner CoT reasoning: {message.reasoning}")
             
             # Format and save assistant message to history
             assistant_msg = {"role": "assistant", "content": content}
             if message.tool_calls:
-                assistant_msg["tool_calls"] = [
-                    {
-                        "id": tc.id,
-                        "type": tc.type,
-                        "function": {
-                            "name": tc.function.name,
-                            "arguments": tc.function.arguments
-                        }
-                    } for tc in message.tool_calls
-                ]
+                assistant_msg["tool_calls"] = message.tool_calls
             messages.append(assistant_msg)
             
             # If no tools called, we have completed the request
             if not message.tool_calls:
                 await send_websocket_msg({
                     "type": "assistant",
-                    "content": content,
+                    # Already delivered fragment by fragment when streaming; repeating the
+                    # whole thing here would render it twice, since the client appends.
+                    "content": "" if message.streamed else content,
                     "done": True
                 })
                 break
                 
             # Process all tool calls in sequence
             for tool_call in message.tool_calls:
-                tool_name = tool_call.function.name
-                tool_args_str = tool_call.function.arguments
+                tool_name = tool_call["function"]["name"]
+                tool_args_str = tool_call["function"]["arguments"]
                 
                 try:
                     tool_args = json.loads(tool_args_str)
@@ -200,7 +223,7 @@ async def run_agentic_loop(
 
                 messages.append({
                     "role": "tool",
-                    "tool_call_id": tool_call.id,
+                    "tool_call_id": tool_call["id"],
                     "name": tool_name,
                     "content": content_str
                 })

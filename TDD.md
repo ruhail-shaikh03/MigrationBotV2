@@ -868,6 +868,50 @@ additionally states that an unfamiliar ID prefix is *not* evidence a tab switch 
 are not tab names. The parameter key is still `ricefw_id` across `tool_dispatch.py`, `read.py`,
 `write.py` and `worker.py`; renaming it is a wider change and was not attempted (§16.2).
 
+### 8.3 Streaming
+
+`core/streaming.py:complete()` runs every completion and returns a `CompletedMessage`
+(`content`, `tool_calls` in wire shape, `reasoning`, `streamed`) whether or not the provider
+streamed it. The loop has one code path; `settings.STREAM_RESPONSES` changes only how the frames
+reach the client.
+
+**It is off by default and should stay off until someone has watched a streamed turn perform a
+real write.** Streaming changes how tool calls arrive: instead of one complete object, a call comes
+as a name, then an id, then JSON arguments split across however many deltas the provider chose,
+reassembled by index. The reassembly is unit-tested against the documented delta shape, but no test
+here can prove the provider emits that shape — and if it does not, the arguments are truncated,
+`json.loads` fails, and *every write breaks* at dispatch. So the deploy stays on the code path that
+has been running for months.
+
+Two details in the reassembly are not obvious and are each covered by a test:
+
+- **A repeated `function.name` is assigned, not appended.** Providers resend the name on later
+  fragments of the same call; concatenating gives `"get_rowget_row"`, a tool nobody wrote, failing
+  with an error that names a function that does not exist.
+- **Chunks carrying no `choices` are skipped**, not treated as an error — usage-only chunks arrive
+  that way at the end of a stream.
+
+`run_agentic_loop`'s docstring claimed token streaming for months while the code contained no
+`stream=True` anywhere. The claim is now conditional and true in both modes.
+
+#### The leakage guard is what makes this non-trivial
+
+The loop retries on `deepseek-chat` when the reasoner leaks `<｜｜DSML｜｜>` into its reply — a real
+artifact seen in production. That check reads the **finished** reply. Streamed naively, the marker
+would already be on the user's screen before the guard ran, so turning the flag on would have
+silently disabled a safety feature that currently works.
+
+`streaming._SafeEmitter` therefore withholds the last `len(marker) - 1` characters of the stream
+until the next delta proves them harmless, because a marker can straddle deltas — `"…<｜"` in one
+chunk and `"｜DSML｜｜>"` in the next — and checking each delta alone would let it through. When the
+marker completes it raises `DSMLLeak` before emitting a single character of it. The user sees a lag
+of a dozen characters at the very tail of a clean stream and nothing else.
+
+Retracting is the loop's job, not the emitter's: the client has already rendered whatever was
+emitted before the marker, and the retry *appends*. So the loop sends
+`{"type": "assistant", "content": "", "reset": true}` (§9.2) to clear that bubble before streaming
+the replacement, or the user reads a correct answer stapled to the tail of a poisoned one.
+
 ---
 
 ## 9. WebSocket Protocol Reference
@@ -897,7 +941,7 @@ Any other `type` is ignored rather than misread as chat text (`chat.py:websocket
 |---|---|---|---|---|
 | `connection_ok` | `{type, user_email, project_name, active_tab}` | `chat.py:websocket_chat_endpoint` | `useWebSocket.ts:connect` (`onmessage`) | `setSessionInfo` applies all three fields |
 | `history` | `{type, messages: [{role, content, toolCalls}]}` | `chat.py:websocket_chat_endpoint` | `useWebSocket.ts:connect` (`onmessage`) | `setMessages`, **only into an empty store** — see below |
-| `assistant` | `{type, content, done: true}` | `agentic_loop.py:run_agentic_loop` | `useWebSocket.ts:connect` (`onmessage`) | appends to the most recent assistant message |
+| `assistant` | `{type, content, done, reset?}` | `agentic_loop.py:run_agentic_loop` | `useWebSocket.ts:connect` (`onmessage`) | appends to the most recent assistant message — unless `reset` is set, which **empties** it instead (§8.3). Streaming sends many of these with `done: false` and a final one with `content: ""`, since the text has already been delivered |
 | `tool_start` | `{type, tool, args}` | `agentic_loop.py:run_agentic_loop` | `useWebSocket.ts:connect` (`onmessage`) | pushes `{name, args, status:"running"}` |
 | `tool_result` | `{type, tool, result}` | `agentic_loop.py:run_agentic_loop` | `useWebSocket.ts:connect` (`onmessage`) | marks the matching running entry `"completed"` or `"failed"` per `result.ok` |
 | `tab_switched` | `{type, active_tab}` | `chat.py:websocket_chat_endpoint` | `useWebSocket.ts:connect` (`onmessage`) | `setActiveTab(active_tab)` — the client no longer sets it optimistically (§14) |
@@ -1252,17 +1296,36 @@ longer silently truncated (§16 history). A `_MAX_SCAN_ROWS` (`read.py:_MAX_SCAN
 safety valve stops pagination and sets a `truncated: true` field in the response if a
 misconfigured schema somehow never yields a short page — no real tracker should reach it.
 
-### 11.1 The dashboard row cache
+### 11.1 The row cache
 
-Agent tool reads are **not** cached: every `get_row`/`search_rows`/`summarize`/`data_quality` call
-scans live. (Earlier revisions of `CLAUDE.md` and the `migrationbot-sheets-testing` skill described
-a `sheet_records` Postgres table fronted by `read.py:_ensure_sheet_synced()` and
+Both the dashboard and the agent read through it. Agent reads did not, until this change: every
+`get_row`/`search_rows`/`summarize`/`data_quality` call re-scanned the whole tab, so one turn that
+ran `summarize`, then `get_row`, then `search_rows` scanned the same 412 rows three times, each
+scan paging up to 20 000 rows. The cache had existed since the grid landed; the agent simply never
+used it. (Earlier revisions of `CLAUDE.md` and the `migrationbot-sheets-testing` skill described a
+`sheet_records` Postgres table fronted by `read.py:_ensure_sheet_synced()` and
 `sheets/sync.py:sync_sheet_to_db()`. No such table, model or module has ever existed in this
 repository; both documents have been corrected.)
 
-The dashboard changed the read profile enough to need one. Chat issues one or two scans per
-question; a grid would re-scan the whole tab on every sort, filter, page and panel switch, and each
-scan pages up to 20 000 rows. `sheets/rows_cache.py:get_tab_matrix()` therefore caches
+`read.py:_cached_matrix` is the entry point, and it imports `get_tab_matrix` *inside the function*
+because `rows_cache` imports `_fetch_all_rows` from `read.py` — module-scope would be a cycle. It
+replaced a verbatim `get_header_row` + `_fetch_all_rows` pair in `search_rows`, `summarize` and
+`run_data_quality_check`, which already computed exactly the four arguments `get_tab_matrix` takes.
+
+`get_row` is the interesting one: it previously cost **three** Sheets calls — a full scan of the ID
+column via `find_row_num`, then the row, then the headers — and now costs zero when the cache is
+warm. That matters more than the count suggests, because calling `get_row` in a loop is the
+model's characteristic mistake and the reason CLAUDE.md warns against it. The cached lookup keys
+off `primary_id_position` (a column letter, via `read.py:_column_letter_to_index`) rather than
+`primary_id_column` (a header name), so it resolves to exactly the cell the uncached path would;
+the two can disagree on a mis-detected schema, and a cache that quietly answers with a *different*
+row is far worse than a slow one. ID matching stays `.strip().upper()`, as `find_row_num` did.
+
+**`get_row_raw` is deliberately not cached.** It serves the write path's audit pre-read, and a
+60-second-old "before" value would put a wrong `old_value` in the audit trail — and therefore a
+wrong value behind every undo (§10.5). `get_bulk_rows_raw` and `find_row_num` are likewise untouched.
+
+`sheets/rows_cache.py:get_tab_matrix()` caches
 `{headers, rows, truncated}` as JSON under `migrationbot:rows:{spreadsheet_id}:{tab}` with a
 **60-second** TTL — short on purpose, so it collapses one person's burst of clicks without serving
 stale data to someone who edited the sheet directly in Google.
@@ -1273,9 +1336,20 @@ is still accurate. Without this the grid would keep serving pre-write values for
 after an edit landed, which reads to the user as the write having silently failed.
 
 Every Redis failure in this module is logged and swallowed in favour of a live Sheets scan — a
-cache is an optimisation, and Redis being down must not take the dashboard with it. This is
-deliberately *not* the durable, reconciled read model that a `sheet_records` table would be; that
-remains unbuilt.
+cache is an optimisation, and Redis being down must not take the dashboard with it.
+
+**Redis timeouts are bounded, and the bound is small**: `socket_connect_timeout=0.5`,
+`socket_timeout=2.0`, `retry_on_timeout=False`. With the client defaults, a Redis outage cost about
+**8 seconds per call** in connect retries before falling back. That was tolerable when only the
+dashboard used this — once per page load — and is not tolerable now that the agent reads come
+through here too: eight tool calls in one turn would have spent over a minute achieving nothing
+while the WebSocket looked hung. Since every failure path here degrades to a live scan anyway, a
+long timeout buys nothing but a longer wait before doing the work regardless. The local test suite
+made this visible before production did — `tests/test_sheets` went from 1 second to 52 the moment
+agent reads started touching Redis that is not running here.
+
+This is deliberately *not* the durable, reconciled read model that a `sheet_records` table would
+be; that remains unbuilt.
 
 ---
 
@@ -2058,6 +2132,7 @@ figure already on screen, so it is left as a deliberate follow-up rather than fo
 | `GOOGLE_CLIENT_ID` / `_SECRET` | `sheets/client.py:build_sheets_service`, `auth.ts` (`GoogleProvider` config) | mock values (`config.py:Settings`) |
 | **`JWT_SECRET`** | `deps.py:get_current_user`, `chat.py:authenticate_ws_user`, `auth.ts:getJwtSecret` (and the `secret:` option, read from `process.env` directly — §4.2) | **required — no default on either side** (`config.py:Settings`; `auth.ts:getJwtSecret` throws if unset, at request time) |
 | `ALLOW_DEV_AUTH` | `deps.py:get_current_user`, `chat.py:authenticate_ws_user` | `false` (`config.py:Settings`) — only set true for local dev/tests |
+| `STREAM_RESPONSES` | `agentic_loop.py:run_agentic_loop` via `core/streaming.py:complete` | `false` (`config.py:Settings`) — leave off until a streamed turn has been seen to perform a real write (§8.3) |
 | `DEFAULT_ROLE` | `permissions.py:get_user_permissions` | `"viewer"` (`config.py:Settings`) — fail-closed default when no permissions row applies |
 | **`CORS_ORIGINS`** | `main.py` (`CORSMiddleware` registration) | **required — no default** (`config.py:Settings`) |
 | **`ADMIN_EMAILS`** | `config.py:Settings.admin_emails_list` | **required — no default** (`config.py:Settings`) |
