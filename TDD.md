@@ -124,9 +124,13 @@ relies on `metadata.create_all` (`db/engine.py:init_db`).
 | `permissions` | `models/permission.py:Permission` | `role` default `"editor"`; `allowed_fields` default `["*"]`; `denied_operations` default `[]`; unique `(user_id, project_id)`; CHECK `role IN ('admin','editor','viewer')` |
 | `sessions` | `models/session.py:Session` | UUID PK; `active_tab`; `project_id` `ON DELETE SET NULL` |
 | `audit_logs` | `models/audit_log.py:AuditLog` | `old_value`/`new_value` Text; `args_json` JSONB; `result_ok`; generated `created_month` |
+| `person_aliases` | `models/person_alias.py:PersonAlias` | unique `(project_id, alias, canonical)` — one alias may name several people (§10.3) |
+| `messages` | `models/message.py:Message` | `session_id` FK `ON DELETE CASCADE`; `role`; nullable `content`; `tool_calls` JSONB; `tool_call_id`; ordered by `id` (§4.3) |
 
-**Postgres holds no spreadsheet data.** Every WRICEF row is read live from Google Sheets. The
-database exists for identity, authorisation, session state, and the audit trail only.
+**Postgres holds no spreadsheet data.** Every tracker row is read live from Google Sheets. The
+database exists for identity, authorisation, session state, the audit trail, and — since the
+chat-persistence change — the conversation itself. `messages` stores what was *said about* the
+sheet, never a copy of the sheet.
 
 ---
 
@@ -249,8 +253,39 @@ function: the `project_id` query parameter; else the user's most recently active
 project; else the first `is_active` project. All three failing closes the socket.
 
 A `sessions` row is loaded or created with `active_tab` = `project.default_tab` or `"SD"`
-(`chat.py:websocket_chat_endpoint`). Conversation history is **in-process only**, initialised
-empty per connection and reassigned each turn — nothing persists chat history.
+(`chat.py:websocket_chat_endpoint`). Conversation history **is persisted**, to `messages` keyed by
+that session (§2). It previously was not: `message_history = []` was initialised empty per
+connection and reassigned each turn, and nothing wrote it anywhere.
+
+That produced a confusing failure rather than an obvious one. The browser's Zustand store is
+created at module scope, so it survives a socket drop — after the 3-second reconnect (§9.3) the
+*user* still saw the entire conversation on screen while the *model* had forgotten all of it. The
+next follow-up ("what about the second one?") was answered against an empty history, and nothing
+on screen explained why. A blank chat would have been the kinder bug.
+
+On connect, `db/message_store.py:load_history` restores the session's messages and `chat.py` sends
+them to the client as a `history` frame (§9.2). Two different limits apply and they are
+deliberately not the same number (`core/history.py`):
+
+- `MAX_REPLAY_MESSAGES = 200` — what the **user** gets back. Generous: it is one indexed query, and
+  a conversation that reappears half-missing reads as data loss.
+- `MAX_MODEL_MESSAGES = 24` — what the **model** is given as context. The loop already swaps in a
+  compact system prompt from iteration 1 to hold token use down (§8.1); handing it an unbounded
+  history would give that saving straight back on the next turn, and on every turn after it, at a
+  cost that grows with the conversation.
+
+`core/history.py:trim_for_model` does the bounding, and it is not a slice. A `tool` message is only
+valid as a reply to the `assistant` message whose `tool_calls` it answers, and the API rejects the
+request outright when that parent is missing — so `messages[-24:]` fails whenever the cut lands
+mid-turn, which is common on a tool-heavy conversation and never in a short manual test. The window
+is opened at the nearest `user` message instead, falling back to skipping leading orphan `tool`
+messages when the window contains no whole turn.
+
+Only the *delta* is written each turn. `run_agentic_loop` returns the whole accumulated history, so
+persisting its return verbatim would rewrite the entire conversation on every message and grow
+quadratically. The system prompt is never stored: it is rebuilt per turn from the live project, tab
+and schema, and a stored copy would come back describing a sheet that may since have been
+re-detected.
 
 ---
 
@@ -861,6 +896,7 @@ Any other `type` is ignored rather than misread as chat text (`chat.py:websocket
 | `type` | Payload | Emitted by | Client consumer | Effect |
 |---|---|---|---|---|
 | `connection_ok` | `{type, user_email, project_name, active_tab}` | `chat.py:websocket_chat_endpoint` | `useWebSocket.ts:connect` (`onmessage`) | `setSessionInfo` applies all three fields |
+| `history` | `{type, messages: [{role, content, toolCalls}]}` | `chat.py:websocket_chat_endpoint` | `useWebSocket.ts:connect` (`onmessage`) | `setMessages`, **only into an empty store** — see below |
 | `assistant` | `{type, content, done: true}` | `agentic_loop.py:run_agentic_loop` | `useWebSocket.ts:connect` (`onmessage`) | appends to the most recent assistant message |
 | `tool_start` | `{type, tool, args}` | `agentic_loop.py:run_agentic_loop` | `useWebSocket.ts:connect` (`onmessage`) | pushes `{name, args, status:"running"}` |
 | `tool_result` | `{type, tool, result}` | `agentic_loop.py:run_agentic_loop` | `useWebSocket.ts:connect` (`onmessage`) | marks the matching running entry `"completed"` or `"failed"` per `result.ok` |
@@ -876,6 +912,25 @@ emits.
 `updateLastMessage` targets by explicit `targetId` or most-recent-role rather than always the final
 element (`useChatStore.ts:updateLastMessage`), so interleaved `assistant` and `tool_*` frames no
 longer corrupt each other.
+
+The `history` frame is sent once, right after `connection_ok`, and only when the session has
+stored messages. It carries the *display* shape — one bubble per turn, tool calls folded into the
+assistant bubble that made them — not the wire shape the model sees. Those differ by more than
+field names: one assistant bubble on screen is several wire messages (one per round of tool calls,
+one `tool` message per result, then a final message carrying the prose), so replaying them
+one-to-one would render a single answer as three or four bubbles, most of them blank.
+`core/history.py:to_display` performs the fold.
+
+**The client applies it only when its store is empty**, which is precisely the page-reload case.
+The store is created at module scope and therefore survives a socket drop, so after a reconnect the
+browser already holds the whole conversation *including a message sent but not yet answered* — and
+that one is not persisted yet. Writing the server's copy over it would delete exactly the message
+the user is waiting on. An empty store, by contrast, can only mean a fresh load. This is why the
+guard is "is the store empty" rather than a first-connection flag: it is a statement about what the
+client actually knows, not about which connection attempt this is.
+
+Sending it as its own frame rather than folding it into `connection_ok` means a client that does
+not understand it ignores it and keeps whatever it has, which is the correct degradation.
 
 ### 9.3 Lifecycle
 
@@ -1096,6 +1151,55 @@ matters; the samples exist so the reader knows where to look) and `MAX_NAMES_FOR
 past which `duplicate_people` is skipped rather than allowed to run `suggest_merges`'
 all-pairs comparison over thousands of names. `truncated` is echoed through from the row cache,
 because past `_MAX_SCAN_ROWS` every count is a floor and not a total.
+
+### 10.5 Undo
+
+| Method | Path | Purpose | Handler |
+|---|---|---|---|
+| POST | `/api/audit/{id}/undo` | revert one audited write, by entry id | `audit.py:undo_write` |
+| POST | `/api/audit/undo-cell` | revert the caller's latest write to one cell | `audit.py:undo_latest_for_cell` |
+
+`audit_logs` has recorded `old_value` and `new_value` on every mutation since Phase 1 and nothing
+read them back. The whole feature is therefore a lookup and an inverse write: no new state, no new
+table, and no new way for a cell to change. The reversal is enqueued through the ordinary producer,
+so it is throttled at 1 req/sec, audited as its own entry, and invalidates the row cache exactly
+like any other edit (§11.1). An undo is a write; treating it as more than that is how a second
+write path gets built by accident.
+
+Ordering mirrors `dashboard.py:patch_row` exactly, and for the same reason: a write path that skips
+`PermissionChecker` is a privilege-escalation bug. The `args` shape is load-bearing — the
+field-level gate reads `args["updates"][*]["field"]` (§6.2), so a differently-shaped dict would
+silently disable field restrictions while still appearing to check permissions.
+
+**The guard is the point.** `audit.py:_verify_unchanged` reads the cell first and refuses with 409
+unless it still holds the value the entry wrote. An audit row records what happened *then*; between
+then and now someone else may have edited the same cell, and blindly restoring `old_value` would
+destroy their edit while reporting success — the person undoing would never learn of it, the person
+overwritten would never learn of it, and the audit trail would show a legitimate-looking
+correction. A read failure refuses too, with 503: a guard that fails open is not a guard, and the
+cost of refusing is that someone retries in a minute. `None` and `""` compare equal, so undoing a
+write that filled a blank cell is allowed rather than mistaken for a mismatch.
+
+**Scope limits, all deliberate:**
+
+- `update_cell` and `bulk_update` only. Undoing an `add_row` means deleting a row, and nothing in
+  this system deletes anything; `format_row` records a synthetic before-value that was never a real
+  cell. A `bulk_update` audit row describes one row and one field — same as `update_cell` — so its
+  inverse is an ordinary single-cell write, not a second bulk operation.
+- Failed writes are refused: nothing landed, and "reverting" one would *write* a value the sheet
+  never had, dressed up as a correction.
+- Scoped to the entry's own author, or a config admin, matching `api/jobs.py` — and 404 rather than
+  403, because confirming that someone else's write exists is itself a disclosure. RBAC still runs
+  on top: owning a write does not grant the right to write that field again.
+
+`undo-cell` exists because the chat write ledger — where someone notices a mistake seconds after
+making it, which is the likeliest place an undo is wanted at all — cannot name an audit row.
+`audit_logs` records no job id, the ledger is keyed by one, and there is no column joining them;
+adding one is not possible without migration tooling, since `create_all` brings up new tables but
+never alters existing ones (§15.2). Resolving by cell is also the more honest operation for that
+surface: the ledger row says "W-1 · Dev Status → Completed", the user means "put that cell back",
+and if it has been written twice since, the latest write is the one they mean. Everything after
+resolution is the same code path, guard included.
 
 ---
 
@@ -1632,6 +1736,28 @@ Loading state is derived from a tab-tagged payload (`{key, data}`) rather than t
 instance of the lint debt noted in §14.7 — and it could drift out of step with the payload, leaving
 the panel showing one tab's counts under another tab's name. Deriving it makes both problems
 structurally impossible; the file's lint count is unchanged from `main`.
+
+### 14.9 Undo controls
+
+Two surfaces, because the two moments are different. `/admin/audit` gets a per-row Undo button; the
+chat write ledger (`components/WriteLedger.tsx`) gets one on applied entries, which is where a
+mistake is noticed seconds after it is made.
+
+Both render the control **only where the server would accept it** — an applied write, with a named
+field, from `update_cell` or `bulk_update`. A queued write has not landed, a failed one changed
+nothing, and an added row has no cell to put back. Showing the button on those and letting the
+request fail would manufacture an error the user could have been spared; showing it disabled would
+raise a question the row cannot answer.
+
+Refusals are shown verbatim rather than paraphrased. When the guard declines, its message names
+what the cell reads *now* — that is the entire reason for asking, so flattening it to "undo failed"
+would discard the only useful part. In `/admin/audit` the note sits above the table and survives the
+re-read; in chat it is appended as a `system` message, so it stays in the transcript instead of
+disappearing with a toast.
+
+The list is re-read after a successful undo rather than patched in place, because the reversal is
+not a state change to the row above it — it is a new queued write that will appear as its own audit
+entry moments later.
 
 ---
 

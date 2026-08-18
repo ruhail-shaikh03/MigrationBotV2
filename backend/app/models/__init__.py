@@ -5,5 +5,6 @@ from app.models.permission import Permission
 from app.models.audit_log import AuditLog
 from app.models.session import Session
 from app.models.person_alias import PersonAlias
+from app.models.message import Message
 
-__all__ = ["Base", "User", "Project", "Permission", "AuditLog", "Session", "PersonAlias"]
+__all__ = ["Base", "User", "Project", "Permission", "AuditLog", "Session", "PersonAlias", "Message"]

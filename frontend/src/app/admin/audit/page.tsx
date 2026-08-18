@@ -3,7 +3,7 @@
 import { useSession } from "next-auth/react"
 import { useEffect, useState } from "react"
 import { 
-  ShieldCheck, Search, Filter, RefreshCw, AlertCircle, CheckCircle
+  ShieldCheck, Search, Filter, RefreshCw, AlertCircle, CheckCircle, Undo2
 } from "lucide-react"
 
 interface AuditLog {
@@ -35,6 +35,46 @@ export default function AdminAudit() {
   const [userEmail, setUserEmail] = useState("")
   const [toolName, setToolName] = useState("")
   const [ricefwId, setRicefwId] = useState("")
+  const [undoing, setUndoing] = useState<number | null>(null)
+  const [undoNote, setUndoNote] = useState("")
+
+  /**
+   * Queue the inverse of one write.
+   *
+   * The reversal is an ordinary queued write — same producer, same worker, same 1/sec —
+   * so it appears in this very table as its own entry moments later. That is why the list
+   * is re-read on success rather than patched in place: the undo is not a state change to
+   * the row above, it is a new row.
+   *
+   * A refusal is shown verbatim. The server declines when the cell no longer holds the
+   * value the entry wrote, and its message says what the cell says now — which is the
+   * whole point of asking, so paraphrasing it as "undo failed" would throw away the only
+   * useful part.
+   */
+  const undoEntry = async (a: AuditLog) => {
+    setUndoing(a.id)
+    setUndoNote("")
+    try {
+      const res = await fetch(`/api/audit/${a.id}/undo`, {
+        method: "POST",
+        headers: {
+          "Authorization": `Bearer ${apiToken}`,
+          "X-Google-Access-Token": session?.googleAccessToken || "",
+        },
+      })
+      const body = await res.json().catch(() => ({}))
+      if (!res.ok) {
+        setUndoNote(body.detail || "Could not undo that write.")
+        return
+      }
+      setUndoNote(`Queued: ${a.ricefw_id} · ${a.field} back to "${body.restoring || "blank"}".`)
+      await fetchAudits()
+    } catch {
+      setUndoNote("Could not reach the server to undo that write.")
+    } finally {
+      setUndoing(null)
+    }
+  }
 
   const fetchAudits = async () => {
     try {
@@ -170,9 +210,17 @@ export default function AdminAudit() {
         </div>
       ) : (
         <div className="panel rounded-xl border border-[var(--color-rule)] overflow-hidden">
+          {/* The outcome of the last undo, kept on screen rather than toasted. A refusal
+              says what the cell reads now and why reverting would discard someone's edit;
+              that is worth reading twice, and worth still being there after a re-read. */}
+          {undoNote && (
+            <p className="border-b border-[var(--color-rule)] bg-ink-850 px-4 py-2.5 text-xs text-ink-300">
+              {undoNote}
+            </p>
+          )}
           <div className="overflow-x-auto">
-            {/* Seven columns including an old→new diff; needs the most room. */}
-            <table className="w-full min-w-[1080px] text-left border-collapse">
+            {/* Eight columns including an old→new diff; needs the most room. */}
+            <table className="w-full min-w-[1180px] text-left border-collapse">
               <thead>
                 <tr className="border-b border-[var(--color-rule)] bg-ink-850">
                   <th className="label-micro whitespace-nowrap p-4">Timestamp</th>
@@ -182,6 +230,7 @@ export default function AdminAudit() {
                   <th className="label-micro whitespace-nowrap p-4">Field Targeted</th>
                   <th className="label-micro whitespace-nowrap p-4">Changes (Old → New)</th>
                   <th className="label-micro whitespace-nowrap p-4">Result</th>
+                  <th className="label-micro whitespace-nowrap p-4">Undo</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-[var(--color-rule)] text-xs">
@@ -224,6 +273,25 @@ export default function AdminAudit() {
                           <AlertCircle className="h-3 w-3" />
                           ERROR
                         </span>
+                      )}
+                    </td>
+                    <td className="p-4">
+                      {/* Only where there is something to put back. A failed write changed
+                          nothing, a read has no before-value, and add_row/format_row would
+                          need a deletion — the server refuses all of them, so rendering the
+                          control would only manufacture an error. */}
+                      {a.result_ok && a.field && (a.tool_name === "update_cell" || a.tool_name === "bulk_update") ? (
+                        <button
+                          type="button"
+                          onClick={() => undoEntry(a)}
+                          disabled={undoing !== null}
+                          className="btn btn-ghost px-2 py-1 text-[11px] disabled:opacity-40"
+                        >
+                          <Undo2 className="h-3 w-3" />
+                          {undoing === a.id ? "Undoing…" : "Undo"}
+                        </button>
+                      ) : (
+                        <span className="text-ink-600">—</span>
                       )}
                     </td>
                   </tr>

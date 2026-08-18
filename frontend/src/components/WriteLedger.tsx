@@ -40,9 +40,16 @@ const STATE_LABEL: Record<LedgerState, string> = {
 export default function WriteLedger({
   entries,
   onDismiss,
+  onUndo,
+  undoing,
 }: {
   entries: LedgerEntry[]
   onDismiss: () => void
+  /** Absent when the surface cannot revert — the control is then simply not rendered,
+   *  rather than shown disabled with no way to find out why. */
+  onUndo?: (entry: LedgerEntry) => void
+  /** jobId currently being reverted, so only that row's control shows as busy. */
+  undoing?: string | null
 }) {
   if (entries.length === 0) return null
 
@@ -89,6 +96,22 @@ export default function WriteLedger({
             >
               {STATE_LABEL[e.state]}
             </span>
+
+            {/* Only on applied writes with a named field. A queued one has not landed yet,
+                a failed one changed nothing, and a write with no field (add_row) has no
+                cell to put back — the server refuses all three, so offering the control
+                would only produce an error the user could have been spared. */}
+            {onUndo && e.state === "applied" && e.field && (
+              <button
+                type="button"
+                onClick={() => onUndo(e)}
+                disabled={undoing === e.jobId}
+                className="btn btn-ghost px-2 py-0.5 text-[11px] disabled:opacity-40"
+              >
+                <Undo2 className="h-3 w-3" />
+                {undoing === e.jobId ? "Undoing…" : "Undo"}
+              </button>
+            )}
 
             {e.state === "failed" && e.error && (
               <p className="w-full text-[12px] leading-relaxed text-failed">{e.error}</p>
