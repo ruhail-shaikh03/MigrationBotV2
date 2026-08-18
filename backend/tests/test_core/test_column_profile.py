@@ -11,7 +11,9 @@ know that any customer has a "University" column, and neither must its tests.
 
 import pytest
 
-from app.core.column_profile import MIN_SAMPLE, people_confidence, profile_column
+from app.core.column_profile import (
+    MAX_SAMPLE, MIN_SAMPLE, people_confidence, profile_column,
+)
 
 
 def _rep(values, times):
@@ -62,11 +64,47 @@ def test_unique_identifiers_are_not_people():
     assert people_confidence(profile_column([f"SLCM-{i:04d}" for i in range(400)])) == "unlikely"
 
 
-def test_low_cardinality_enum_abstains_rather_than_being_rejected():
-    """Documents the known limit: a team of eight and a workflow of eight states are
-    statistically identical. Only meaning separates them, which is why the LLM stays in
-    the loop. Abstaining is not a vote — it neither applies a role nor blocks one."""
-    assert people_confidence(profile_column(_rep(ENUM_LABELS, 400))) == "abstain"
+def test_a_short_workflow_vocabulary_is_never_read_as_a_roster():
+    """Four labels are four whether the tab has 120 rows or 400.
+
+    This used to depend on the row count rather than the values: at 400 rows the
+    cardinality *ratio* fell under the floor and the column was rejected, but the same four
+    labels in a 120-row tab measured 0.033, passed every criterion, and came back "likely".
+    An absolute distinct-value count is what makes the answer a statement about the column.
+    """
+    for rows in (120, 400):
+        assert people_confidence(profile_column(_rep(ENUM_LABELS, rows))) != "likely", rows
+
+
+def test_a_longer_enum_abstains_rather_than_being_rejected():
+    """Abstaining is not a vote — it neither applies a role nor blocks one, and it is the
+    honest answer where shape runs out. Eight states clear the distinct-count floor exactly
+    as a team of eight would."""
+    eight_states = ENUM_LABELS + ["Cancelled", "In Review", "Deployed", "Blocked"]
+    assert people_confidence(profile_column(_rep(eight_states, 400))) == "abstain"
+
+
+def test_a_team_of_eight_is_still_told_apart_from_a_workflow_of_eight():
+    """The two are not in fact statistically identical, as an earlier note here claimed:
+    names run to 2.4 tokens and 14 characters, state labels to 1.4 and 8. Distinct count
+    and repetition cannot separate them; token count and length can."""
+    eight_states = ENUM_LABELS + ["Cancelled", "In Review", "Deployed", "Blocked"]
+    assert people_confidence(profile_column(_rep(PEOPLE, 400))) == "likely"
+    assert people_confidence(profile_column(_rep(eight_states, 400))) != "likely"
+
+
+def test_a_very_small_team_is_not_promoted_and_that_is_a_known_limit():
+    """A three-person project is real, and the profiler calls it "unlikely" — a stronger
+    claim than the evidence supports, because `distinct` and `cardinality` measure the same
+    property and both fail, so one characteristic is counted as two.
+
+    Left alone deliberately. No caller distinguishes "unlikely" from "abstain" — both
+    `_structural_fallback` and the health check test for `== "likely"` — so the only thing
+    a further criterion would buy is a more accurate label that nothing reads. The column
+    is still reachable through the keyword and LLM paths (§7.5), which is the point of the
+    profiler being one signal rather than the decision.
+    """
+    assert people_confidence(profile_column(_rep(PEOPLE[:3], 400))) != "likely"
 
 
 def test_small_samples_abstain():
@@ -89,6 +127,61 @@ def test_empty_column_abstains():
 def test_profile_fields_are_computed_independently(field):
     """Signals stay separable so a non-Latin sheet can lean on the script-agnostic ones."""
     assert isinstance(getattr(profile_column(_rep(PEOPLE, 100)), field), float)
+
+
+# --- scale ------------------------------------------------------------------
+#
+# cardinality is distinct-over-total, so without a bounded sample the same column is
+# recognised on a small tracker and rejected on a large one — the profiler would quietly
+# get worse as a sheet grew, which is the failure mode hardest to notice.
+
+_MANY_PEOPLE = [f"{f} {l}" for f in
+                ["Muhammad", "Madiha", "Huzaima", "Taymoor", "Neeha", "Amna", "Arjmand",
+                 "Babar", "Sara", "Bilal", "Zainab"]
+                for l in ["Zeshan Ayub", "Shah Bukhari", "Ather", "Ahmed", "Nehal",
+                          "Korejo", "Bano", "Ali", "Iqbal", "Qamar", "Malik"]][:33]
+
+
+@pytest.mark.parametrize("rows", [412, 2000, 20000, 100000])
+def test_a_roster_is_recognised_at_any_tab_size(rows):
+    """33 people in 20 000 rows measures 0.0017 unsampled, well under the 0.02 floor."""
+    assert people_confidence(profile_column(_rep(_MANY_PEOPLE, rows))) == "likely"
+
+
+@pytest.mark.parametrize("rows", [2000, 20000, 100000])
+def test_the_sample_is_capped_and_the_profile_stops_changing_with_size(rows):
+    profile = profile_column(_rep(_MANY_PEOPLE, rows))
+    assert profile.n == MAX_SAMPLE
+    assert round(profile.cardinality, 4) == round(len(_MANY_PEOPLE) / MAX_SAMPLE, 4)
+
+
+def test_sampling_does_not_alias_on_periodic_data():
+    """Sheet data is periodic — grouped by module, assigned round-robin. Taking every Nth
+    row where N shares a factor with that period sees a fraction of the distinct values:
+    33 names sampled every third row yields 11, and a cardinality a third of the truth."""
+    profile = profile_column(_rep(_MANY_PEOPLE, 3000))
+    assert profile.cardinality * profile.n > len(_MANY_PEOPLE) * 0.9
+
+
+def test_the_same_column_profiles_identically_twice():
+    """A verdict that changed between two reads of an unchanged sheet would be
+    untraceable to anything, so the sample is drawn from a fixed seed."""
+    column = _rep(_MANY_PEOPLE, 5000)
+    assert profile_column(column) == profile_column(column)
+
+
+@pytest.mark.parametrize("values", [UPPER_CODES, FREE_TEXT])
+def test_sampling_does_not_start_admitting_non_people_at_scale(values):
+    assert people_confidence(profile_column(_rep(values, 20000))) != "likely"
+
+
+def test_unique_per_row_identifiers_stay_rejected_at_scale():
+    assert people_confidence(profile_column([f"W-{i}" for i in range(20000)])) == "unlikely"
+
+
+def test_a_column_shorter_than_the_cap_is_not_sampled_at_all():
+    column = _rep(PEOPLE, 100)
+    assert profile_column(column).n == 100
 
 
 # --- detection ---------------------------------------------------------------

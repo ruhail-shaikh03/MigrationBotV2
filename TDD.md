@@ -664,9 +664,29 @@ a sheet offers — the next one says `Owner`, `Assigned To`, `PIC`, or a header 
 and the failure repeats one sheet at a time.
 
 `core/column_profile.py` replaces that with value shape, which is the same on every sheet in every
-domain. It never sees a column name: `profile_column(values)` returns `n`, `cardinality`,
+domain. It never sees a column name: `profile_column(values)` returns `n`, `distinct`, `cardinality`,
 `mean_tokens`, `mean_length`, `alpha_ratio`, `title_case_ratio` and `repeat_ratio`, and
-`people_confidence` reduces those to `"likely" | "abstain" | "unlikely"`. Thresholds were fitted
+`people_confidence` reduces those to `"likely" | "abstain" | "unlikely"`.
+
+Two of those are corrections to the original design, both made because a criterion was measuring
+the *sheet* rather than the *column*:
+
+- **The sample is capped at `MAX_SAMPLE` (1000) values, drawn pseudo-randomly from a fixed seed.**
+  `cardinality` is distinct-over-total, so a column naming 33 people measures 0.08 on a 412-row tab
+  and 0.0017 on a 20 000-row one — the same column, on the same kind of sheet, recognised on the
+  small tracker and silently rejected on the large one. Random rather than every-Nth because sheet
+  data is periodic (grouped by module, assigned round-robin) and a stride sharing a factor with that
+  period aliases: 33 names sampled every third row yields 11 distinct values and a third of the true
+  cardinality. The seed is fixed so a verdict cannot change between two reads of an unchanged sheet.
+- **`distinct >= MIN_DISTINCT` (8) replaced the *lower* bound on `cardinality`.** A roster has a long
+  tail; a workflow has a short fixed list, and four statuses are four whether the tab has 120 rows or
+  100 000. The ratio floor stated that idea in a scale-dependent way and got it wrong in both
+  directions: "Completed / Not Started / In Testing / Hold" came back **likely** in a 120-row tab
+  (0.033 — every criterion passed), while a column naming eight people was rejected in a large one.
+  Only the ratio's *upper* bound survives, doing the different job of rejecting a unique value per row.
+
+Every fixture now returns the same verdict at 120, 412 and 20 000 rows, which is the property the
+whole approach depends on. Thresholds were fitted
 against every populated column of both trackers:
 
 ```
@@ -1165,7 +1185,7 @@ not say how bad it is: three rows without a deadline is a footnote, 362 means th
 being used and every date-derived number on the analytics panel is quietly partial.
 
 The checks are `no_id`, `duplicate_id`, `no_deadline`, `unreadable_date`, `unassigned`,
-`duplicate_people` and `no_status`. Every one of them is driven by `schema_config` — no header
+`duplicate_people`, `no_status` and `unmapped_people`. Every one of them is driven by `schema_config` — no header
 string is spelled in the module — so a non-SAP tracker gets the same treatment.
 
 **`core/data_quality.py:DataQualityChecker` is deliberately not reused here**, contrary to the
@@ -2102,8 +2122,13 @@ remaining gap. What follows is what is still not generic:
   the migration path — there is no automatic backfill. This now also governs `people_columns`
   (§7.4): an un-migrated project resolves to the single synthesised role derived from its legacy
   `assignee_column`, so a second resource column stays invisible until someone re-detects that tab
-  or adds it by hand in the role editor. The degradation is silent — the UI cannot distinguish
-  "this sheet has one resource column" from "this project was never re-detected". This is now the
+  or adds it by hand in the role editor. The degradation used to be silent — the UI could not distinguish
+  "this sheet has one resource column" from "this project was never re-detected", so nobody had any
+  reason to go and look. The health panel's `unmapped_people` check (§10.4) closes that: it profiles
+  every column the schema has *not* claimed and reports the ones whose values look like people, which
+  turns an invisible gap into a line on a screen pointing at the role editor. It is the same profiler
+  detection uses, applied to the sheet as it stands rather than as it was onboarded, so it stays
+  generic — it works on a tracker whose header says Owner, PIC, or nothing recognisable in English. This is now the
   *only* reason a people column goes missing: detection itself no longer depends on recognising
   English role vocabulary (§7.5), so a re-detected tab finds people columns whatever they are
   called. Re-detection remains a deliberate admin act — `detect-metadata` returns a config and
