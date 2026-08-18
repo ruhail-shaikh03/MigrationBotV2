@@ -168,6 +168,102 @@ def test_an_empty_tab_produces_no_division_error():
     assert _check(report, "no_id")["severity"] == "ok"
 
 
+# --- roles the schema never learned about --------------------------------------
+#
+# The failure being made visible: detection reads value shape now, so a re-detected tab
+# finds its people columns whatever they are called — but nothing re-detects an existing
+# project, and until someone does, the UI cannot tell "this sheet has one resource column"
+# from "this sheet was never re-detected" (TDD §16.3). Nobody had a reason to go and look.
+#
+# Fixtures are named by shape, never by the sheet they came from.
+
+_NAMES = ["Muhammad Zeshan Ayub", "Madiha Shah Bukhari", "Huzaima Ather", "Taymoor Ahmed",
+          "Neeha Nehal", "Amna Lateef Korejo", "Arjmand Bano", "Babar Ali"]
+_CODES = ["AROR", "AWKUM", "BNWU", "CUVAS", "EUM", "GUDGK", "HSA"]
+_STATES = ["Completed", "Not Started", "In Testing", "Hold"]
+
+
+def _tab(mapped_people=(), extra_columns=None):
+    """A tab of 120 rows with an ID, a status, a mapped-or-not people column and extras."""
+    columns = {"Second Owner": _NAMES, "Dev Status": _STATES}
+    columns.update(extra_columns or {})
+    headers = ["WRICEF No."] + list(columns)
+    rows = [
+        {"WRICEF No.": f"W-{i}", **{h: v[i % len(v)] for h, v in columns.items()}}
+        for i in range(120)
+    ]
+    schema = {
+        "primary_id_column": "WRICEF No.",
+        "status_column": "Dev Status",
+        "people_columns": [
+            {"key": h.lower().replace(" ", "_"), "label": h, "header": h} for h in mapped_people
+        ],
+    }
+    return headers, rows, schema
+
+
+def test_a_person_shaped_column_nobody_mapped_is_flagged():
+    report = assess_tab(*_tab())
+    check = _check(report, "unmapped_people")
+    assert check["count"] == 1
+    assert check["samples"][0]["column"] == "Second Owner"
+
+
+def test_the_same_column_is_silent_once_it_is_mapped():
+    report = assess_tab(*_tab(mapped_people=["Second Owner"]))
+    assert _check(report, "unmapped_people")["count"] == 0
+
+
+def test_nothing_mapped_at_all_is_an_error_not_a_warning():
+    """Every person-shaped number on the tab is empty rather than partial."""
+    assert _check(assess_tab(*_tab()), "unmapped_people")["severity"] == "error"
+
+
+def test_a_second_missed_column_beside_a_mapped_one_is_a_warning():
+    headers, rows, schema = _tab(
+        mapped_people=["Developer Name"], extra_columns={"Developer Name": _NAMES[::-1]}
+    )
+    assert _check(assess_tab(headers, rows, schema), "unmapped_people")["severity"] == "warning"
+
+
+def test_severity_does_not_soften_just_because_the_sheet_is_wide():
+    """A proportion is the wrong measure: two missed columns out of forty is 5% of the
+    columns and 100% of the missing assignments."""
+    padding = {f"Note {i}": [""] for i in range(36)}
+    report = assess_tab(*_tab(extra_columns=padding))
+    assert _check(report, "unmapped_people")["severity"] == "error"
+
+
+def test_a_status_column_is_not_mistaken_for_people():
+    assert _check(assess_tab(*_tab(mapped_people=["Second Owner"])), "unmapped_people")["count"] == 0
+
+
+def test_short_uppercase_codes_are_not_flagged():
+    headers, rows, schema = _tab(mapped_people=["Second Owner"], extra_columns={"Site": _CODES})
+    assert _check(assess_tab(headers, rows, schema), "unmapped_people")["count"] == 0
+
+
+def test_free_text_is_not_flagged():
+    descriptions = [f"Migrate the {w} report from legacy into the new system" for w in
+                    ("billing", "hostel", "transcript", "admission", "payroll")]
+    headers, rows, schema = _tab(
+        mapped_people=["Second Owner"], extra_columns={"Description": descriptions}
+    )
+    assert _check(assess_tab(headers, rows, schema), "unmapped_people")["count"] == 0
+
+
+def test_a_tab_too_short_to_judge_flags_nothing():
+    """Below the profiler's minimum sample the statistics are noise, not evidence."""
+    headers = ["WRICEF No.", "Second Owner"]
+    rows = [{"WRICEF No.": f"W-{i}", "Second Owner": _NAMES[i]} for i in range(5)]
+    assert _check(assess_tab(headers, rows, {}), "unmapped_people")["count"] == 0
+
+
+def test_the_detail_says_what_the_missing_column_costs():
+    check = _check(assess_tab(*_tab()), "unmapped_people")
+    assert "workload" in check["detail"] and "Admin" in check["detail"]
+
+
 # --- helpers -----------------------------------------------------------------
 
 def _check(report, key):

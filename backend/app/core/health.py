@@ -26,8 +26,11 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 from app.core.aliases import suggest_merges
+from app.core.column_profile import people_confidence, profile_column
 from app.core.people import count_observed_names, parse_date
-from app.core.schema import bind_columns, get_due_column, get_people_columns, resolve_header
+from app.core.schema import (
+    bind_columns, get_due_column, get_effort_columns, get_people_columns, resolve_header,
+)
 
 # suggest_merges compares every distinct name against every other. That is nothing at the
 # 26 names a real tracker has, and 25 million comparisons on a 5000-name tab. Past this
@@ -49,6 +52,10 @@ class Check:
     total: int
     detail: str
     samples: List[Dict[str, Any]] = field(default_factory=list)
+    # Set only where a proportion is the wrong measure. Two unmapped people columns out of
+    # thirty is 6% of the columns and 100% of the problem: the assignments in them are
+    # absent from every report regardless of how wide the sheet happens to be.
+    severity_override: Optional[str] = None
 
     @property
     def severity(self) -> str:
@@ -59,6 +66,8 @@ class Check:
         """
         if self.count == 0:
             return "ok"
+        if self.severity_override:
+            return self.severity_override
         share = self.count / self.total if self.total else 1.0
         if share >= 0.5:
             return "error"
@@ -252,6 +261,31 @@ def assess_tab(
             "reason": "This tab's schema names no people columns.",
         })
 
+    # --- roles the schema never learned about ------------------------------------------
+    #
+    # Runs whether or not any people column is mapped, because the worst case is a tab with
+    # none mapped and an obvious candidate sitting there: every workload figure on that tab
+    # is empty and nothing else says why.
+    candidates = _unmapped_people(headers, rows, tab_schema, people)
+    checks.append(Check(
+        key="unmapped_people",
+        label="Columns that look like people but are not mapped",
+        count=len(candidates),
+        total=len([h for h in headers if h]),
+        detail=(
+            "Names in these columns are missing from every workload, merge suggestion, "
+            "health count and digest. Add them under Admin → Projects."
+        ),
+        # A proportion of the columns is the wrong measure here, so it is overridden. With
+        # nothing mapped, every person-shaped number on this tab is empty rather than
+        # partial, which is a different order of wrong.
+        severity_override="error" if not people else "warning",
+        samples=[
+            {"row": 0, "id": "", "column": c["header"], "value": c["example"]}
+            for c in candidates[:MAX_SAMPLES]
+        ],
+    ))
+
     # --- status ---------------------------------------------------------------------
     if status_header:
         blank_status = [
@@ -285,6 +319,71 @@ def assess_tab(
         "skipped": skipped,
         "completeness": _completeness(headers, rows, tab_schema),
     }
+
+
+def _claimed_headers(tab_schema: Dict[str, Any], headers: List[str]) -> set:
+    """Every header the schema has already assigned a meaning to.
+
+    Excluded from people-candidacy not as a heuristic but because the admin has already
+    said what these columns are. Without it the status column is a standing false positive:
+    "Completed / Not Started / In Testing / Hold" is title-cased, consistently spelled and
+    repeats across rows, which is most of what a roster looks like.
+    """
+    claimed = set()
+    for value in (
+        tab_schema.get("primary_id_column"),
+        tab_schema.get("status_column"),
+        tab_schema.get("module_column"),
+        tab_schema.get("type_column"),
+        tab_schema.get("description_column"),
+    ):
+        bound = resolve_header(headers, value)
+        if bound:
+            claimed.add(bound)
+    for value in (tab_schema.get("date_columns") or {}).values():
+        bound = resolve_header(headers, value)
+        if bound:
+            claimed.add(bound)
+    for col in bind_columns(get_effort_columns(tab_schema), headers):
+        claimed.add(col["header"])
+    return claimed
+
+
+def _unmapped_people(
+    headers: List[str],
+    rows: List[Dict[str, str]],
+    tab_schema: Dict[str, Any],
+    people: List[Dict[str, Any]],
+) -> List[Dict[str, str]]:
+    """Columns whose *values* look like people, that the schema does not treat as people.
+
+    This is the visible half of a failure that was previously silent. Detection reads value
+    shape now, so a re-detected tab finds its people columns whatever they are called — but
+    nothing re-detects an existing project, and until someone does, a tab reports one
+    resource column when it has two. The UI could not tell "this sheet has one" from "this
+    sheet was never re-detected", so nobody had any reason to go and look (TDD §16.3).
+
+    Judged by `core/column_profile`, which never sees a column name — the same profiler
+    detection uses, applied to the sheet as it stands rather than as it was onboarded. That
+    is what keeps this generic: the check works on a tracker whose header says Owner, PIC,
+    or nothing recognisable in English at all.
+
+    False positives are cheap here and true negatives are expensive. Being told to look at a
+    column that turns out not to name people costs one glance; not being told costs every
+    number the column should have contributed. `people_confidence` only returns "likely"
+    when all six criteria pass, so the suggestion is already conservative.
+    """
+    mapped = {col["header"] for col in people or []} | _claimed_headers(tab_schema, headers)
+    out: List[Dict[str, str]] = []
+    for header in headers:
+        if not header or header in mapped:
+            continue
+        values = [row.get(header) for row in rows]
+        if people_confidence(profile_column(values)) != "likely":
+            continue
+        examples = [str(v).strip() for v in values if str(v or "").strip()][:2]
+        out.append({"header": header, "example": ", ".join(examples)})
+    return out
 
 
 def _completeness(
