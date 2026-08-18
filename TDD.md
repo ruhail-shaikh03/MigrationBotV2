@@ -41,9 +41,10 @@ Google Sheets. Users sign in with Google, open a WebSocket to a FastAPI backend,
 natural-language requests. An agentic LLM loop turns those into calls against a fixed nine-tool
 catalogue.
 
-**Reads go straight to the Google Sheets API on every request — there is no cache.** Writes are
-queued through Redis to a separate worker container, which performs the mutation, writes the audit
-row, and publishes the outcome back to the API over Redis pub/sub for delivery to the originating
+**Reads go through a 60-second Redis cache** (§11.1) that both the dashboard and the agent's tools
+share; a cold cache, or Redis being unreachable, falls straight through to the Google Sheets API.
+Writes are queued through Redis to a separate worker container, which performs the mutation, writes
+the audit row, and publishes the outcome back to the API over Redis pub/sub for delivery to the originating
 client.
 
 ### 1.1 Component map
@@ -2240,6 +2241,26 @@ iteration that just closed it.
 the newly-resolved due column, so effort coverage stays at ~40 of 412 rows on the reference sheet.
 Switching it to the deadline would raise coverage substantially but silently change every day
 figure already on screen, so it is left as a deliberate follow-up rather than folded into a bug fix.
+
+**Verified live, 2026-08-18, against the rebuilt production deploy**, after PRs #40 and #41 landed
+on `main`: `What's overdue?` on HEDP produced exactly one `summarize(report_type=overdue)` tool call
+and a complete 8-item table with descriptions and assignees. The dashboard's overdue-only grid filter
+independently returned the same 8 rows. Chat and dashboard have not disagreed on this since.
+
+### 16.7 Duplicated primary IDs — write ambiguity, not yet addressed
+
+**Severity: medium, confirmed live, unfixed.** The new health check (§13, `Duplicated WRICEF No.
+values`) found **27 of 412 HEDP rows share their WRICEF No. with another row** — e.g. `SLCM-0005`
+and `SLCM-0825` both appear twice. Every write path (`update_cell`, `bulk_update`, undo, the
+dashboard's inline reassign) addresses a row by this column via `find_row_num`, which returns the
+first match. A write aimed at the second occurrence of a duplicated ID silently lands on the first
+one instead — no error, no audit anomaly, just the wrong row changed.
+
+This is now *visible* (the health panel lists all 27, with row numbers) but not *prevented*: nothing
+stops a write from being enqueued against an ambiguous ID, and `find_row_num` has no way to report
+"which one did you mean." Fixing it properly needs either a disambiguating write path (row number
+instead of, or alongside, the ID) or a refusal at dispatch time when the target ID is not unique —
+both are scoped for a future stage, not attempted here.
 
 ---
 
