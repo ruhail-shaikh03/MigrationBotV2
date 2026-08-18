@@ -8,7 +8,7 @@ the sheet, which is a configuration decision, not a per-user preference.
 """
 
 import logging
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
