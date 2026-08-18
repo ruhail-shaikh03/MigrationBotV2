@@ -127,7 +127,12 @@ export function useWebSocket(apiToken: string | null, projectId: number | null) 
               if (lastMsg && lastMsg.role === "assistant") {
                 return {
                   ...lastMsg,
-                  content: lastMsg.content + content
+                  // `reset` empties the bubble instead of appending to it. It arrives when
+                  // the server caught the reasoner leaking its internal markup partway
+                  // through a streamed reply and is about to retry on another model — the
+                  // text already on screen has to go, or the good answer gets stapled to
+                  // the tail of the poisoned one.
+                  content: data.reset ? "" : lastMsg.content + content
                 }
               }
               return lastMsg

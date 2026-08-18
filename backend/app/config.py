@@ -23,6 +23,15 @@ class Settings(BaseSettings):
     # deployment that isn't explicitly opted in.
     ALLOW_DEV_AUTH: bool = False
 
+    # Off by default, and deliberately so. Streaming changes how `tool_calls` reach the
+    # loop: instead of one complete object they arrive as partial JSON fragments spread
+    # across deltas and have to be reassembled. The assembly is unit-tested against the
+    # documented delta shape, but no test here can prove the provider actually emits that
+    # shape — and if it does not, every write breaks, silently, at the point of dispatch.
+    # So the deploy stays on the code path that has been running for months until someone
+    # can watch a real streamed turn produce a real write (§8.3).
+    STREAM_RESPONSES: bool = False
+
     # Fail-closed default role for a caller with no explicit permissions row (§6.2 in
     # TDD.md). "viewer" so an unknown grant surface can never write; override only if a
     # deployment genuinely wants the old fail-open behavior.

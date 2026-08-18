@@ -26,7 +26,21 @@ from app.sheets.read import _fetch_all_rows
 
 logger = logging.getLogger("rows_cache")
 
-redis_client = aioredis.from_url(settings.REDIS_URL, decode_responses=True)
+# Bounded on purpose, and the bound is small.
+#
+# Every failure path here degrades to a live Sheets scan, so the only thing a long timeout
+# buys is a longer wait before doing the work anyway. With the defaults, a Redis outage
+# cost ~8 seconds per call (connect retries with backoff) — tolerable when only the
+# dashboard used this, once per page load, and not tolerable now that the agent's reads
+# come through here too: eight tool calls in one turn would spend over a minute achieving
+# nothing while the socket looked hung.
+redis_client = aioredis.from_url(
+    settings.REDIS_URL,
+    decode_responses=True,
+    socket_connect_timeout=0.5,
+    socket_timeout=2.0,
+    retry_on_timeout=False,
+)
 
 CACHE_PREFIX = "migrationbot:rows"
 # Short on purpose. This exists to collapse the burst of reads from one person working a

@@ -56,6 +56,43 @@ async def _fetch_all_rows(
         start += page_size
 
 
+def _column_letter_to_index(letter: str) -> int:
+    """"B" -> 1, "AA" -> 26. The same addressing `find_row_num` uses.
+
+    Deliberately keyed off `primary_id_position` (a column letter) rather than
+    `primary_id_column` (a header name), so the cached lookup resolves to exactly the
+    cell the uncached one would. The two can disagree on a mis-detected schema, and a
+    cache that quietly answers with a *different* row than the live path is a far worse
+    failure than a slow one.
+    """
+    index = 0
+    for char in str(letter or "B").strip().upper():
+        if char.isalpha():
+            index = index * 26 + (ord(char) - 64)
+    return max(index - 1, 0)
+
+
+async def _cached_matrix(
+    service: Any, spreadsheet_id: str, active_tab: str, data_start_row: int
+) -> Tuple[List[str], List[List[str]], bool]:
+    """The tab's headers and data rows, from the 60-second Redis cache when warm.
+
+    Local import: `rows_cache` imports `_fetch_all_rows` from this module, so importing it
+    at module scope would be a cycle. Same pattern `core/people.py` uses for its
+    `PersonResolver` import.
+
+    Why the agent reads go through the dashboard's cache at all: every tool call used to
+    re-scan the whole tab. A single agentic turn that runs summarize, then get_row, then
+    search_rows scanned the same 412 rows three times over, each scan paging up to
+    `_MAX_SCAN_ROWS`. The cache already invalidates on write (`queue/worker.py` calls
+    `invalidate_tab` after every applied job), so this does not make the agent any staler
+    than the grid a user is looking at while they ask.
+    """
+    from app.sheets.rows_cache import get_tab_matrix
+
+    return await get_tab_matrix(service, spreadsheet_id, active_tab, data_start_row)
+
+
 async def find_row_num(
     service: Any, 
     spreadsheet_id: str, 
@@ -193,21 +230,25 @@ async def get_row(
     """Fetch all values mapped to headers for a single RICEFW object ID."""
     schema_config = get_tab_schema(schema_config, active_tab)
     data_start_row = schema_config.get("data_start_row", 3)
-    header_row_num = data_start_row - 1
     primary_id_pos = schema_config.get("primary_id_position", "B")
 
-    row_num = await find_row_num(service, spreadsheet_id, active_tab, ricefw_id, data_start_row, primary_id_pos)
-    if row_num is None:
+    # Three Sheets calls became zero on a warm cache. The uncached path scanned the whole
+    # ID column to find the row, fetched that row, then fetched the headers — and the
+    # model's most common mistake is calling this tool in a loop, which is exactly the
+    # shape that used to blow the quota.
+    headers, all_rows, _ = await _cached_matrix(service, spreadsheet_id, active_tab, data_start_row)
+
+    id_index = _column_letter_to_index(primary_id_pos)
+    key = ricefw_id.strip().upper()
+    values = None
+    for row in all_rows:
+        if id_index < len(row) and str(row[id_index]).strip().upper() == key:
+            values = row
+            break
+
+    if values is None:
         return {"ok": False, "error": f"RICEFW ID '{ricefw_id}' not found in active tab."}
 
-    result = await _with_retry(lambda: service.spreadsheets().values().get(
-        spreadsheetId=spreadsheet_id,
-        range=f"{active_tab}!{row_num}:{row_num}"
-    ).execute())
-    
-    headers = await get_header_row(service, spreadsheet_id, active_tab, header_row_num)
-    values = result.get("values", [[]])[0]
-    
     row_data = {h: (values[i] if i < len(values) else "") for i, h in enumerate(headers)}
     return {"ok": True, "ricefw_id": ricefw_id, "data": row_data}
 
@@ -225,8 +266,9 @@ async def search_rows(
     """Scans the spreadsheet and filters rows based on a set of criteria (AND matching)."""
     schema_config = get_tab_schema(schema_config, active_tab)
     data_start_row = schema_config.get("data_start_row", 3)
-    header_row_num = data_start_row - 1
-    headers = await get_header_row(service, spreadsheet_id, active_tab, header_row_num)
+    headers, all_rows, truncated = await _cached_matrix(
+        service, spreadsheet_id, active_tab, data_start_row
+    )
 
     # get_header_row strips each header, but resolve_column's canonical names are copied
     # verbatim from COLUMN_ALIASES / the LLM-built column_map and deliberately keep the
@@ -256,7 +298,6 @@ async def search_rows(
             "match_type": f.get("match_type", "exact")
         })
 
-    all_rows, truncated = await _fetch_all_rows(service, spreadsheet_id, active_tab, data_start_row)
     matches = []
 
     for row in all_rows:
@@ -319,17 +360,16 @@ async def summarize(
     schema_config = get_tab_schema(schema_config, active_tab)
     report_type = args.get("report_type")
     data_start_row = schema_config.get("data_start_row", 3)
-    header_row_num = data_start_row - 1
-    
-    headers = await get_header_row(service, spreadsheet_id, active_tab, header_row_num)
+
+    headers, all_rows, truncated = await _cached_matrix(
+        service, spreadsheet_id, active_tab, data_start_row
+    )
     # Same header-normalization as search_rows: headers are stripped, canonical names
     # from resolve_column/schema_config may not be.
     col_idx = {h.lower().strip(): i for i, h in enumerate(headers)}
 
     def _col(name: str):
         return col_idx.get(name.lower().strip()) if name else None
-
-    all_rows, truncated = await _fetch_all_rows(service, spreadsheet_id, active_tab, data_start_row)
 
     # Filter by module if scope_module is supplied
     scope_module = args.get("scope_module")
@@ -544,11 +584,9 @@ async def run_data_quality_check(
     """Executes the DataQualityChecker rules engine against spreadsheet data."""
     schema_config = get_tab_schema(schema_config, active_tab)
     data_start_row = schema_config.get("data_start_row", 3)
-    header_row_num = data_start_row - 1
-
-    headers = await get_header_row(service, spreadsheet_id, active_tab, header_row_num)
-
-    rows, truncated = await _fetch_all_rows(service, spreadsheet_id, active_tab, data_start_row)
+    headers, rows, truncated = await _cached_matrix(
+        service, spreadsheet_id, active_tab, data_start_row
+    )
 
     # Optional module scoping, same normalized-lookup pattern as summarize()
     scope_module = args.get("scope_module")
