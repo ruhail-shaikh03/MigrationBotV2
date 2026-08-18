@@ -1423,6 +1423,19 @@ long timeout buys nothing but a longer wait before doing the work regardless. Th
 made this visible before production did — `tests/test_sheets` went from 1 second to 52 the moment
 agent reads started touching Redis that is not running here.
 
+**The suite keeps this cache cold**, via an autouse `cold_row_cache` fixture in
+`tests/conftest.py` that patches `rows_cache.redis_client` for every test. The key is
+`(spreadsheet_id, active_tab)`, which identifies data uniquely in production and not at all in the
+suite: nearly every read test builds a *different* fixture under the same `spreadsheet_id="sheet-123"`
+and `active_tab="SD"`, so they share one key. That was inert while only the dashboard read through
+the cache. Once agent reads did, the suite's behaviour split by environment — with no Redis running
+every call degraded to a live scan and 281 tests passed, while CI, which runs Redis as a service,
+had the first test warm the key and the next five read its rows instead of their own mock's:
+`data_quality` counted two blank statuses against a fixture holding one, and a module breakdown came
+back `"SD"` for a fixture whose only value is `"Sales & Distribution"`. Five failures, none a real
+defect, reproducible nowhere but CI. `tests/test_sheets/test_rows_cache.py` — the file whose subject
+*is* the caching — patches `redis_client` per test, and those patches nest inside the fixture and win.
+
 This is deliberately *not* the durable, reconciled read model that a `sheet_records` table would
 be; that remains unbuilt.
 
