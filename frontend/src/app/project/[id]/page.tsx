@@ -7,7 +7,7 @@ import {
   Bar, BarChart, Cell, LabelList, ResponsiveContainer, Tooltip, XAxis, YAxis,
 } from "recharts"
 import {
-  AlertTriangle, ArrowLeft, Grid3x3, Pencil, RefreshCw, Search, Users,
+  AlertTriangle, ArrowLeft, Grid3x3, Pencil, RefreshCw, Search, Stethoscope, Users,
 } from "lucide-react"
 
 import {
@@ -90,6 +90,28 @@ interface AnalyticsResponse {
   truncated: boolean
 }
 
+interface HealthCheck {
+  key: string
+  label: string
+  count: number
+  total: number
+  severity: "error" | "warning" | "info" | "ok"
+  detail: string
+  samples: { row: number; id: string; column: string; value: string }[]
+}
+
+interface HealthResponse {
+  tab: string
+  total_rows: number
+  checks: HealthCheck[]
+  /** Checks that could not run, and why. Never folded into `checks` as a zero: a check
+   *  the schema does not support has not passed, and showing it as green is the one
+   *  failure mode this panel exists to avoid. */
+  skipped: { key: string; label: string; reason: string }[]
+  completeness: { score: number; fields: string[]; filled: number; cells: number } | null
+  truncated: boolean
+}
+
 const PAGE_SIZE = 50
 
 export default function ProjectDashboard() {
@@ -98,9 +120,10 @@ export default function ProjectDashboard() {
   const params = useParams()
   const projectId = params?.id as string
 
-  const [view, setView] = useState<"grid" | "workload">("grid")
+  const [view, setView] = useState<"grid" | "workload" | "health">("grid")
   const [rowsData, setRowsData] = useState<RowsResponse | null>(null)
   const [analytics, setAnalytics] = useState<AnalyticsResponse | null>(null)
+  const [health, setHealth] = useState<{ key: string; data: HealthResponse | null } | null>(null)
   const [isLoading, setIsLoading] = useState(true)
   const [errorMsg, setErrorMsg] = useState("")
 
@@ -174,6 +197,29 @@ export default function ProjectDashboard() {
   useEffect(() => {
     load()
   }, [load])
+
+  // Health is fetched only when its panel is open, and only on tab change — not on every
+  // filter keystroke like the grid. It deliberately reports the whole tab: "12 rows have
+  // no deadline" is a fact about the sheet, and re-scoping it to the current search would
+  // turn it into a fact about a search, which is not a thing anyone can act on.
+  useEffect(() => {
+    if (view !== "health" || !apiToken || !projectId) return
+    let cancelled = false
+    // Nothing is set before the first await, so the effect never triggers a synchronous
+    // re-render — the same shape /admin/people uses.
+    const run = async () => {
+      const query = tab ? `?tab=${encodeURIComponent(tab)}` : ""
+      try {
+        const res = await fetch(`/api/projects/${projectId}/health${query}`, { headers: authHeaders })
+        const body = res.ok ? await res.json() : null
+        if (!cancelled) setHealth({ key: tab, data: body })
+      } catch {
+        if (!cancelled) setHealth({ key: tab, data: null })
+      }
+    }
+    run()
+    return () => { cancelled = true }
+  }, [view, tab, apiToken, projectId, authHeaders])
 
   // Reassignments land through the queue, so the terminal frame is the cue to re-read.
   // Reusing the existing queue_update -> CustomEvent bridge means the dashboard reflects
@@ -392,6 +438,14 @@ export default function ProjectDashboard() {
               >
                 <Users className="h-3.5 w-3.5" /> Workload
               </button>
+              <button
+                onClick={() => setView("health")}
+                className={`inline-flex items-center gap-1.5 rounded px-3 py-1.5 text-xs transition cursor-pointer ${
+                  view === "health" ? "bg-brass-400/15 text-brass-300" : "text-ink-400 hover:text-ink-200"
+                }`}
+              >
+                <Stethoscope className="h-3.5 w-3.5" /> Health
+              </button>
             </div>
             <button onClick={() => load()} className="btn btn-ghost" aria-label="Refresh">
               <RefreshCw className={`h-4 w-4 ${isLoading ? "animate-spin" : ""}`} />
@@ -433,9 +487,12 @@ export default function ProjectDashboard() {
           </div>
         )}
 
-        {/* Filters apply to both views: a workload chart that ignores the active filter
-            would contradict the grid beside it. */}
-        <div className="flex flex-wrap items-end gap-3">
+        {/* Filters apply to the grid and the workload chart: a chart that ignored the
+            active filter would contradict the grid beside it. Health is the exception and
+            hides them, because its counts are about the tab rather than about a selection
+            — leaving the controls visible would imply they narrow numbers that they do
+            not. */}
+        <div className={`flex-wrap items-end gap-3 ${view === "health" ? "hidden" : "flex"}`}>
           <div className="min-w-[220px] flex-1 space-y-1.5">
             <label className="label-micro" htmlFor="dash-search">Search</label>
             <div className="relative">
@@ -602,8 +659,10 @@ export default function ProjectDashboard() {
               </>
             )}
           </section>
-        ) : (
+        ) : view === "workload" ? (
           <WorkloadPanel analytics={analytics} isLoading={isLoading} />
+        ) : (
+          <HealthPanel health={health?.key === tab ? health.data : null} isLoading={health?.key !== tab} />
         )}
       </main>
     </div>
@@ -752,6 +811,133 @@ function WorkloadPanel({
         <ChartFrame title="By status" subtitle={`${analytics.total_rows} rows`}>
           <DataTable rows={by_status.map((s) => ({ Status: s.label, Rows: s.count }))} />
         </ChartFrame>
+      )}
+    </div>
+  )
+}
+
+/**
+ * What the sheet does not say.
+ *
+ * The analytics panel reports overdue counts with two significant figures; this one
+ * reports that 362 of 412 rows carry no deadline at all, which is what those figures were
+ * computed against. Both are true, and only together are they honest.
+ *
+ * Checks that could not run are rendered separately and never as a passing zero. A panel
+ * that says "0 problems" because the schema names no deadline column is worse than no
+ * panel: it converts an unanswered question into a clean bill of health.
+ */
+function HealthPanel({
+  health,
+  isLoading,
+}: {
+  health: HealthResponse | null
+  isLoading: boolean
+}) {
+  if (isLoading && !health) return <p className="text-sm text-ink-500">Reading the sheet…</p>
+  if (!health) return <p className="text-sm text-ink-500">Health data is unavailable.</p>
+
+  const { checks, skipped, completeness, total_rows, truncated } = health
+  const problems = checks.filter((c) => c.severity !== "ok")
+
+  const tone: Record<HealthCheck["severity"], string> = {
+    error: "border-[color-mix(in_srgb,var(--color-failed)_35%,transparent)] bg-[color-mix(in_srgb,var(--color-failed)_8%,transparent)]",
+    warning: "border-[color-mix(in_srgb,var(--color-brass-400)_35%,transparent)] bg-[color-mix(in_srgb,var(--color-brass-400)_8%,transparent)]",
+    info: "border-[var(--color-rule-strong)] bg-white/[0.03]",
+    ok: "border-[var(--color-rule)] bg-transparent",
+  }
+  const dot: Record<HealthCheck["severity"], string> = {
+    error: "bg-failed",
+    warning: "bg-brass-400",
+    info: "bg-ink-500",
+    ok: "bg-ink-600",
+  }
+
+  return (
+    <div className="space-y-5">
+      <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
+        <StatTile label="Rows checked" value={String(total_rows)} sub={truncated ? "partial scan" : undefined} />
+        <StatTile
+          label="Checks run"
+          value={String(checks.length)}
+          sub={skipped.length > 0 ? `${skipped.length} could not run` : undefined}
+        />
+        <StatTile
+          label="Needs attention"
+          value={String(problems.length)}
+          sub={problems.length === 0 ? "nothing flagged" : undefined}
+        />
+        <StatTile
+          // "—" rather than a number the sheet never earned: a fill rate over zero
+          // declared columns would be 100% on a sheet nobody has described.
+          label="Critical fields filled"
+          value={completeness ? `${completeness.score}%` : "—"}
+          sub={
+            completeness
+              ? `${completeness.filled} of ${completeness.cells} cells`
+              : "no critical fields declared"
+          }
+        />
+      </div>
+
+      {truncated && (
+        <p className="text-[12px] text-ink-500">
+          The scan hit its row ceiling, so every count below is a floor rather than a total.
+        </p>
+      )}
+
+      <section className="space-y-2">
+        <h2 className="label-micro">Checks</h2>
+        {checks.map((c) => (
+          <div key={c.key} className={`rounded-lg border px-3 py-2.5 ${tone[c.severity]}`}>
+            <div className="flex items-baseline gap-2">
+              <span className={`h-1.5 w-1.5 shrink-0 translate-y-[-1px] rounded-full ${dot[c.severity]}`} />
+              <span className="text-sm font-medium text-ink-100">{c.label}</span>
+              <span className="tabular-nums text-sm text-ink-300">
+                {c.count}
+                {c.total > 0 && <span className="text-ink-500"> / {c.total}</span>}
+              </span>
+            </div>
+            <p className="mt-1 pl-3.5 text-[12px] leading-relaxed text-ink-400">{c.detail}</p>
+            {c.samples.length > 0 && (
+              <div className="mt-1.5 flex flex-wrap gap-1.5 pl-3.5">
+                {c.samples.map((s, i) => (
+                  <span
+                    key={`${c.key}-${i}`}
+                    className="rounded border border-[var(--color-rule)] px-1.5 py-0.5 font-mono text-[11px] text-ink-400"
+                  >
+                    {/* Row 0 marks a sample that is about a value rather than a row —
+                        the near-duplicate names, which belong to no single row. */}
+                    {s.row > 0 && <span className="text-ink-500">row {s.row} </span>}
+                    {s.id || s.column}
+                    {s.value && <span className="text-ink-500"> · {s.value}</span>}
+                  </span>
+                ))}
+                {c.count > c.samples.length && (
+                  <span className="px-1 py-0.5 text-[11px] text-ink-500">
+                    +{c.count - c.samples.length} more
+                  </span>
+                )}
+              </div>
+            )}
+          </div>
+        ))}
+      </section>
+
+      {skipped.length > 0 && (
+        <section className="space-y-2">
+          <h2 className="label-micro">Not checked</h2>
+          <p className="text-[12px] text-ink-500">
+            This tab&rsquo;s schema does not name the columns these need. Map them in Admin →
+            Projects and they start reporting.
+          </p>
+          {skipped.map((s) => (
+            <div key={s.key} className="flex flex-wrap items-baseline gap-2 text-[12.5px]">
+              <span className="text-ink-300">{s.label}</span>
+              <span className="text-ink-500">{s.reason}</span>
+            </div>
+          ))}
+        </section>
       )}
     </div>
   )

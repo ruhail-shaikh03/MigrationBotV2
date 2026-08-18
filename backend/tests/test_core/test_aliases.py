@@ -264,13 +264,13 @@ def test_observed_names_fold_case_the_way_the_workload_does():
     "Ahmed Qamar" (16) and "ahmed qamar" (1) as two names while the workload panel beside
     it correctly reported one person with 18. It also emitted the redundant "ahmed qamar"
     as a merge candidate for a name that already resolved to the same person."""
-    from app.api.aliases import _count_observed_names
+    from app.core.people import count_observed_names
 
     rows = [
         {"Dev": "Ahmed Qamar"}, {"Dev": "Ahmed Qamar"}, {"Dev": "ahmed qamar"},
         {"Dev": "AHMED QAMAR"}, {"Dev": "Babar Ali"},
     ]
-    counts = _count_observed_names(rows, [{"header": "Dev"}])
+    counts = count_observed_names(rows, [{"header": "Dev"}])
 
     # One entry, totalling every spelling, labelled with the dominant one.
     assert counts == {"Ahmed Qamar": 4, "Babar Ali": 1}
@@ -279,9 +279,9 @@ def test_observed_names_fold_case_the_way_the_workload_does():
 
 
 def test_observed_names_still_split_shared_cells():
-    from app.api.aliases import _count_observed_names
+    from app.core.people import count_observed_names
 
-    counts = _count_observed_names(
+    counts = count_observed_names(
         [{"Dev": "Minhaj Alam & Dawood"}, {"Dev": "Dawood"}], [{"header": "Dev"}]
     )
     assert counts == {"Minhaj Alam": 1, "Dawood": 2}

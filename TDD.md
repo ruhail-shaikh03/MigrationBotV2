@@ -495,6 +495,21 @@ now treat that the same way: build `{h.lower().strip(): i}` and look up
   remediation; regression tests in `test_sheets_logic.py` cover both `search_rows` and
   `summarize.count_by_field` against a header with a real trailing space.
 
+- **Dashboard path**: `dashboard.py` and `core/health.py` go through
+  `schema.py:resolve_header(headers, wanted)` and `schema.py:bind_columns(columns, headers)`.
+  This third path was missed by the Phase 1 remediation above and had the same defect in a
+  quieter form. `_row_dicts` keys each row by the **stripped** header row, while
+  `get_people_columns`, `get_due_column` and `date_columns` all return the header **verbatim**
+  from `schema_config`. So on a tab whose schema says `"Technical Resource "`,
+  `row.get("Technical Resource ")` returned `None` for every row: no exception, no log line,
+  and the column read as universally blank rather than as missing. The workload panel would
+  have credited nobody and the health panel would have reported every row unassigned — a
+  specific, confident, entirely wrong number. `resolve_header` tries an exact match first, so a
+  sheet that genuinely carries two headers differing only in whitespace keeps the one its
+  schema names; `bind_columns` drops a column the tab no longer has instead of keeping a dead
+  header, so callers never have to ask whether a column exists. The write path is deliberately
+  untouched: `patch_row` must address a cell by the exact string the sheet uses.
+
 ### 7.3 Auto-detection
 
 `detect_all_tabs` (`schema_detect.py:detect_all_tabs`) enumerates tabs, reads `A1:Z10` from each,
@@ -1023,7 +1038,8 @@ sheet, so it is configuration, not a per-user preference. Project visibility sti
 
 `list_people` counts names **after splitting and before aliasing** — the admin has to see what the
 sheet actually says, including the variants they are about to merge away — but by *normalised* key,
-labelled with whichever spelling dominates (`aliases.py:_count_observed_names`). Counting raw
+labelled with whichever spelling dominates (`people.py:count_observed_names`, shared with the
+health panel of §10.4). Counting raw
 display strings, as the first implementation did, showed `Ahmed Qamar` (16) and `ahmed qamar` (1)
 as two separate people on the screen while the workload panel beside it correctly reported one
 person with 18, and offered the lower-case spelling as a merge candidate for a name that already
@@ -1034,6 +1050,52 @@ exists because some merges will be wrong and every one of them has to be reversi
 
 None of these endpoints writes to the spreadsheet. The alias map is a read layer: the sheet keeps
 saying `Madiha` in that cell forever, and only the app's reading of it changes.
+
+### 10.4 Sheet health
+
+`GET /api/projects/{id}/health?tab=` (`dashboard.py:project_health`) reports how much of a tab is
+actually filled in. It is gated exactly as the grid and analytics are, **not** as admin-only: it
+reports on rows the caller can already read, and the people who can fix a blank deadline are the
+ones who own the row.
+
+All checking logic lives in `core/health.py:assess_tab(headers, rows, tab_schema, data_start_row)`,
+which is pure and does no I/O. It emits, per check, `{key, label, count, total, severity, detail,
+samples}`, plus a `skipped` list and a `completeness` block. Severity is graded by *share* of the
+tab — `error` at ≥50%, `warning` at ≥10%, `info` below, `ok` at zero — because a count alone does
+not say how bad it is: three rows without a deadline is a footnote, 362 means the column is not
+being used and every date-derived number on the analytics panel is quietly partial.
+
+The checks are `no_id`, `duplicate_id`, `no_deadline`, `unreadable_date`, `unassigned`,
+`duplicate_people` and `no_status`. Every one of them is driven by `schema_config` — no header
+string is spelled in the module — so a non-SAP tracker gets the same treatment.
+
+**`core/data_quality.py:DataQualityChecker` is deliberately not reused here**, contrary to the
+original plan for this stage. Its checks are written against one customer's WRICEF tracker: it
+falls back to literal `"RICEFW ID"`, `"Dev Status"`, `"Required"` and `"Sign-Off Date"` headers,
+and on a sheet carrying none of them `consistency_checks` returns `[]` while `completeness_score`
+returns `100.0`. Empty reads as *no problems found* and 100.0 reads as *perfect*, so the panel
+would have been most reassuring exactly where it knew least — the inverse of what it is for, and a
+direct violation of the generic-sheet requirement (§16.3). `DataQualityChecker` still serves the
+agent, where a human reads its output in context. Two rules follow and are worth keeping:
+
+- **A check that could not run is not a check that passed.** Anything whose column the schema does
+  not name goes into `skipped` with the reason, never into `checks` as a zero. The UI renders the
+  two lists separately under "Checks" and "Not checked".
+- **`completeness` is `None`, not `100.0`,** when the tab declares no `critical_fields`. A score
+  with nothing behind it is worse than no score; the tile shows an em dash.
+
+`unreadable_date` is the one check that reports something *worse* than a blank. A value like
+`17/0/2026` — present on the reference tracker — looks filled in to a human scanning the sheet and
+parses to `None` in every calculation, so the row is silently dropped from exactly the reports it
+appears to belong to. `duplicate_people` is the inverse: the only check that is a prompt rather
+than a defect, since some of those pairs are genuinely two people, and it links the reader to the
+triage screen of §14.7 rather than acting on its own.
+
+Two bounds keep the endpoint cheap: `MAX_SAMPLES = 5` per check (the count is the number that
+matters; the samples exist so the reader knows where to look) and `MAX_NAMES_FOR_MERGE_SCAN = 1000`,
+past which `duplicate_people` is skipped rather than allowed to run `suggest_merges`'
+all-pairs comparison over thousands of names. `truncated` is echoed through from the row cache,
+because past `_MAX_SCAN_ROWS` every count is a floor and not a total.
 
 ---
 
@@ -1539,6 +1601,38 @@ carries no `eslint-disable` anywhere, and adding the first one here would be wor
 inconsistency. Fixing all seven is a single-pass job for whenever the data-fetching pattern is
 revisited.
 
+### 14.8 The health panel
+
+A third view beside Grid and Workload on `/project/[id]`, backed by §10.4. It answers the question
+underneath the analytics panel: the analytics panel reports overdue counts to two significant
+figures, and this one reports that those figures were computed over 50 of 412 rows.
+
+Three decisions are load-bearing:
+
+- **It ignores the filter bar, and hides it.** Every other view narrows with the filters, because a
+  chart contradicting the grid beside it would be worse than no chart. Health is the exception:
+  "362 rows have no deadline" is a fact about the tab, and re-scoping it to the current search
+  turns it into a fact about a search, which nobody can act on. Leaving the controls on screen
+  while they did nothing would imply they narrowed numbers that they do not, so they are hidden
+  rather than disabled.
+- **`checks` and `skipped` render as two separate lists**, headed "Checks" and "Not checked". The
+  second carries the reason and points at Admin → Projects, because the fix for an unrunnable check
+  is a schema mapping, not a sheet edit. Folding them together as passing zeros is the failure
+  §10.4 exists to avoid, and it would be invisible precisely on the trackers the app knows least.
+- **Fetched lazily** — only while the panel is open, and only on tab change, not on every filter
+  keystroke like the grid. A health scan reads the whole tab, and the 60-second row cache makes it
+  cheap only if it is not requested on every render.
+
+The completeness tile shows an em dash rather than a percentage when the tab declares no
+`critical_fields`, matching the `None` the endpoint returns. `truncated` is surfaced as a line of
+prose above the checks, not swallowed: past the row ceiling every count below it is a floor.
+
+Loading state is derived from a tab-tagged payload (`{key, data}`) rather than tracked as a second
+`useState`. A separate flag would have to be raised synchronously inside the effect — the eighth
+instance of the lint debt noted in §14.7 — and it could drift out of step with the payload, leaving
+the panel showing one tab's counts under another tab's name. Deriving it makes both problems
+structurally impossible; the file's lint count is unchanged from `main`.
+
 ---
 
 ## 15. Deployment, CI/CD & Tests
@@ -1718,6 +1812,15 @@ remaining gap. What follows is what is still not generic:
   so a key present-but-null no longer defeats the fallback; that spelling is what broke the overdue
   report on every project (§16.5). The deadline column no longer has an inline default at all —
   `schema.py:get_due_column` resolves it, falling back to a header scan.
+- **`core/data_quality.py` is written against one customer's tracker.** `consistency_checks` and
+  `completeness_score` fall back to literal `"RICEFW ID"`, `"Dev Status"`, `"Required"`,
+  `"Sign-Off Date"` and `"Completion Date"` headers, and on a sheet carrying none of them they
+  return `[]` and `100.0` respectively — *no problems found* and *perfect*, from a checker that
+  resolved nothing. It is reachable only through the agent's `data_quality` tool, where a human
+  reads the output in context. The dashboard's health panel was originally planned to reuse it and
+  deliberately does not; `core/health.py` drives every check from `schema_config` instead (§10.4).
+  Making `DataQualityChecker` itself generic is unstarted work, and until it is done its output
+  should not be surfaced anywhere a reader would take silence for a clean bill of health.
 - **`add_row` requires `module` and `type`.** Both are `required` in the tool schema and consumed
   by `worker.py:process_job`. A sheet with no category or type column cannot satisfy them. Making
   them optional means touching the write path, so it was left alone.
