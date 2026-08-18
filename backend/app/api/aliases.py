@@ -8,7 +8,7 @@ the sheet, which is a configuration decision, not a per-user preference.
 """
 
 import logging
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
@@ -18,8 +18,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.admin import require_admin
 from app.api.dashboard import _resolve_project, _row_dicts, _tab_for
 from app.core.aliases import suggest_merges
-from app.core.people import normalise_person, split_cell
-from app.core.schema import get_people_columns, get_tab_schema
+from app.core.people import count_observed_names, normalise_person
+from app.core.schema import bind_columns, get_people_columns, get_tab_schema
 from app.db.engine import get_db
 from app.deps import get_current_user, get_google_auth
 from app.models.person_alias import PersonAlias
@@ -35,37 +35,6 @@ router = APIRouter()
 class AliasCreate(BaseModel):
     alias: str
     canonical: str
-
-
-def _count_observed_names(
-    rows: List[Dict[str, str]], people_columns: List[Dict[str, Any]]
-) -> Dict[str, int]:
-    """How often each person is named on this tab, after splitting, before aliasing.
-
-    Counted by normalised key and labelled with the spelling that occurs most often, so
-    this agrees with the workload panel. Counting raw display strings — the first
-    implementation — showed "Ahmed Qamar" (16) and "ahmed qamar" (1) as two separate
-    names while the workload beside it correctly reported one person with 18, and offered
-    the redundant lower-case spelling as a merge candidate for a name that already
-    resolved to the same person. Case is folded everywhere else by `normalise_person`;
-    this was the one place it was not.
-
-    Aliases are deliberately *not* applied: the admin has to see what the sheet actually
-    says, including the variants they are about to merge away.
-    """
-    by_key: Dict[str, Dict[str, int]] = {}
-    for row in rows:
-        for col in people_columns:
-            for name in split_cell(row.get(col["header"])):
-                spellings = by_key.setdefault(normalise_person(name), {})
-                spellings[name] = spellings.get(name, 0) + 1
-
-    counts: Dict[str, int] = {}
-    for spellings in by_key.values():
-        # Ties break alphabetically so the label is stable across reloads.
-        dominant = max(spellings.items(), key=lambda kv: (kv[1], kv[0]))[0]
-        counts[dominant] = sum(spellings.values())
-    return counts
 
 
 @router.get("/projects/{project_id}/people", dependencies=[Depends(require_admin)])
@@ -94,8 +63,8 @@ async def list_people(
     )
     rows = _row_dicts(headers, raw_rows)
 
-    people_columns = get_people_columns(tab_schema)
-    counts = _count_observed_names(rows, people_columns)
+    people_columns = bind_columns(get_people_columns(tab_schema), headers)
+    counts = count_observed_names(rows, people_columns)
 
     existing = await db.execute(select(PersonAlias).where(PersonAlias.project_id == project_id))
     aliases = existing.scalars().all()

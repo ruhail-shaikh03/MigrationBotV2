@@ -136,3 +136,48 @@ def get_available_tabs(schema_config: Dict[str, Any]) -> List[str]:
     if "tabs" in schema_config:
         return list(schema_config.get("tabs", {}).keys())
     return []
+
+
+def resolve_header(headers: Optional[List[str]], wanted: Optional[str]) -> Optional[str]:
+    """The key `wanted` actually has in a row dict, or None if the tab has no such column.
+
+    schema_config stores headers *verbatim*, trailing spaces and all (§7.2) — the write
+    path needs the exact string to address a cell. Row dicts, however, are keyed by
+    `meta.get_header_row`'s output, which is stripped. So `row.get("Technical Resource ")`
+    on a tab whose schema declares that trailing space returns None for every row, and the
+    column reads as universally blank rather than as missing.
+
+    That silence is why this exists. A column that resolves to nothing looks exactly like
+    a column nobody filled in, and the dashboard would have reported every row on such a
+    tab as unassigned — a confident, specific, entirely wrong number.
+
+    Exact match wins first, so a sheet that genuinely has two headers differing only in
+    whitespace keeps the one its schema names.
+    """
+    if not wanted:
+        return None
+    available = [h for h in (headers or []) if h]
+    if wanted in available:
+        return wanted
+    needle = str(wanted).strip().casefold()
+    for header in available:
+        if str(header).strip().casefold() == needle:
+            return header
+    return None
+
+
+def bind_columns(
+    columns: List[Dict[str, Any]], headers: Optional[List[str]]
+) -> List[Dict[str, Any]]:
+    """Re-point a list of role columns at the header keys this tab actually uses.
+
+    Columns the tab does not have are dropped rather than kept with a dead header, so a
+    caller iterating the result never has to ask whether a column exists. A schema that
+    names a column the sheet has since removed is a stale mapping, not an empty column.
+    """
+    out = []
+    for col in columns or []:
+        header = resolve_header(headers, col.get("header"))
+        if header:
+            out.append({**col, "header": header})
+    return out

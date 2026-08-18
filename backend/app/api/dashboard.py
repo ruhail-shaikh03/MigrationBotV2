@@ -25,8 +25,10 @@ from app.core.aliases import PersonResolver
 from app.core.overdue import is_finished_status
 from app.core.people import collect_assignments, normalise_person, parse_date, resolve_effort
 from app.core.permissions import get_user_permissions
+from app.core.health import assess_tab
 from app.core.schema import (
-    get_available_tabs, get_due_column, get_effort_columns, get_people_columns, get_tab_schema,
+    bind_columns, get_available_tabs, get_due_column, get_effort_columns, get_people_columns,
+    get_tab_schema, resolve_header,
 )
 from app.db.engine import get_db
 from app.deps import get_current_user, get_google_auth
@@ -189,12 +191,16 @@ async def list_rows(
     )
     rows = _row_dicts(headers, raw_rows)
 
-    people = get_people_columns(tab_schema)
-    status_header = tab_schema.get("status_column")
+    # Every schema-declared header is re-pointed at the key the row dicts actually use.
+    # schema_config stores headers verbatim — "Technical Resource " with its real trailing
+    # space — while row dicts are keyed by the stripped header row, so an unbound lookup
+    # returns None for every row and the column reads as universally blank (§7.2).
+    people = bind_columns(get_people_columns(tab_schema), headers)
+    status_header = resolve_header(headers, tab_schema.get("status_column"))
     # Resolved against the real headers, so a sheet whose deadline column detection never
     # mapped ("Expected Completetion Date") still filters by overdue instead of matching
     # nothing at all. Same resolver the agent's summarize(overdue) uses.
-    due_header = get_due_column(tab_schema, headers)
+    due_header = resolve_header(headers, get_due_column(tab_schema, headers))
 
     # Only the people-columns the caller asked about; role_key narrows a person filter to
     # one role so "overdue work Sara owns as functional consultant" is answerable.
@@ -394,12 +400,17 @@ async def project_analytics(
     )
     rows = _row_dicts(headers, raw_rows)
 
-    people = get_people_columns(tab_schema)
-    effort = get_effort_columns(tab_schema)
+    people = bind_columns(get_people_columns(tab_schema), headers)
+    effort = bind_columns(get_effort_columns(tab_schema), headers)
     resolver = await _resolver_for(db, project_id)
-    status_header = tab_schema.get("status_column")
-    date_columns = tab_schema.get("date_columns") or {}
-    due_header = get_due_column(tab_schema, headers)
+    status_header = resolve_header(headers, tab_schema.get("status_column"))
+    # Bound too: resolve_effort reads these as row keys to derive a day span.
+    date_columns = {}
+    for key, value in (tab_schema.get("date_columns") or {}).items():
+        bound = resolve_header(headers, value)
+        if bound:
+            date_columns[key] = bound
+    due_header = resolve_header(headers, get_due_column(tab_schema, headers))
 
     by_status: Dict[str, int] = {}
     workload: Dict[str, Dict[str, Any]] = {}
@@ -464,3 +475,39 @@ async def project_analytics(
         "has_due_dates": bool(due_header),
         "truncated": truncated,
     }
+
+
+@router.get("/projects/{project_id}/health", response_model=Dict[str, Any])
+async def project_health(
+    project_id: int,
+    tab: Optional[str] = None,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+    google_auth: dict = Depends(get_google_auth),
+) -> Dict[str, Any]:
+    """How much of this tab is actually filled in, and what is unusable where it is not.
+
+    Gated exactly as the grid and analytics are, not as admin-only: this reports on the
+    same rows the caller can already read, and the people who can fix a blank deadline
+    are the people who own the row, not the config admin.
+    """
+    project = await _resolve_project(db, current_user, project_id)
+    active_tab = _tab_for(project, tab)
+    tab_schema = get_tab_schema(project.schema_config or {}, active_tab)
+    data_start_row = tab_schema.get("data_start_row", 3)
+
+    service = build_sheets_service(
+        access_token=google_auth["access_token"],
+        refresh_token=google_auth.get("refresh_token"),
+    )
+    headers, raw_rows, truncated = await get_tab_matrix(
+        service, project.spreadsheet_id, active_tab, data_start_row
+    )
+    rows = _row_dicts(headers, raw_rows)
+
+    report = assess_tab(headers, rows, tab_schema, data_start_row)
+    # A truncated scan makes every count a floor. Reporting "12 rows have no deadline"
+    # over the first 20 000 of a longer tab states a total that is not one.
+    report["truncated"] = truncated
+    report["tab"] = active_tab
+    return report

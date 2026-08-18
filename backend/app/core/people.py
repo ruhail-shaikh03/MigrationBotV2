@@ -203,3 +203,35 @@ def collect_assignments(
                 "person_key": normalise_person(name),
             })
     return out
+
+
+def count_observed_names(
+    rows: List[Dict[str, Any]], people_columns: List[Dict[str, Any]]
+) -> Dict[str, int]:
+    """How often each person is named across a tab, after splitting, before aliasing.
+
+    Counted by normalised key and labelled with the spelling that occurs most often, so
+    this agrees with the workload panel. Counting raw display strings — the first
+    implementation — showed "Ahmed Qamar" (16) and "ahmed qamar" (1) as two separate
+    names while the workload beside it correctly reported one person with 18, and offered
+    the redundant lower-case spelling as a merge candidate for a name that already
+    resolved to the same person. Case is folded everywhere else by `normalise_person`;
+    this was the one place it was not.
+
+    Aliases are deliberately *not* applied: the admin triage screen has to show what the
+    sheet actually says, including the variants they are about to merge away, and the
+    health panel counts near-duplicates that aliasing would have already hidden.
+    """
+    by_key: Dict[str, Dict[str, int]] = {}
+    for row in rows:
+        for col in people_columns or []:
+            for name in split_cell(row.get(col.get("header"))):
+                spellings = by_key.setdefault(normalise_person(name), {})
+                spellings[name] = spellings.get(name, 0) + 1
+
+    counts: Dict[str, int] = {}
+    for spellings in by_key.values():
+        # Ties break alphabetically so the label is stable across reloads.
+        dominant = max(spellings.items(), key=lambda kv: (kv[1], kv[0]))[0]
+        counts[dominant] = sum(spellings.values())
+    return counts
