@@ -1074,7 +1074,7 @@ Filters are `q` (any cell), `status`, `person` (+ optional `role_key` to scope t
 case/whitespace folding rather than a substring test — a substring match would fold "Sara" and
 "Sara Khan" into one person. The deadline column comes from `schema.py:get_due_column`, shared with
 the agent's `summarize(overdue)` so the two surfaces cannot disagree about what a deadline is
-(§16.5). `_is_overdue` treats a row as overdue when that date has passed and its status does not
+(§16.6). `_is_overdue` treats a row as overdue when that date has passed and its status does not
 read as finished; the finished-word list is deliberately narrow (no `"live"`, which would clear
 "Go-Live Pending") because hiding an overdue item is the worse error — nobody chases what they
 cannot see.
@@ -1244,6 +1244,61 @@ never alters existing ones (§15.2). Resolving by cell is also the more honest o
 surface: the ledger row says "W-1 · Dev Status → Completed", the user means "put that cell back",
 and if it has been written twice since, the latest write is the one they mean. Everything after
 resolution is the same code path, guard included.
+
+### 10.6 CSV export
+
+`GET /api/projects/{id}/rows.csv` (`dashboard.py:export_rows_csv`), taking the same
+`tab/q/status/person/role_key/overdue/sort/desc` parameters as the grid, plus `include_empty`.
+Notably **no `limit` or `offset`**: the export is the whole filtered set. Exporting the visible
+page would hand back a file that silently disagrees with the row count printed above the button,
+which is precisely the thing a download is trusted not to do.
+
+Server-side rather than client-side because the grid pages at 50 and the useful artefact is the
+whole selection. The filters run through `dashboard.py:_filter_rows` — extracted from `list_rows`
+in this change and now called by both — so the export cannot drift from the screen. Reimplementing
+them beside the originals would work exactly until either side was next touched.
+
+**Values that a spreadsheet would execute are prefixed with an apostrophe**
+(`dashboard.py:_csv_safe`). A cell beginning `=`, `+`, `-`, `@`, tab or carriage return is run as a
+formula when the CSV is opened in Excel or Sheets, so an export turns data other people typed into
+a script the recipient runs. This is a live path rather than a theoretical one: the source is a
+spreadsheet that a dozen people type into, and the API returns formatted values, so a *text* cell
+whose content merely starts with `=` arrives here intact and would become a live formula on
+re-import. The apostrophe is what every spreadsheet reads as "this is text" and hides from display;
+the characters themselves are kept exactly, because the export must not quietly edit the data. A
+leading `-` means `-5` exports as `'-5` — a visible, correctable annoyance, chosen over a silently
+executable cell.
+
+`truncated` is written into the file as a trailing note, not only into a header, because a partial
+export that looks complete is worse than a slow one. `X-Row-Count` carries the count the caller
+should have received.
+
+### 10.7 Digest preview
+
+`GET /api/projects/{id}/digest?tab=&days=` (`api/digest.py:preview_digest`) returns what a
+"what is overdue this week, per person" digest would say today, plus a plain-text rendering.
+`core/digest.py:build_digest` is pure and takes `today` as a parameter, so a digest is
+reproducible — one that cannot be regenerated identically cannot be checked against what was sent.
+
+**Nothing is sent, scheduled or configured.** There is no APScheduler job, no SMTP setting and no
+recipient list, and their absence is the deliverable rather than an omission. A digest leaves the
+system and arrives in the inbox of someone who never asked for it, naming them and listing what
+they are late on; a wrong recipient list or wrong wording cannot be quietly corrected in the next
+deploy, because it has already been read. The payload says `"delivery": "preview-only"` so a client
+that grows a Send button has to notice there is nothing behind it.
+
+Two decisions inside the computation are worth keeping:
+
+- **A tab with no deadline column returns a `reason`, not zeroes.** It cannot have anything overdue
+  on it, and "0 overdue" reads as good news to whoever opens the mail. Same for a tab naming no
+  people columns.
+- **Overdue work nobody owns is reported under `unassigned`, not dropped.** It is the work most
+  likely to *stay* overdue, precisely because no digest would otherwise mention it to anyone.
+
+Names resolve through the project's alias map (§10.3). This is the dependency that made the digest
+wait for the people work: one listing "Madiha Shah Bukhari" and "Madiha" as two people with
+separate overdue lists is worse than no digest, because mailing it makes a data-quality problem
+public and attributes real work to someone who does not exist.
 
 ---
 
@@ -1740,7 +1795,7 @@ unreachable from the dashboard while chat could switch freely. The rows response
 Switching clears the person and role filters with it, since those values are tab-specific and
 carrying them across lands the user on an empty grid that reads as an empty tab.
 
-**"What's overdue?" burned all eight iterations and answered nothing.** See §16.5 — the root cause
+**"What's overdue?" burned all eight iterations and answered nothing.** See §16.6 — the root cause
 is a schema-resolution bug, not a prompt or model problem, and the fix is described there.
 
 ### 14.7 The person triage screen
@@ -1832,6 +1887,20 @@ disappearing with a toast.
 The list is re-read after a successful undo rather than patched in place, because the reversal is
 not a state change to the row above it — it is a new queued write that will appear as its own audit
 entry moments later.
+
+### 14.10 Export control
+
+A download button in the dashboard toolbar, hidden on the health view — whose numbers describe the
+whole tab rather than the filtered selection the button would export.
+
+It fetches rather than links. The endpoint needs both the bearer token and the Google access token,
+and a bare `<a href>` sends neither, so a plain link would download an HTML 401 named `rows.csv`.
+The blob round-trip is the cost of that. The filename comes from the server's
+`Content-Disposition` (project, tab and date); the client's `download` attribute is only a fallback
+for a proxy that strips the header.
+
+The query mirrors the grid's exactly, minus `limit`/`offset`, and passes `include_empty` when the
+user has revealed the empty columns — so the file matches the columns on screen as well as the rows.
 
 ---
 
@@ -2010,7 +2079,7 @@ remaining gap. What follows is what is still not generic:
   non-SAP sheet is exactly when they are wrong, and they fail as "column not found" rather than as
   a misconfiguration. They are now written as `x or "default"` rather than `.get(key, "default")`,
   so a key present-but-null no longer defeats the fallback; that spelling is what broke the overdue
-  report on every project (§16.5). The deadline column no longer has an inline default at all —
+  report on every project (§16.6). The deadline column no longer has an inline default at all —
   `schema.py:get_due_column` resolves it, falling back to a header scan.
 - **`core/data_quality.py` is written against one customer's tracker.** `consistency_checks` and
   `completeness_score` fall back to literal `"RICEFW ID"`, `"Dev Status"`, `"Required"`,
@@ -2040,7 +2109,21 @@ remaining gap. What follows is what is still not generic:
   called. Re-detection remains a deliberate admin act — `detect-metadata` returns a config and
   never writes one.
 
-### 16.4 Dependency advisories are outstanding
+### 16.4 Digest delivery is unbuilt, on purpose
+
+**Severity: none — this is a decision, not a defect.** `core/digest.py` computes a per-person
+overdue digest and `api/digest.py` will show it to you, and that is where it stops. No scheduler,
+no SMTP settings, no recipient list.
+
+What is missing is not the code — APScheduler inside the existing worker process would be a short
+change, since it is already a long-running loop with Redis and database access. What is missing is
+the sign-off. A digest is the only artefact this app produces that is meant to leave it: it lands
+unasked in someone's inbox, names them, and lists what they are late on. Wrong recipients or wrong
+wording cannot be fixed in the next deploy, because it has already been read. Anyone completing
+this should get explicit agreement on both the audience and the wording, and send one to themselves
+first.
+
+### 16.5 Dependency advisories are outstanding
 **Severity: medium, unverified.** `npm audit` in `frontend/` reports 2 critical and 6 high, all in
 pre-existing dependencies: `@auth/core` / `next-auth` (existence-based auth bypass, and `getToken()`
 raising on a malformed bearer), `next` (middleware/proxy bypass in App Router with Turbopack),
@@ -2048,7 +2131,7 @@ plus `postcss`, `sharp`, `nanoid`, `js-yaml`, `brace-expansion`. The two auth ad
 directly on §4's token chain. Not triaged against the versions actually in `package-lock.json`, and
 no upgrade attempted — `next-auth` is on a beta pin, so bumping it is not a patch-level change.
 
-### 16.5 The overdue report was unreachable on every project — RESOLVED
+### 16.6 The overdue report was unreachable on every project — RESOLVED
 **Severity: was high.** `summarize(report_type="overdue")` failed on both registered trackers, and
 the failure cascaded: with its one purpose-built tool returning an error, the model improvised with
 `search_rows`, filtering on date *substrings* (`Expected Completetion Date contains "2025"`) and on

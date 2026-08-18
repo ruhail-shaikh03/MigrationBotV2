@@ -7,7 +7,7 @@ import {
   Bar, BarChart, Cell, LabelList, ResponsiveContainer, Tooltip, XAxis, YAxis,
 } from "recharts"
 import {
-  AlertTriangle, ArrowLeft, Grid3x3, Pencil, RefreshCw, Search, Stethoscope, Users,
+  AlertTriangle, ArrowLeft, Download, Grid3x3, Pencil, RefreshCw, Search, Stethoscope, Users,
 } from "lucide-react"
 
 import {
@@ -130,6 +130,7 @@ export default function ProjectDashboard() {
   const [pending, setPending] = useState<Record<string, PendingEdit>>({})
   const [editing, setEditing] = useState<string | null>(null)
   const [showEmptyColumns, setShowEmptyColumns] = useState(false)
+  const [exporting, setExporting] = useState(false)
 
   // "" means "whatever the project's default tab is" — the server decides, so the page
   // renders correctly on first paint without first fetching the tab list.
@@ -193,6 +194,49 @@ export default function ProjectDashboard() {
       setIsLoading(false)
     }
   }, [apiToken, projectId, tab, offset, q, person, roleKey, overdueOnly, authHeaders])
+
+  /**
+   * Download the filtered tab.
+   *
+   * Fetched rather than linked, because the endpoint needs the bearer token and the
+   * Google token — a bare <a href> sends neither and would download an HTML 401. The blob
+   * round-trip is the cost of that.
+   *
+   * The query mirrors the grid's exactly, minus limit/offset: the file is the whole
+   * filtered set, not the visible page. Exporting the page would produce a file that
+   * disagrees with the row count printed directly above the button.
+   */
+  const exportCsv = useCallback(async () => {
+    if (!apiToken || !projectId) return
+    setExporting(true)
+    try {
+      const query = new URLSearchParams()
+      if (tab) query.set("tab", tab)
+      if (q.trim()) query.set("q", q.trim())
+      if (person) query.set("person", person)
+      if (roleKey) query.set("role_key", roleKey)
+      if (overdueOnly) query.set("overdue", "true")
+      if (showEmptyColumns) query.set("include_empty", "true")
+
+      const res = await fetch(`/api/projects/${projectId}/rows.csv?${query}`, { headers: authHeaders })
+      if (!res.ok) throw new Error(`Export failed (${res.status}).`)
+
+      const blob = await res.blob()
+      const url = URL.createObjectURL(blob)
+      const link = document.createElement("a")
+      link.href = url
+      // The server names the file (project, tab and date); this is only the fallback for
+      // the case where the header did not survive a proxy.
+      link.download =
+        res.headers.get("Content-Disposition")?.match(/filename="([^"]+)"/)?.[1] || "rows.csv"
+      link.click()
+      URL.revokeObjectURL(url)
+    } catch (err) {
+      setErrorMsg(err instanceof Error ? err.message : "Could not export these rows.")
+    } finally {
+      setExporting(false)
+    }
+  }, [apiToken, projectId, tab, q, person, roleKey, overdueOnly, showEmptyColumns, authHeaders])
 
   useEffect(() => {
     load()
@@ -447,6 +491,19 @@ export default function ProjectDashboard() {
                 <Stethoscope className="h-3.5 w-3.5" /> Health
               </button>
             </div>
+            {/* Hidden on the health view, whose numbers are about the whole tab rather
+                than the filtered selection this would export. */}
+            {view !== "health" && (
+              <button
+                onClick={exportCsv}
+                disabled={exporting}
+                className="btn btn-ghost disabled:opacity-40"
+                aria-label="Export these rows as CSV"
+                title="Download the filtered rows as CSV"
+              >
+                <Download className="h-4 w-4" />
+              </button>
+            )}
             <button onClick={() => load()} className="btn btn-ghost" aria-label="Refresh">
               <RefreshCw className={`h-4 w-4 ${isLoading ? "animate-spin" : ""}`} />
             </button>

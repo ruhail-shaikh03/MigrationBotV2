@@ -11,11 +11,15 @@ default (§6.2) deliberately does not grant visibility here: a user who can only
 project through the default role was never actually granted anything.
 """
 
+import csv
+import io
 import logging
+import re
 from datetime import date
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -159,38 +163,26 @@ def _matches(row: Dict[str, str], header: Optional[str], needle: str) -> bool:
     return needle.lower().strip() in str(row.get(header, "")).lower()
 
 
-@router.get("/projects/{project_id}/rows", response_model=Dict[str, Any])
-async def list_rows(
+async def _filter_rows(
+    db: AsyncSession,
     project_id: int,
-    tab: Optional[str] = None,
+    rows: List[Dict[str, str]],
+    headers: List[str],
+    tab_schema: dict,
+    *,
     q: Optional[str] = None,
     status: Optional[str] = None,
     person: Optional[str] = None,
     role_key: Optional[str] = None,
     overdue: bool = False,
-    sort: Optional[str] = None,
-    desc: bool = False,
-    limit: int = Query(100, ge=1, le=500),
-    offset: int = Query(0, ge=0),
-    db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-    google_auth: dict = Depends(get_google_auth),
-) -> Dict[str, Any]:
-    """The tab's rows, filtered and paged, plus the column metadata to render them."""
-    project = await _resolve_project(db, current_user, project_id)
-    active_tab = _tab_for(project, tab)
-    tab_schema = get_tab_schema(project.schema_config or {}, active_tab)
-    data_start_row = tab_schema.get("data_start_row", 3)
+) -> List[Dict[str, str]]:
+    """The grid's filters, applied once and shared by every surface that offers them.
 
-    service = build_sheets_service(
-        access_token=google_auth["access_token"],
-        refresh_token=google_auth.get("refresh_token"),
-    )
-    headers, raw_rows, truncated = await get_tab_matrix(
-        service, project.spreadsheet_id, active_tab, data_start_row
-    )
-    rows = _row_dicts(headers, raw_rows)
-
+    Extracted so the CSV export cannot drift from the grid. An export whose filters are
+    reimplemented beside the originals is an export that silently stops matching the screen
+    the first time either side is touched, and the whole promise of the feature is that
+    what downloads is what the user is looking at.
+    """
     # Every schema-declared header is re-pointed at the key the row dicts actually use.
     # schema_config stores headers verbatim — "Technical Resource " with its real trailing
     # space — while row dicts are keyed by the stripped header row, so an unbound lookup
@@ -230,6 +222,46 @@ async def list_rows(
             if not due or not _is_overdue(due, row, status_header):
                 continue
         filtered.append(row)
+    return filtered
+
+
+@router.get("/projects/{project_id}/rows", response_model=Dict[str, Any])
+async def list_rows(
+    project_id: int,
+    tab: Optional[str] = None,
+    q: Optional[str] = None,
+    status: Optional[str] = None,
+    person: Optional[str] = None,
+    role_key: Optional[str] = None,
+    overdue: bool = False,
+    sort: Optional[str] = None,
+    desc: bool = False,
+    limit: int = Query(100, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+    google_auth: dict = Depends(get_google_auth),
+) -> Dict[str, Any]:
+    """The tab's rows, filtered and paged, plus the column metadata to render them."""
+    project = await _resolve_project(db, current_user, project_id)
+    active_tab = _tab_for(project, tab)
+    tab_schema = get_tab_schema(project.schema_config or {}, active_tab)
+    data_start_row = tab_schema.get("data_start_row", 3)
+
+    service = build_sheets_service(
+        access_token=google_auth["access_token"],
+        refresh_token=google_auth.get("refresh_token"),
+    )
+    headers, raw_rows, truncated = await get_tab_matrix(
+        service, project.spreadsheet_id, active_tab, data_start_row
+    )
+    rows = _row_dicts(headers, raw_rows)
+    people = bind_columns(get_people_columns(tab_schema), headers)
+
+    filtered = await _filter_rows(
+        db, project_id, rows, headers, tab_schema,
+        q=q, status=status, person=person, role_key=role_key, overdue=overdue,
+    )
 
     if sort and sort in headers:
         filtered.sort(key=lambda r: str(r.get(sort, "")).lower(), reverse=desc)
@@ -511,3 +543,113 @@ async def project_health(
     report["truncated"] = truncated
     report["tab"] = active_tab
     return report
+
+
+# Excel and Sheets execute a cell that begins with one of these when a CSV is opened, so
+# an exported value is a script the recipient runs. The data here comes out of a
+# spreadsheet other people type into, which makes this a real path rather than a
+# theoretical one: someone types =HYPERLINK(...) into a Description field, a PM exports
+# the tab and opens it, and it fires.
+_FORMULA_LEADERS = ("=", "+", "-", "@", "\t", "\r")
+
+
+def _csv_safe(value: Any) -> str:
+    """Neutralise a value that a spreadsheet would treat as a formula on import.
+
+    Prefixed with an apostrophe, which every spreadsheet reads as "this is text" and hides
+    from the cell display. Deliberately not stripped or quoted away: the point is to keep
+    the exact characters the sheet holds while making sure they are read rather than run.
+    """
+    text = "" if value is None else str(value)
+    return f"'{text}" if text[:1] in _FORMULA_LEADERS else text
+
+
+@router.get("/projects/{project_id}/rows.csv")
+async def export_rows_csv(
+    project_id: int,
+    tab: Optional[str] = None,
+    q: Optional[str] = None,
+    status: Optional[str] = None,
+    person: Optional[str] = None,
+    role_key: Optional[str] = None,
+    overdue: bool = False,
+    sort: Optional[str] = None,
+    desc: bool = False,
+    include_empty: bool = False,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+    google_auth: dict = Depends(get_google_auth),
+):
+    """The filtered tab as a CSV download.
+
+    Server-side rather than client-side because the grid pages at 50 and the thing a PM
+    actually wants is the whole filtered set — exporting the visible page would produce a
+    file that silently disagrees with the row count printed above it.
+
+    Every filter goes through `_filter_rows`, the same function the grid calls, so the two
+    cannot drift. There is no `limit`: the export *is* the whole result, and truncating it
+    without saying so is the failure this endpoint exists to avoid.
+    """
+    project = await _resolve_project(db, current_user, project_id)
+    active_tab = _tab_for(project, tab)
+    tab_schema = get_tab_schema(project.schema_config or {}, active_tab)
+    data_start_row = tab_schema.get("data_start_row", 3)
+
+    service = build_sheets_service(
+        access_token=google_auth["access_token"],
+        refresh_token=google_auth.get("refresh_token"),
+    )
+    headers, raw_rows, truncated = await get_tab_matrix(
+        service, project.spreadsheet_id, active_tab, data_start_row
+    )
+    rows = _row_dicts(headers, raw_rows)
+
+    filtered = await _filter_rows(
+        db, project_id, rows, headers, tab_schema,
+        q=q, status=status, person=person, role_key=role_key, overdue=overdue,
+    )
+    if sort and sort in headers:
+        filtered.sort(key=lambda r: str(r.get(sort, "")).lower(), reverse=desc)
+
+    # Emptiness is judged over the whole filtered set, matching the grid, which hides
+    # columns nothing filled in — including the dozen literally named "Column 15" that the
+    # reference trackers carry.
+    columns = [h for h in headers if h]
+    if not include_empty:
+        populated = {h for row in filtered for h, v in row.items() if str(v).strip()}
+        columns = [h for h in columns if h in populated] or columns
+
+    def generate():
+        buffer = io.StringIO()
+        writer = csv.writer(buffer, lineterminator="\n")
+
+        def flush() -> str:
+            out = buffer.getvalue()
+            buffer.seek(0)
+            buffer.truncate(0)
+            return out
+
+        writer.writerow(columns)
+        yield flush()
+        for row in filtered:
+            writer.writerow([_csv_safe(row.get(h, "")) for h in columns])
+            yield flush()
+        if truncated:
+            # Stated in the file itself, not just in a header nobody reads. A partial
+            # export that looks complete is worse than a slow one.
+            writer.writerow([])
+            writer.writerow([f"NOTE: the scan hit its {len(rows)}-row ceiling; this export is partial."])
+            yield flush()
+
+    stamp = date.today().isoformat()
+    slug = re.sub(r"[^A-Za-z0-9]+", "-", f"{project.project_name} {active_tab}").strip("-").lower()
+    return StreamingResponse(
+        generate(),
+        media_type="text/csv; charset=utf-8",
+        headers={
+            "Content-Disposition": f'attachment; filename="{slug}-{stamp}.csv"',
+            # The row count the caller should have got, so a truncated download is
+            # detectable rather than merely short.
+            "X-Row-Count": str(len(filtered)),
+        },
+    )
