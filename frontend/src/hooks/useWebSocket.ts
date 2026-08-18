@@ -1,5 +1,5 @@
 import { useEffect, useRef, useCallback } from "react"
-import { useChatStore } from "@/store/useChatStore"
+import { useChatStore, type Message } from "@/store/useChatStore"
 
 /**
  * Detach every handler, then close cleanly with code 1000.
@@ -31,7 +31,7 @@ function teardownSocket(socket: WebSocket | null): void {
 }
 
 export function useWebSocket(apiToken: string | null, projectId: number | null) {
-  const { isConnected, setIsConnected, addMessage, updateLastMessage, setWs, setActiveTab, setSessionInfo } = useChatStore()
+  const { isConnected, setIsConnected, addMessage, updateLastMessage, setMessages, setWs, setActiveTab, setSessionInfo } = useChatStore()
   // The canonical "current socket" reference. Read/write this, not the Zustand `ws` state,
   // for anything that must see the actual current socket regardless of when its closure was
   // created — `ws` was previously read inside `connect` without being a dependency of it, so
@@ -193,7 +193,32 @@ export function useWebSocket(apiToken: string | null, projectId: number | null) 
             })
             break
           }
-          case "connection_ok": {
+          case "history": {
+          // Applied only into an empty store, which is precisely the reload case.
+          //
+          // The store is created at module scope, so it survives a socket drop: after the
+          // 3s reconnect the browser still holds the whole conversation, including any
+          // message sent but not yet answered — and that one is not persisted yet. Writing
+          // the server's copy over it would delete exactly the message the user is waiting
+          // on. An empty store, by contrast, can only mean a fresh page load.
+          if (useChatStore.getState().messages.length > 0) break
+          const restored = (data.messages || []).map((m: {
+            role: "user" | "assistant" | "system"
+            content: string
+            toolCalls?: Message["toolCalls"]
+          }, i: number) => ({
+            id: `history-${i}`,
+            role: m.role,
+            content: m.content,
+            // The sheet timestamps nothing, and inventing per-message times would put a
+            // clock on the replay that the record cannot support. One time for the batch.
+            timestamp: new Date(),
+            toolCalls: m.toolCalls,
+          }))
+          if (restored.length > 0) setMessages(restored)
+          break
+        }
+        case "connection_ok": {
             setSessionInfo({
               userEmail: data.user_email,
               projectName: data.project_name,
@@ -214,7 +239,7 @@ export function useWebSocket(apiToken: string | null, projectId: number | null) 
     // wsRef/setWs are assigned above (ref) and in onopen (store), not here — publishing
     // a still-CONNECTING socket to the store let callers send on a socket that wasn't
     // open yet.
-  }, [apiToken, projectId, setIsConnected, setWs, addMessage, updateLastMessage, setActiveTab, setSessionInfo])
+  }, [apiToken, projectId, setIsConnected, setWs, addMessage, updateLastMessage, setMessages, setActiveTab, setSessionInfo])
 
   // `connect` already closes over apiToken/projectId, so depending on it alone covers
   // a token or project change without re-running the effect twice for one change.

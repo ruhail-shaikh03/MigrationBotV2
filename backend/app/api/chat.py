@@ -16,7 +16,9 @@ from app.models.session import Session as UserSession
 from app.core.permissions import get_user_permissions
 from app.core.agentic_loop import run_agentic_loop
 from app.core.column_mapper import COLUMN_ALIASES
+from app.core.history import to_display, trim_for_model
 from app.core.schema import get_tab_schema
+from app.db.message_store import load_history, save_turn
 from app.queue.events import queue_events_channel
 from app.sheets.client import build_sheets_service
 from app.sheets.meta import switch_module
@@ -138,8 +140,14 @@ async def websocket_chat_endpoint(
         await db.commit()
         await db.refresh(user_sess)
 
-    # Initialize in-memory conversation history for this WS session
-    message_history = []
+    # Conversation history, restored from Postgres rather than started empty.
+    #
+    # This used to be `message_history = []` on every connection. The failure that caused
+    # was not "the chat is blank" — the browser's Zustand store is a module-scope
+    # singleton, so after the 3-second reconnect the user still saw the whole conversation
+    # while the model had forgotten all of it. The next follow-up ("what about the second
+    # one?") was answered against nothing, and the screen gave no hint why.
+    message_history = await load_history(db, user_sess.id)
 
     # Send success initialization packet
     await websocket.send_json({
@@ -148,6 +156,15 @@ async def websocket_chat_endpoint(
         "project_name": project.project_name,
         "active_tab": user_sess.active_tab
     })
+
+    # Replay the conversation to the client, in the bubble shape it already renders.
+    # Sent as its own frame after connection_ok rather than folded into it, so a client
+    # that does not understand it ignores it and simply keeps whatever it has in memory.
+    if message_history:
+        await websocket.send_json({
+            "type": "history",
+            "messages": to_display(message_history),
+        })
 
     # Define message sender helper
     # The agentic loop and the queue-event forwarder both write to this socket, so
@@ -277,10 +294,17 @@ async def websocket_chat_endpoint(
                 # Fetch or map dynamic columns
                 column_map = active_tab_schema.get("column_map") or proj_schema.get("column_map") or COLUMN_ALIASES
 
-                # Execute the agentic loop
+                # Execute the agentic loop.
+                #
+                # The model gets a bounded window, not the whole conversation. The loop
+                # swaps in a compact system prompt from iteration 1 to hold token use
+                # down, and handing it an unbounded history would give that saving back on
+                # the very next turn and every turn after it. What the *user* sees on
+                # reconnect is a separate, much larger limit (core/history.py).
+                sent_history = trim_for_model(message_history)
                 message_history = await run_agentic_loop(
                     user_message=user_msg,
-                    message_history=message_history,
+                    message_history=sent_history,
                     user_email=user.email,
                     session_id=current_sess.id,
                     spreadsheet_id=current_project.spreadsheet_id,
@@ -294,6 +318,11 @@ async def websocket_chat_endpoint(
                     google_access_token=google_access_token,
                     google_refresh_token=google_refresh_token
                 )
+
+                # Persist only what this turn added. run_agentic_loop returns the full
+                # accumulated history, so writing all of it every turn would duplicate the
+                # whole conversation on each message and grow quadratically.
+                await save_turn(fresh_db, current_sess.id, message_history[len(sent_history):])
 
                 # Update session activity timestamp
                 current_sess.last_active = datetime.now(timezone.utc)

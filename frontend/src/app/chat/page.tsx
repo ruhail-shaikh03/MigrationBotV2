@@ -2,7 +2,7 @@
 
 import { useSession, signOut } from "next-auth/react"
 import { useRouter } from "next/navigation"
-import { useEffect, useMemo, useRef, useState } from "react"
+import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { useChatStore, Project, Message } from "@/store/useChatStore"
 import { useWebSocket } from "@/hooks/useWebSocket"
 import MarkdownMessage from "@/components/MarkdownMessage"
@@ -20,6 +20,8 @@ export default function ChatPage() {
   const [input, setInput] = useState("")
   // Terminal outcomes keyed by job_id, plus the ids the user has cleared.
   const [outcomes, setOutcomes] = useState<Record<string, LedgerEntry>>({})
+  // jobId of the ledger row currently being reverted, so only that row shows as busy.
+  const [undoing, setUndoing] = useState<string | null>(null)
   const [dismissed, setDismissed] = useState<Set<string>>(new Set())
   const [isAdminState, setIsAdminState] = useState(false)
   const messagesEndRef = useRef<HTMLDivElement | null>(null)
@@ -30,7 +32,7 @@ export default function ChatPage() {
     projects, setProjects,
     activeProject, setActiveProject,
     activeTab,
-    messages, setMessages,
+    messages, setMessages, addMessage,
     isConnected, clearChat
   } = useChatStore()
 
@@ -159,6 +161,60 @@ export default function ChatPage() {
   // socket. Verified against a real write, which arrived already "applied". The
   // enqueue result carries job_id and status:"queued" back to us
   // (tool_dispatch.py), so that is the queued row, and the terminal frame in
+  /**
+   * Put one cell back the way it was.
+   *
+   * Identified by cell rather than by audit id: `audit_logs` records no job id and the
+   * ledger is keyed by one, so there is no id to send. The server resolves the caller's
+   * most recent write to that cell, and refuses outright if the cell no longer holds the
+   * value this entry wrote — someone else may have edited it in between, and silently
+   * discarding their change would be a far worse bug than a refused undo.
+   *
+   * The reversal is an ordinary queued write, so it arrives back through the same
+   * queue_update path as any other edit and lands in the ledger as its own row.
+   */
+  const handleUndo = useCallback(async (entry: LedgerEntry) => {
+    if (!apiToken || !activeProject || !entry.field) return
+    setUndoing(entry.jobId)
+    try {
+      const res = await fetch("/api/audit/undo-cell", {
+        method: "POST",
+        headers: {
+          "Authorization": `Bearer ${apiToken}`,
+          "X-Google-Access-Token": googleToken || "",
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          project_id: activeProject.id,
+          tab: entry.tab,
+          ricefw_id: entry.target,
+          field: entry.field,
+        }),
+      })
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}))
+        // Surfaced as a chat message rather than a toast: the refusal explains what the
+        // cell now says and who is likely to have changed it, which is worth keeping in
+        // the transcript rather than showing for three seconds and losing.
+        addMessage({
+          id: Math.random().toString(36).substring(7),
+          role: "system",
+          content: body.detail || "Could not undo that change.",
+          timestamp: new Date(),
+        })
+      }
+    } catch {
+      addMessage({
+        id: Math.random().toString(36).substring(7),
+        role: "system",
+        content: "Could not reach the server to undo that change.",
+        timestamp: new Date(),
+      })
+    } finally {
+      setUndoing(null)
+    }
+  }, [apiToken, googleToken, activeProject, addMessage])
+
   // `outcomes` replaces it by job_id below.
   const ledger: LedgerEntry[] = useMemo(() => {
     const rows: LedgerEntry[] = []
@@ -476,6 +532,8 @@ export default function ChatPage() {
             <WriteLedger
               entries={ledger}
               onDismiss={() => setDismissed(new Set(ledger.map((l) => l.jobId)))}
+              onUndo={handleUndo}
+              undoing={undoing}
             />
 
             <form onSubmit={handleSend} className="flex items-center gap-2">
