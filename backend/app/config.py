@@ -47,6 +47,25 @@ class Settings(BaseSettings):
     ADMIN_EMAILS: str
     CORS_ORIGINS: str
 
+    # Drive push notifications (§11.2). Both default to empty, and that is a deliberate
+    # departure from the required-no-default treatment JWT_SECRET and the three above get.
+    # Those are required because a deployment missing them is *insecure or broken*; a
+    # deployment missing these simply has no push channel, and falls back to polling
+    # `modifiedTime` — slower, entirely correct. Making them required would crash-loop
+    # backend and worker on every deployment that had not set them yet, which is the exact
+    # failure documented in §3 that cost 21 hours of downtime. Registration refuses with a
+    # clear message when they are unset instead (api/admin.py), which fails one endpoint
+    # rather than the whole application.
+    #
+    # PUBLIC_BASE_URL is the externally reachable origin Drive posts back to, e.g.
+    # "https://migrationbot.duckdns.org" — its domain must be verified in the Cloud Console
+    # project or Drive refuses the channel. DRIVE_WEBHOOK_TOKEN is the shared secret echoed
+    # back in X-Goog-Channel-Token; it is what authenticates Drive to an endpoint that
+    # cannot carry user credentials, so an empty value disables the receiver outright rather
+    # than accepting unauthenticated pushes.
+    PUBLIC_BASE_URL: str = ""
+    DRIVE_WEBHOOK_TOKEN: str = ""
+
     @property
     def admin_emails_list(self) -> List[str]:
         import os

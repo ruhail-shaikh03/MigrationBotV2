@@ -13,7 +13,7 @@ tool calls against a Sheets-backed dataset.
 |---|---|
 | Frontend | Next.js 16 App Router, React 19, Tailwind v4, Zustand 5, NextAuth v5 |
 | Backend | FastAPI (async), SQLAlchemy 2.0 + asyncpg, Pydantic v2 |
-| Data | PostgreSQL 16 (RBAC, audit, projects, sessions) |
+| Data | PostgreSQL 16 (RBAC, audit, projects, sessions, cached sheet rows), Alembic |
 | Queue | Redis 7 (RPUSH/BLPOP FIFO, 1 req/sec throttle) |
 | External | Google Sheets API v4, DeepSeek (`deepseek-chat` / `deepseek-reasoner`) via `AsyncOpenAI` |
 
@@ -29,6 +29,11 @@ cd backend && uvicorn app.main:app --reload --port 8000
 
 # Queue worker — REQUIRED for any write to reach Sheets
 cd backend && python -m app.queue.worker
+
+# Schema migrations — the backend container runs this at startup; run by hand only to
+# inspect. `alembic check` diffs the migrated schema against app/models and is what CI
+# uses to prove they agree. Needs a live Postgres.
+cd backend && alembic upgrade head && alembic check
 
 # Tests — must run from backend/, not repo root
 cd backend && pytest -v --tb=short
@@ -67,20 +72,31 @@ row use `search_rows` (AND filters, 3 match types) or `summarize` (count_by_fiel
 completion_rate, blank_fields, overdue). Looping `get_row` is the classic way to blow the
 Sheets quota and stall the agentic loop against its 8-iteration cap.
 
-**Agent reads hit the Sheets API live.** `get_row`/`search_rows`/`summarize`/`data_quality`
-all scan the spreadsheet through `sheets/read.py:_fetch_all_rows` on every call. There is
-no `sheet_records` table, no `models/sheet_record.py` and no `sheets/sync.py` — earlier
-revisions of this file and of `migrationbot-sheets-testing` described that cache as if it
-existed; it never did. Treat quota as a real constraint on the read path, not something a
-cache absorbs.
+**All reads go through three tiers, and `get_tab_matrix` is the only seam.**
+`sheets/rows_cache.py:get_tab_matrix()` is the sole read boundary — 7 call sites across
+`read.py:_cached_matrix` (which feeds every agent tool), `api/dashboard.py`, `api/aliases.py`
+and `api/digest.py`. It tries, in order: Redis (60s, `migrationbot:rows:{id}:{tab}`, collapses
+one person's burst of clicks) → Postgres `sheet_records` (`sheets/records_cache.py`, no expiry)
+→ a live Sheets scan. Add caching behaviour *there*, not at a call site.
 
-**The dashboard endpoints read through a 60-second Redis cache.**
-`sheets/rows_cache.py:get_tab_matrix()` caches one tab's header row plus data rows under
-`migrationbot:rows:{spreadsheet_id}:{tab}`, because a grid re-scans on every sort, filter
-and page. `queue/worker.py` calls `invalidate_tab()` after a successful write, so an edit
-shows up immediately rather than after the TTL. Redis being down degrades to a live scan,
-never an error. If a dashboard read looks stale, suspect this cache; if an *agent* read
-looks stale, it isn't cached at all.
+**The Postgres tier is invalidated by a fact, not a timer.** `sheet_sync_state` holds an
+`is_dirty` flag per `(spreadsheet_id, tab)`, set by a Drive push notification
+(`api/webhooks.py`), by `queue/worker.py` after a successful write, or by a
+`files.get(fields=modifiedTime)` that no longer matches. So an *unchanged* tab costs zero
+Sheets calls no matter how long it stays unchanged — which is the point of the table.
+Earlier revisions of this file described a `sheet_records` table and a `sheets/sync.py` that
+had never been written; the table is now real, but `sheets/sync.py` still does not exist and
+there is no background sync — refills happen lazily, on the next real request, with that
+user's own OAuth token.
+
+**Every cache failure degrades to a live scan, never an error.** Redis down, Postgres down,
+Drive scope missing, `modifiedTime` unreadable — all mean "assume stale" and fall through.
+A read must never fail because a cache did. If a *dashboard* read looks stale suspect Redis;
+if an *agent* read looks stale suspect `is_dirty` not being set.
+
+**Sheets has no cell-change webhook.** Drive `files.watch` fires per *file* and its payload
+never says which cell or even which tab changed, so a notification only ever marks every tab
+of that spreadsheet dirty. Anything that claims to know which cell changed is wrong.
 
 ## Code Style
 

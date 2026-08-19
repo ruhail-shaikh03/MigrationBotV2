@@ -113,10 +113,15 @@ a synchronous round trip to Google, so read latency and Sheets quota are directl
 
 ## 2. Persistence Model
 
-Five tables, all SQLAlchemy 2.0 `Mapped[...]` / `mapped_column(...)` on a shared `DeclarativeBase`
-(`db/engine.py:Base`). Created at API startup by `init_db()` in the lifespan hook
-(`main.py:lifespan`); failure is logged and swallowed. No migration tool exists — schema evolution
-relies on `metadata.create_all` (`db/engine.py:init_db`).
+Ten tables, all SQLAlchemy 2.0 `Mapped[...]` / `mapped_column(...)` on a shared `DeclarativeBase`
+(`db/engine.py:Base`, enumerated in `models/__init__.py`). Created at API startup by `init_db()` in
+the lifespan hook (`main.py:lifespan`); failure is logged and swallowed. Schema evolution now goes
+through Alembic (`backend/migrations/`, §15.2) rather than `metadata.create_all` alone —
+`docker-compose.yml`'s `backend` service runs `alembic upgrade head` before `uvicorn` starts
+(§15.1). `init_db()`/`create_all` is not dead code, though: `tests/test_db.py` and
+`tests/integration/test_integration_logic.py` each call `init_db()`/`drop_db()` directly in their
+own autouse fixtures to build and tear down a fresh schema per run, independent of the migration
+chain, so both paths have to keep producing an identical schema (§15.2 covers how CI checks that).
 
 | Table | Model | Notable columns |
 |---|---|---|
@@ -127,11 +132,21 @@ relies on `metadata.create_all` (`db/engine.py:init_db`).
 | `audit_logs` | `models/audit_log.py:AuditLog` | `old_value`/`new_value` Text; `args_json` JSONB; `result_ok`; generated `created_month` |
 | `person_aliases` | `models/person_alias.py:PersonAlias` | unique `(project_id, alias, canonical)` — one alias may name several people (§10.3) |
 | `messages` | `models/message.py:Message` | `session_id` FK `ON DELETE CASCADE`; `role`; nullable `content`; `tool_calls` JSONB; `tool_call_id`; ordered by `id` (§4.3) |
+| `sheet_records` | `models/sheet_record.py:SheetRecord` | composite PK `(spreadsheet_id, tab, row_number)`; `primary_id` **non-uniquely** indexed; `data` JSONB — the ragged row exactly as scanned (§11.1, §16.7) |
+| `sheet_sync_state` | `models/sheet_sync_state.py:SheetSyncState` | composite PK `(spreadsheet_id, tab)`; `is_dirty` default `true`; `drive_modified_time`; `checked_at` vs. `synced_at` (§11.1) |
+| `sheet_watch_channels` | `models/sheet_watch_channel.py:SheetWatchChannel` | unique `spreadsheet_id`; unique `channel_id`; `resource_id`; `token`; `expiration` (§11.2) |
 
-**Postgres holds no spreadsheet data.** Every tracker row is read live from Google Sheets. The
-database exists for identity, authorisation, session state, the audit trail, and — since the
-chat-persistence change — the conversation itself. `messages` stores what was *said about* the
-sheet, never a copy of the sheet.
+**Postgres now holds spreadsheet data — but only a derived copy of it, never the record of truth.**
+The last three tables above cache a tab's rows, the freshness state that governs whether that cache
+can be trusted, and any live Drive push-notification channel, respectively (§11.1, §11.2). Google
+Sheets remains the system of record for every tracker row: each of these three tables is
+reproducible in full by re-scanning the spreadsheet, and dropping all three costs one scan per tab
+on the next read, never a lost fact — which is also why `0002_sheet_records.py`'s `downgrade()` can
+drop them outright with no reconciliation step (its own docstring makes the same point). The
+original seven tables are unchanged in kind: identity, authorisation, session state, the audit
+trail, and the conversation itself. `messages` still stores what was *said about* the sheet, never a
+copy of the sheet; `sheet_records` is the copy, and it is explicitly a cache, not a second source of
+truth — nothing reads it as authoritative, and every write still lands on the spreadsheet first.
 
 ---
 
@@ -151,6 +166,19 @@ correctly using the shared public default (§4.2).
 
 Secrets still carrying defaults: `DEEPSEEK_API_KEY`, `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`
 (all on `config.py:Settings`).
+
+**Two more settings are optional, with empty-string defaults, and deliberately so:**
+`PUBLIC_BASE_URL` and `DRIVE_WEBHOOK_TOKEN` (`config.py:Settings`, §11.2). These govern Drive
+push-notification registration for the row cache. The contrast with the four required variables
+above is the point: those are required because a deployment missing them is insecure or simply
+broken, while a deployment missing these two still works correctly — the row cache never receives a
+push and falls back to a `modifiedTime` check on every freshness confirmation (§11.1), which is
+slower but not wrong. Making them required would reproduce the exact failure mode described in the
+outage callout below: any deployment that hadn't yet set them would crash-loop `backend` and
+`worker` at the `settings = Settings()` import the moment this code shipped. Instead,
+`api/watch.py:_require_push_config` is the only place their absence is fatal, and it fails one
+endpoint — channel registration — with a message naming whichever variable is unset, rather than the
+whole application.
 
 `main.py` also refuses to boot if `CORS_ORIGINS` contains a literal `"*"`, since that's
 incompatible with the `allow_credentials=True` the app needs for cookie/Authorization-header
@@ -1049,10 +1077,19 @@ dependencies and against a startup where `init_db()` failed but Postgres itself 
 a live `SELECT 1` alone can't tell "Postgres is down" apart from "Postgres is up with no tables
 ever created" (§16 history)),
 `GET /api/me` (`api/auth.py:get_current_profile`, mounted directly in `main.py`),
-`GET /api/projects` (`chat.py:list_user_projects`), and `GET /api/jobs/{job_id}`
+`GET /api/projects` (`chat.py:list_user_projects`), `GET /api/jobs/{job_id}`
 (`api/jobs.py:get_job_status`, added Phase 5 — queries the job-state key a write job's `job_id`
 maps to, §5.2; scoped to the job's own `user_email` or a config admin, 404 rather than 403 on a
-mismatch).
+mismatch), and `POST /api/webhooks/drive` (`api/webhooks.py:drive_notification`, §11.2) — the
+**third** unauthenticated route, after `/api/health` and `/api/ready`, and the only one of the three
+that changes state. It cannot require a bearer token: Google Drive posts to it with no user
+credentials and no way to obtain any. It authenticates the *sender* instead — the notification must
+carry `X-Goog-Channel-Token` matching `settings.DRIVE_WEBHOOK_TOKEN` via `hmac.compare_digest`, and
+`X-Goog-Channel-ID` must match a `sheet_watch_channels` row this deployment actually registered — and
+an unconfigured `DRIVE_WEBHOOK_TOKEN` refuses every notification outright with 403 rather than
+accepting an unauthenticated write to `is_dirty`. `main.py` mounts `webhooks_router` with a comment
+recording that posture deliberately, so a future pass adding `Depends(get_current_user)` here would
+silently stop every notification rather than "fixing" an oversight.
 
 `docker-compose.yml`'s `backend` service now runs a `healthcheck` against `/api/ready` (interval
 30 s, 3 retries, `start_period` 15 s) — see §3.
@@ -1321,6 +1358,41 @@ wait for the people work: one listing "Madiha Shah Bukhari" and "Madiha" as two 
 separate overdue lists is worse than no digest, because mailing it makes a data-quality problem
 public and attributes real work to someone who does not exist.
 
+### 10.8 Drive watch control
+
+| Method | Path | Purpose | Citation |
+|---|---|---|---|
+| GET | `/api/watch/projects/{project_id}` | whether this project has a live push channel, and when it lapses | `watch.py:get_watch_status` |
+| POST | `/api/watch/projects/{project_id}` | open (or replace) the push channel for this project's spreadsheet | `watch.py:register_project_watch` |
+| DELETE | `/api/watch/projects/{project_id}` | close the push channel | `watch.py:stop_project_watch` |
+
+All three carry `dependencies=[Depends(require_admin)]` (`watch.py`) — the config-admin check of
+§6.1, not the row-level RBAC that gates tool dispatch. `api/watch.py`'s own module docstring gives
+the reason for keeping this file separate from `api/webhooks.py`: that one is unauthenticated by
+necessity and only ever invalidates a cache, while these endpoints are admin-gated and spend the
+caller's own Google credentials (via `deps.py:get_google_auth`, the same header-based path
+`/admin/projects/detect-metadata` and the dashboard reads use) to call Drive directly — keeping two
+opposite auth postures in one file is "the kind of adjacency that eventually produces a route
+missing its dependency."
+
+`POST` replaces rather than adds a second channel: `register_project_watch` looks up any existing
+`sheet_watch_channels` row for the project's `spreadsheet_id` and calls `drive.py:stop_watch` on it
+first, best-effort, before registering the new one — two live channels on one file would mean every
+edit notifies twice, and the second notification would find a cache the first had already
+invalidated. If Drive refuses the new registration (`drive.py:register_watch` returns `None` — most
+commonly because `PUBLIC_BASE_URL`'s domain isn't verified as a push-notification domain in the
+Cloud Console project), the endpoint answers `502` and the old channel, already stopped, is not
+replaced; if Drive refuses to *stop* the old one, that channel is simply left to lapse on its own
+expiration, since `api/webhooks.py:drive_notification` already ignores a notification whose channel
+ID matches no row. Both `POST` and `DELETE` refuse with the `_require_push_config` message of §3
+before calling Drive at all when `PUBLIC_BASE_URL` or `DRIVE_WEBHOOK_TOKEN` is unset.
+
+`GET` never touches Drive — it reads the stored `sheet_watch_channels` row (if any) and reports
+`active` (`expiration` still in the future), `expires_in_seconds`, and `needs_renewal`
+(`WATCH_RENEW_MARGIN_SECONDS`, 6 hours, from `drive.py`), alongside a `configured` flag so an admin
+can tell "no channel because push isn't set up" apart from "no channel because nobody has registered
+one yet."
+
 ---
 
 ## 11. Google Sheets Integration
@@ -1351,6 +1423,8 @@ errors propagate.
 | `bulk_update` | `write.py:bulk_update` | 2 + one `get_id_row_map` scan (not one `find_row_num` per target ID) |
 | `add_row` | `write.py:add_row` | 1 + headers, `values().append` |
 | `format_row` | `format.py:format_row` | `spreadsheets().batchUpdate` `repeatCell` |
+| `get_modified_time` | `drive.py:get_modified_time` | 1 Drive call — `files().get(fields="modifiedTime")`; spent on a cold or unverifiable tab as part of the §11.1 freshness check, never on a clean one |
+| `register_watch` / `stop_watch` | `drive.py:register_watch`, `drive.py:stop_watch` | 1 Drive call each — `files().watch()` / `channels().stop()`; only from `POST`/`DELETE /api/watch/projects/{id}` (§10.8), never from a read |
 
 `next_ricefw_id` (`meta.py:next_ricefw_id`) computes max+1 over parsed IDs, formatted `%03d`;
 `switch_module` (`meta.py:switch_module`) optionally verifies the tab exists then updates
@@ -1374,14 +1448,80 @@ misconfigured schema somehow never yields a short page — no real tracker shoul
 
 ### 11.1 The row cache
 
-Both the dashboard and the agent read through it. Agent reads did not, until this change: every
-`get_row`/`search_rows`/`summarize`/`data_quality` call re-scanned the whole tab, so one turn that
-ran `summarize`, then `get_row`, then `search_rows` scanned the same 412 rows three times, each
-scan paging up to 20 000 rows. The cache had existed since the grid landed; the agent simply never
-used it. (Earlier revisions of `CLAUDE.md` and the `migrationbot-sheets-testing` skill described a
-`sheet_records` Postgres table fronted by `read.py:_ensure_sheet_synced()` and
-`sheets/sync.py:sync_sheet_to_db()`. No such table, model or module has ever existed in this
-repository; both documents have been corrected.)
+Both the dashboard and the agent read through it. Agent reads did not, until the change that
+introduced this cache: every `get_row`/`search_rows`/`summarize`/`data_quality` call re-scanned the
+whole tab, so one turn that ran `summarize`, then `get_row`, then `search_rows` scanned the same
+412 rows three times, each scan paging up to 20 000 rows.
+
+Earlier revisions of this document, and of `CLAUDE.md` and the `migrationbot-sheets-testing` skill,
+recorded that a `sheet_records` Postgres table, `read.py:_ensure_sheet_synced()` and
+`sheets/sync.py:sync_sheet_to_db()` had been described but never built — a documented instance of
+this file asserting code that did not exist. That table now exists (`models/sheet_record.py`, §2),
+built for exactly the reason those earlier drafts anticipated, though not through the two function
+names they named: the durable tier is `sheets/records_cache.py`, and there is still no
+`sheets/sync.py` — nothing pushes data into Postgres on a schedule or in the background. A cached
+row is only ever written as the side effect of an ordinary read that found the tab dirty.
+
+**Three tiers, tried in order** (`rows_cache.py:get_tab_matrix`, whose own module docstring states
+this directly):
+
+1. **Redis**, 60 seconds (unchanged from before this change — see below).
+2. **Postgres** (`sheets/records_cache.py:read_tab`), no expiry. Serves the tab's rows until
+   something says the sheet changed, rather than until a timer says so.
+3. **Google Sheets**, live — `read.py:_fetch_all_rows` via the same paginated scan as ever. The
+   system of record, and the fallback for every failure in the two tiers above.
+
+**Freshness is a fact, not a timer, and the fact is established in `records_cache.py:_confirm_fresh`
+/ `_clean_without_drive` in this order:**
+
+1. **A live push channel.** If `sheet_watch_channels` holds an unexpired row for the spreadsheet,
+   Drive has undertaken to notify this deployment when the file changes (§11.2), so silence is
+   itself the evidence — the tab is clean, and this costs zero API calls of any kind. This is the
+   steady state a registered channel is for.
+2. **A recent confirmation.** Failing that, if `sheet_sync_state.checked_at` is less than
+   `FRESHNESS_GRACE_SECONDS` (30) old, the tab is trusted without asking again. This exists to
+   collapse a burst of reads arriving with Redis cold — several dashboard panels loading at once,
+   or several agent tool calls in one turn — into one Drive metadata call rather than one per read;
+   it is deliberately short, being the one window in which this tier can serve genuinely stale data.
+3. **Otherwise, ask Drive.** `drive.py:get_modified_time` fetches the file's current
+   `modifiedTime` and it is compared, as an opaque string, against `sheet_sync_state.drive_modified_time`.
+   A match confirms the tab and updates `checked_at`; a mismatch, or `get_modified_time` returning
+   `None` (no Drive scope on this session, an outage, a quota refusal), means the tab is **not**
+   clean.
+
+**Any failure anywhere in this tier — Postgres unreachable, the Drive call failing, an unexpected
+exception — is read as stale, never as an error.** `read_tab` and `store_tab` each wrap their whole
+body in `try/except`, log, and return `None` / swallow, matching the posture `rows_cache` already
+takes toward Redis: a cache is an optimisation, and losing it must cost quota, never correctness.
+The one deliberately asymmetric case is `get_modified_time` returning `None` — the module docstring
+in `sheets/drive.py` is explicit that this means "could not determine," and every caller treats
+"could not determine" the same as "changed."
+
+A cached row_number is meaningless unless it was scanned at the same `data_start_row` the caller is
+now asking about — a re-detected schema can move where data starts — so `read_tab` treats a
+`data_start_row` mismatch as a miss as well, even when the stored state is otherwise clean
+(`records_cache.py:read_tab`).
+
+**The version stamp is read *before* the live scan, not after** (`rows_cache.py:get_tab_matrix`,
+the comment directly above the `get_modified_time` call on the cold path; `records_cache.py:store_tab`'s
+docstring makes the same point from the write side). An edit landing on the sheet mid-scan would, if
+the stamp were read afterward, be recorded as already captured by a scan that in fact predates it —
+serving rows that never contained that edit, with the sync state insisting they are current. Reading
+first means the same mid-scan edit instead shows up as a `modifiedTime` mismatch on the *next*
+freshness check, which costs one redundant re-scan. That is the deliberately safe direction: the
+only failure mode left is doing one scan more than strictly necessary, never serving a value the
+spreadsheet does not hold.
+
+**There is no advisory lock**, and the absence is deliberate — `records_cache.py`'s module docstring
+explains the tradeoff directly. An earlier draft guarded refills with `pg_advisory_xact_lock` so
+that several concurrent readers of a cold tab would produce one scan instead of several. Doing that
+means holding a Postgres transaction open across a multi-second Google Sheets scan — trading a
+cheap, harmless duplicate read for a lock held across an external network call, which is a
+substantially worse failure mode under load (a slow or hung Sheets call would then hold a database
+lock, not just a slow request). `store_tab` is written to make the redundancy safe instead: each
+refill replaces the tab's rows wholesale inside one transaction, so racing refills simply converge
+on the same result, and the Redis tier in front already collapses the common case — most concurrent
+readers of a cold tab hit Redis before they ever reach Postgres.
 
 `read.py:_cached_matrix` is the entry point, and it imports `get_tab_matrix` *inside the function*
 because `rows_cache` imports `_fetch_all_rows` from `read.py` — module-scope would be a cycle. It
@@ -1424,21 +1564,91 @@ long timeout buys nothing but a longer wait before doing the work regardless. Th
 made this visible before production did — `tests/test_sheets` went from 1 second to 52 the moment
 agent reads started touching Redis that is not running here.
 
-**The suite keeps this cache cold**, via an autouse `cold_row_cache` fixture in
-`tests/conftest.py` that patches `rows_cache.redis_client` for every test. The key is
-`(spreadsheet_id, active_tab)`, which identifies data uniquely in production and not at all in the
-suite: nearly every read test builds a *different* fixture under the same `spreadsheet_id="sheet-123"`
-and `active_tab="SD"`, so they share one key. That was inert while only the dashboard read through
-the cache. Once agent reads did, the suite's behaviour split by environment — with no Redis running
-every call degraded to a live scan and 281 tests passed, while CI, which runs Redis as a service,
-had the first test warm the key and the next five read its rows instead of their own mock's:
-`data_quality` counted two blank statuses against a fixture holding one, and a module breakdown came
-back `"SD"` for a fixture whose only value is `"Sales & Distribution"`. Five failures, none a real
-defect, reproducible nowhere but CI. `tests/test_sheets/test_rows_cache.py` — the file whose subject
-*is* the caching — patches `redis_client` per test, and those patches nest inside the fixture and win.
+**The suite keeps both tiers cold**, via two autouse fixtures in `tests/conftest.py`:
+`cold_row_cache` patches `rows_cache.redis_client`, and `cold_record_cache` patches
+`records_cache.read_tab`/`store_tab`/`mark_dirty` to no-ops. Both exist for the same underlying
+reason and §15.3 covers the fixtures themselves in full — the summary here is why the Redis tier
+needed this in the first place. The cache key is `(spreadsheet_id, active_tab)`, which identifies
+data uniquely in production and not at all in the suite: nearly every read test builds a *different*
+fixture under the same `spreadsheet_id="sheet-123"` and `active_tab="SD"`, so they share one key.
+That was inert while only the dashboard read through the cache. Once agent reads did, the suite's
+behaviour split by environment — with no Redis running every call degraded to a live scan and 281
+tests passed, while CI, which runs Redis as a service, had the first test warm the key and the next
+five read its rows instead of their own mock's: `data_quality` counted two blank statuses against a
+fixture holding one, and a module breakdown came back `"SD"` for a fixture whose only value is
+`"Sales & Distribution"`. Five failures, none a real defect, reproducible nowhere but CI.
+`tests/test_sheets/test_rows_cache.py` and `tests/test_sheets/test_records_cache.py` — the files
+whose subject *is* the caching — patch the relevant client/functions per test, and those patches
+nest inside the autouse fixtures and win.
 
-This is deliberately *not* the durable, reconciled read model that a `sheet_records` table would
-be; that remains unbuilt.
+This is now the durable, reconciled read model earlier drafts of this section described as unbuilt.
+It remains, deliberately, a cache and not a second source of truth: §2 states the same property from
+the persistence-model side, and §16.7 records the one correctness question it does not answer —
+which of several rows sharing a duplicated ID a write actually meant.
+
+### 11.2 Drive change detection
+
+Google Sheets has **no cell-change webhook**. Google Drive has `files.watch`, and it is
+file-granular: a notification says a file changed and never says which cell, or even which tab —
+`sheets/drive.py`'s module docstring states this as the reason the whole layer exists in the shape
+it does. Everything in this section exists to answer one narrow question, "has this file changed
+since we last looked," and to feed that answer into §11.1's freshness check; nothing here ever reads
+spreadsheet content.
+
+**Scope.** `frontend/src/auth.ts`'s `GoogleProvider` `authorization.params.scope` now requests
+`https://www.googleapis.com/auth/drive.metadata.readonly` alongside the pre-existing
+`openid email profile https://www.googleapis.com/auth/spreadsheets`. The comment beside it in
+`auth.ts` explains the choice over the broader `drive.readonly`: the two Drive calls this layer
+makes — `files.get(fields="modifiedTime")` and `files.watch` — need only metadata, and
+`drive.readonly` would additionally grant read access to the *content* of every file in the user's
+Drive, a materially larger consent screen for zero extra capability here. `sheets/client.py:build_drive_service`'s
+docstring makes the identical point from the backend side.
+
+**Sessions minted before this shipped 403 on their first freshness check, and that is safe by
+construction.** Adding a scope does not retroactively grant it to a token issued under the old
+consent, so a user who does not sign in again is carrying a Google access token with no Drive
+access at all. `drive.py:get_modified_time` treats every failure — including that 403 — as "cannot
+determine," which §11.1 already defines as stale; the request falls through to a live Sheets scan,
+exactly as if Drive had never been wired in. The user notices nothing beyond a slower cache warm-up
+until they next sign out and back in, at which point the new consent screen grants the scope and
+freshness checks start succeeding.
+
+**Channels: registration, renewal, expiry.** A channel is opened per *spreadsheet* — one
+`sheet_watch_channels` row, unique on `spreadsheet_id` — via `POST /api/watch/projects/{id}` (§10.8),
+which an admin triggers by hand; nothing registers one automatically. `drive.py:register_watch`
+requests `WATCH_TTL_SECONDS` (24 hours) but trusts whatever `expiration` Drive actually grants back
+over what was asked for. There is no scheduler anywhere in this application — no cron, no
+APScheduler, no periodic task — so renewal rides on ordinary traffic instead of a timer.
+`records_cache.py:_maybe_renew_channel` runs on every read that finds a live channel, and when that
+channel has less than `WATCH_RENEW_MARGIN_SECONDS` (6 hours) left it re-registers using the
+credentials of whoever happened to be reading. A project anybody looks at therefore stays watched
+indefinitely; one nobody looks at lapses, and the first read after that pays for a `modifiedTime`
+check instead. That is the correct priority order, and the reason no scheduler was introduced for
+the single job that would have needed one — without this the push mechanism would decay silently
+into a poll after 24 hours, which is the kind of regression nobody notices because nothing breaks.
+
+The new channel is registered *before* the old one is stopped, so the file is never briefly
+unwatched; two readers racing there produce one extra channel that no row points at, which the
+handler ignores. Renewal failures are swallowed entirely — a read must not fail, or even
+noticeably slow, because a channel could not be extended, and what it falls back to is the same
+`modifiedTime` check a lapsed channel gets. `GET /api/watch/projects/{id}` exposes the same
+threshold as `needs_renewal` for an admin who wants to look, and `POST` re-registers by hand:
+`register_project_watch` stops the existing channel before opening a new one, so a channel is
+always replaced, never doubled. A channel that is
+simply allowed to lapse is survivable rather than a fault: reads fall back to the `modifiedTime`
+check of §11.1 and get chattier (one Drive call per freshness confirmation instead of zero), never
+incorrect. `api/webhooks.py:drive_notification`'s handling of an unrecognized channel ID — a quiet,
+logged no-op — is what makes a channel that failed to *stop* cleanly equally harmless: it keeps
+notifying Drive-side until it expires, and every one of those notifications finds no matching row
+and is ignored.
+
+**The two settings behind all of this, `PUBLIC_BASE_URL` and `DRIVE_WEBHOOK_TOKEN`
+(`config.py:Settings`), are optional with empty defaults — §3 covers why in full.** In short: making
+them required would crash-loop `backend` and `worker` on every deployment that had not yet set them,
+reproducing the exact `CORS_ORIGINS` outage documented there. Instead, reads keep working without
+either variable ever being set — they just never get a push, and lean entirely on the `modifiedTime`
+check — and only `POST`/`DELETE /api/watch/projects/{id}` refuse, with a message naming what's
+missing (`api/watch.py:_require_push_config`).
 
 ---
 
@@ -1946,10 +2156,21 @@ user has revealed the empty columns — so the file matches the columns on scree
 |---|---|---|---|
 | `postgres` | `postgres:16` | default | **none** |
 | `redis` | `redis:7-alpine` | `redis-server --requirepass $REDIS_PASSWORD` | **none** |
-| `backend` | `./backend` | `uvicorn app.main:app --host 0.0.0.0 --port 8000` | **none** |
+| `backend` | `./backend` | `alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000` | **none** |
 | `worker` | `./backend` | `python -m app.queue.worker` | none |
 | `frontend` | `./frontend` | `node server.js` | **none** |
 | `caddy` | `caddy:2-alpine` | default | `80:80`, `443:443` |
+
+**Migrations run from `backend`'s `command:` and only there**, even though `worker` is built from
+the identical image and could run `alembic upgrade head` just as easily. `docker-compose.yml`'s
+comment on the `backend` service states the reason directly: `backend` and `worker` are two
+containers started from one image (§1.1), so if both ran migrations on boot they would race each
+other against the same database on every `docker compose up`. Picking one owner avoids the race
+without needing a lock — the API owns the schema, the worker simply assumes it is current, and
+`alembic upgrade head` is safe to run unconditionally on every restart because it is a no-op once the
+database is already at head. `0001_baseline`'s self-stamping `upgrade()` (§2, §15.2) is what makes
+this safe on a database that predates migrations entirely, not just on one already under Alembic's
+control.
 
 **Only Caddy publishes.** Until 2026-08 this table read `5433:5432`, `6379:6379`, `8000:8000` and
 `3000:3000` — every one of which put a service on the public internet, since a compose `ports:`
@@ -1983,12 +2204,32 @@ NextAuth wildcard), `/api/auth/*` → frontend, `/api/*` → backend, `/ws*` →
 `ci.yml` runs two jobs on push/PR to `main`/`develop`: `lint-and-test` (Postgres + Redis service
 containers, `ruff check backend/app` — scoped to `E9,F` in `backend/pyproject.toml`'s
 `[tool.ruff.lint]` table, since a first-time broad rule set surfaced ~300 pre-existing findings
-unrelated to any given change — then `pytest -v` from `backend/` with coverage reported via
-`pytest-cov`, `DATABASE_URL` pointed at `migrationbot_test`, and
+unrelated to any given change — then a "Verify migrations" step, then `pytest -v` from `backend/`
+with coverage reported via `pytest-cov`, `DATABASE_URL` pointed at `migrationbot_test`, and
 `CORS_ORIGINS`/`ADMIN_EMAILS`/`DEFAULT_SPREADSHEET_ID` supplied) and `frontend-build` (`npm ci`,
 `npm run lint` — advisory only, `continue-on-error: true`, since the frontend carries ~49
 pre-existing lint errors of its own — then `npm run build`). No coverage floor is enforced yet;
 the first run's own numbers are the honest baseline to ratchet from.
+
+**The "Verify migrations" step runs `alembic upgrade head`, then `alembic check`, then
+`alembic downgrade base`**, against the empty `migrationbot_test` database the Postgres service
+container starts with, leaving it empty again for the test suite's own `create_all`-based fixtures
+to build on afterward. The step's own comment in `ci.yml` gives the reason it exists at all: this is
+the *only* place the migration chain ever runs. There is no Docker and no Postgres on the
+maintainer's development machine, per the step's own comment, so `alembic upgrade head` is
+unrunnable locally and running it for the first time against the production database would be the
+wrong place to discover a mistake.
+
+`alembic check` is the step that actually earns its keep, more than the upgrade it follows. It diffs
+the schema `alembic upgrade head` just produced against `app.models`' metadata and fails the job if
+they disagree — which is the only thing in this codebase that can catch a transcription slip in the
+hand-written `0001_baseline.py` (§2). The test suite cannot catch that slip: it builds its own schema
+with `init_db()`/`create_all` directly from the models (§2, §15.3), never through Alembic, so a
+baseline migration that quietly dropped a column, got a type wrong, or forgot a constraint would
+pass every other check in this pipeline and surface for the first time as a missing column against a
+live production database. `alembic downgrade base` proves the down path the same way, so a bad
+`downgrade()` — in either revision — is caught here rather than during whatever incident first needs
+it.
 
 `frontend/Dockerfile`'s builder stage sets `ARG JWT_SECRET=build-placeholder` / `ENV
 JWT_SECRET=$JWT_SECRET` as defence in depth against a future module-scope env read anywhere in a
@@ -2022,11 +2263,53 @@ touch ignored files — but any *other* untracked file in the repo directory is 
 
 ### 15.3 Tests
 
-55 test functions (58 collected cases, one being parametrised) across `tests/test_db.py` (4),
-`tests/test_core/test_core_logic.py` (24), `tests/test_sheets/test_sheets_logic.py` (22),
-`tests/integration/test_integration_logic.py` (5).
-`test_db.py` and the integration suite each define their own `setup_*` and `db_session` fixtures
-locally, both autouse.
+332 test functions across 20 files. `pytest tests/test_core tests/test_sheets` — the two
+directories that need neither Postgres nor Redis, and therefore the only ones runnable on a
+developer machine without Docker — collects 366 cases from 313 of those functions, the difference
+being parametrisation.
+
+Earlier revisions of this paragraph gave a total that summed only the four files they happened to
+name, omitting fourteen others; the count is stated in full here so it cannot drift that way again.
+The largest files are `test_core/test_aliases.py` (38), `test_core/test_health.py` (26),
+`test_core/test_column_profile.py` (26), `test_core/test_people_schema.py` (26),
+`test_core/test_core_logic.py` (24), `test_sheets/test_sheets_logic.py` (24) and — added with the
+durable row cache — `test_sheets/test_records_cache.py` (24), `tests/integration/test_records_cache_db.py`
+(10) and `test_core/test_webhooks.py` (8).
+
+Four of those files need a real database and are excluded from the local command above:
+`tests/test_db.py` (4) and `tests/integration/` (15 across two files). They run in CI, which
+provides Postgres and Redis as service containers. `test_db.py` and each integration file define
+their own `setup_*` and `db_session` fixtures locally, both autouse.
+
+`test_records_cache.py` is where §11.1's three claims about the durable tier are pinned down
+directly rather than only asserted in prose: tier ordering by call count (a clean tab must reach
+neither Sheets nor Drive), degradation by behaviour (every failure here becomes a live scan, never
+an exception reaching the caller), and the refill's row construction — ragged rows, a blank ID
+becoming `NULL` rather than an empty string, and above all a duplicated ID surviving as two distinct
+records rather than being collapsed by a unique constraint (§16.7). Its functions import
+`records_cache`'s functions by name at module scope specifically so they bind the real
+implementations *before* the autouse fixture below patches those same names — the two are the same
+mechanism used against each other on purpose.
+
+`test_webhooks.py` covers `POST /api/webhooks/drive` (§10, §11.2) end to end: the token check (a
+wrong token, a missing token, an unconfigured deployment, all 403), the `sync` handshake being
+ignored rather than treated as a change, an unknown channel ID being a quiet 200 rather than an
+error, a database failure still answering 200 so Drive does not retry into a storm, and — asserted
+directly rather than left implicit — that the route requires no `Authorization` header at all,
+because a future refactor adding one back would silently stop every real notification.
+
+**`cold_record_cache`** (`tests/conftest.py`), autouse alongside the pre-existing `cold_row_cache`,
+exists for exactly the reason that one does: `sheet_records` is keyed on `(spreadsheet_id, tab)`
+too, so the suite's shared `sheet-123`/`SD` fixtures would collide on it the same way they collide
+in Redis. The difference is that Postgres carries no 60-second TTL to eventually rescue a polluted
+key — a row written by one test stays visible to every test that runs after it, in that run and in
+the next one against the same database, which turns the Redis fixture's five-test flake into a
+persistent one. The fixture patches `records_cache.read_tab`/`store_tab`/`mark_dirty` to inert
+no-ops rather than the session factory underneath them, so a patched-out `read_tab` returns `None` —
+the same answer a cold or unverifiable tab gives in production — and every test exercises the live-scan
+path deliberately rather than by accident of leftover data. `test_records_cache.py`'s own
+module-scope imports (above) are what let it override this fixture for the tests whose subject the
+fixture would otherwise suppress entirely.
 
 **Both are now gated (Phase 0).** `require_test_database()` (`tests/conftest.py:require_test_database`)
 parses the database name out of `settings.DATABASE_URL` and raises `RuntimeError` unless it
@@ -2262,6 +2545,21 @@ stops a write from being enqueued against an ambiguous ID, and `find_row_num` ha
 instead of, or alongside, the ID) or a refusal at dispatch time when the target ID is not unique —
 both are scoped for a future stage, not attempted here.
 
+**`sheet_records.ix_sheet_records_primary_id` is deliberately non-unique, because of this.**
+`models/sheet_record.py:SheetRecord`'s docstring and `0002_sheet_records.py`'s migration comment
+both name the 27-of-412 figure above as the reason: a unique index on `(spreadsheet_id, tab,
+primary_id)` would silently discard the second cached row of every duplicated ID on each refill,
+turning a known reporting oddity into invisible data loss inside the cache itself. The table is
+keyed on `(spreadsheet_id, tab, row_number)` instead — sheet position, not the tracker's own ID — so
+both occurrences of a duplicated ID are stored and both come back from a scan. This makes duplicates
+**queryable in SQL for the first time**: `SELECT primary_id, count(*) FROM sheet_records GROUP BY
+spreadsheet_id, tab, primary_id HAVING count(*) > 1` finds every one of them directly, where before
+this cache existed the only way to find them was `core/health.py:assess_tab`'s `duplicate_id` check
+re-scanning the live sheet. **This does not fix the write ambiguity above** — it only makes the
+underlying condition easier to see. `find_row_num`, `update_cell`, `bulk_update` and the dashboard's
+inline reassign are all unchanged: a write aimed at the second occurrence of a duplicated ID still
+silently lands on the first, cache or no cache.
+
 ---
 
 ## 17. Appendix — Environment Variables
@@ -2284,4 +2582,6 @@ both are scoped for a future stage, not attempted here.
 | **`DB_PASSWORD`** | `docker-compose.yml` (`postgres`/`backend`/`worker` services) | **required under compose** — `${DB_PASSWORD:?…}` aborts startup if unset (§15.1) |
 | **`REDIS_PASSWORD`** | `docker-compose.yml` (`redis` `--requirepass`, substituted into `backend`/`worker` `REDIS_URL`) | **required under compose** — `${REDIS_PASSWORD:?…}` aborts startup if unset (§15.1) |
 | `NEXT_PUBLIC_WS_URL` | `useWebSocket.ts:connect` | empty in compose (`docker-compose.yml`, `frontend` service env) |
+| `PUBLIC_BASE_URL` | `sheets/drive.py:webhook_address`, `api/watch.py:_require_push_config` | `""` (`config.py:Settings`) — optional; unset means no Drive push channel can be registered, and reads fall back to polling `modifiedTime` (§11.2) |
+| `DRIVE_WEBHOOK_TOKEN` | `api/webhooks.py:drive_notification` (compared via `hmac.compare_digest`), `api/watch.py:register_project_watch` | `""` (`config.py:Settings`) — optional; unset means `POST /api/webhooks/drive` refuses every notification with 403 rather than accepting one unauthenticated (§11.2) |
 | `VPS_HOST` / `VPS_USER` / `VPS_SSH_KEY` / `VPS_PASSWORD` | `deploy.yml` (`appleboy/ssh-action` inputs) | GitHub secrets |

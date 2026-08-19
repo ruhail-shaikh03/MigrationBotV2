@@ -12,6 +12,8 @@ from app.api.dashboard import router as dashboard_router
 from app.api.aliases import router as aliases_router
 from app.api.audit import router as audit_router
 from app.api.digest import router as digest_router
+from app.api.webhooks import router as webhooks_router
+from app.api.watch import router as watch_router
 
 # Configure logging format
 logging.basicConfig(
@@ -84,3 +86,8 @@ app.include_router(dashboard_router, prefix="/api")
 app.include_router(aliases_router, prefix="/api")
 app.include_router(audit_router, prefix="/api")
 app.include_router(digest_router, prefix="/api")
+# Unauthenticated by necessity — Google Drive posts here with no user credentials. It
+# authenticates by shared secret instead (api/webhooks.py) and only ever invalidates a
+# cache. The third such route, after /api/health and /api/ready.
+app.include_router(webhooks_router, prefix="/api")
+app.include_router(watch_router, prefix="/api")

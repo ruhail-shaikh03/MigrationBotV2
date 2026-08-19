@@ -30,6 +30,12 @@ services:
   backend:
     build: ./backend
     container_name: migrationbot-backend
+    # Migrations run here and only here. Both this service and `worker` are built from the
+    # same image, so whichever ran them second would race the first; the API owns the schema
+    # and the worker assumes it. `alembic upgrade head` is safe to run on every boot — it is
+    # a no-op once the database is at head, and the baseline revision detects a schema that
+    # predates migrations and stamps itself rather than reissuing DDL (0001_baseline).
+    command: sh -c "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000"
     env_file:
       - .env
     environment:

@@ -59,3 +59,27 @@ def cold_row_cache():
     client.get.return_value = None
     with patch("app.sheets.rows_cache.redis_client", client):
         yield
+
+
+@pytest.fixture(autouse=True)
+def cold_record_cache():
+    """Keep the durable Postgres tier out of every test that is not about it.
+
+    The same collision the Redis fixture above exists to prevent, with the safety net
+    removed. `sheet_records` is keyed on `(spreadsheet_id, tab)` too, so the suite's shared
+    `sheet-123`/`SD` fixtures land on top of each other exactly as they did in Redis — but
+    Postgres has no 60-second TTL, so a row written by one test stays visible to every test
+    that runs after it, in that run and in the next one against the same database. In CI,
+    where Postgres is a real service, that turns cross-test contamination from a five-test
+    flake into a persistent one.
+
+    Patching the two entry points rather than the session factory keeps the failure mode
+    honest: `read_tab` returning None is the same answer a cold or unverifiable tab gives in
+    production, so tests exercise the live-scan path deliberately instead of by accident.
+    `test_records_cache.py` patches these back to the real implementations for the tests
+    whose subject they are, and those patches nest inside this one and win.
+    """
+    with patch("app.sheets.records_cache.read_tab", AsyncMock(return_value=None)), \
+         patch("app.sheets.records_cache.store_tab", AsyncMock(return_value=None)), \
+         patch("app.sheets.records_cache.mark_dirty", AsyncMock(return_value=None)):
+        yield

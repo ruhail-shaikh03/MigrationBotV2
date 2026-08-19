@@ -56,6 +56,32 @@ jobs:
       - name: Lint (ruff)
         run: ruff check backend/app
 
+      # The only place the migration chain can be executed at all: there is no Docker and
+      # no Postgres on the maintainer's machine, so `alembic upgrade head` is unrunnable
+      # locally and would otherwise first execute against the production database.
+      #
+      # `alembic check` is the part that earns its keep. It diffs the migrated schema
+      # against app.models and fails if they disagree, which is what proves the hand-written
+      # baseline actually matches the models it claims to reproduce — a transcription slip
+      # in 0001_baseline is invisible to the test suite (which builds its schema with
+      # create_all, not Alembic) and would surface only as a missing column in production.
+      - name: Verify migrations (upgrade from empty, then diff against models)
+        env:
+          DATABASE_URL: postgresql+asyncpg://migrationbot:test@localhost:5432/migrationbot_test
+          REDIS_URL: redis://localhost:6379
+          DEEPSEEK_API_KEY: mock-key
+          JWT_SECRET: test-secret-32-characters-long-xx
+          CORS_ORIGINS: "http://localhost:3000"
+          ADMIN_EMAILS: "admin@example.com"
+          DEFAULT_SPREADSHEET_ID: "test-spreadsheet-id"
+        run: |
+          cd backend
+          alembic upgrade head
+          alembic check
+          # Prove the down path too, so a bad downgrade is caught here rather than during
+          # an incident, and leave the database empty for the test suite's own create_all.
+          alembic downgrade base
+
       - name: Run Pytest
         env:
           DATABASE_URL: postgresql+asyncpg://migrationbot:test@localhost:5432/migrationbot_test
