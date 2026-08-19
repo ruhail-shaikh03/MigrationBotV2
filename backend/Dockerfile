@@ -18,6 +18,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy source code
 COPY app /workspace/app
+# Migrations ship with the image so `alembic upgrade head` can run at container start.
+COPY alembic.ini /workspace/alembic.ini
+COPY migrations /workspace/migrations
 
 EXPOSE 8000
 

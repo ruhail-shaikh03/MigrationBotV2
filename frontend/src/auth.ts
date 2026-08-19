@@ -138,7 +138,17 @@ export const { handlers, signIn, signOut, auth } = NextAuth({
       clientSecret: process.env.GOOGLE_CLIENT_SECRET,
       authorization: {
         params: {
-          scope: "openid email profile https://www.googleapis.com/auth/spreadsheets",
+          // drive.metadata.readonly is the change-detection scope, not a data scope: it
+          // covers files.get(fields=modifiedTime) and files.watch, which is all the row
+          // cache needs to learn that a spreadsheet changed. drive.readonly would also
+          // work and would additionally grant read access to the content of every file in
+          // the user's Drive — a much larger consent for no extra capability here.
+          //
+          // Adding a scope invalidates nothing, but sessions minted before it carry tokens
+          // without Drive access, so those users' freshness checks 403 until they sign in
+          // again. The backend treats any Drive failure as "assume stale" and falls back to
+          // a live scan, so that window is slower, never broken.
+          scope: "openid email profile https://www.googleapis.com/auth/spreadsheets https://www.googleapis.com/auth/drive.metadata.readonly",
           prompt: "consent",
           access_type: "offline",
           response_type: "code"
