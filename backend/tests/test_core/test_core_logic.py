@@ -256,6 +256,64 @@ def test_data_quality_checker_handles_assignee_at_column_zero():
     assert any("not registered in permissions" in m for m in messages)
 
 
+# 6b. §16.3: the checker used to fall back to one customer's literal headers, so a tracker
+# using none of them reported no alerts — indistinguishable from a clean sheet.
+def test_unrelated_tracker_reports_what_it_could_not_check():
+    headers = ["Task ID", "Owner", "Progress"]
+    rows = [["T-1", "sam@example.com", "In progress"]]
+    schema = {"primary_id_column": "Task ID", "people_columns": [{"key": "owner", "header": "Owner"}]}
+
+    alerts = DataQualityChecker(headers, rows, schema).consistency_checks(valid_emails=[])
+
+    info = [a for a in alerts if a["severity"] == "info"]
+    assert len(info) == 1
+    # The sign-off and completion-date checks cannot run on a sheet with no date columns,
+    # and saying so is the point — silence would read as a pass.
+    assert "finished-without-sign-off" in info[0]["message"]
+    assert "finished-without-completion-date" in info[0]["message"]
+
+
+def test_checker_without_a_primary_id_column_says_so():
+    checker = DataQualityChecker(["A", "B"], [["1", "2"]], {})
+    assert checker.consistency_checks() == []
+    assert checker.skipped and "no primary ID column" in checker.skipped[0]
+
+
+def test_default_critical_fields_only_names_columns_the_sheet_has():
+    """No literals: a column the schema declares but the sheet lacks is not measured."""
+    headers = ["Task ID", "Owner"]
+    schema = {
+        "primary_id_column": "Task ID",
+        "status_column": "Dev Status",          # declared, absent from this sheet
+        "people_columns": [{"key": "owner", "header": "Owner"}],
+    }
+    fields = DataQualityChecker(headers, [], schema).default_critical_fields()
+    assert fields == ["Task ID", "Owner"]
+
+
+def test_duplicate_ids_are_reported_to_the_agent():
+    """The dashboard health panel already showed these; the agent's tool did not, so it
+    could not explain why a write against one was refused (§16.7)."""
+    headers = ["Task ID", "Owner"]
+    rows = [["T-1", "a"], ["T-2", "b"], ["t-1", "c"]]
+    schema = {"primary_id_column": "Task ID"}
+
+    alerts = DataQualityChecker(headers, rows, schema).consistency_checks()
+
+    dupes = [a for a in alerts if "Duplicated" in a["message"]]
+    assert len(dupes) == 1
+    assert dupes[0]["ids"] == ["T-1"]
+    assert dupes[0]["severity"] == "error"
+
+
+def test_add_row_requires_only_a_description():
+    """A sheet with no category or type column must still be writable (§16.3)."""
+    from app.core.tool_schemas import TOOLS
+
+    add_row = next(t for t in TOOLS if t["function"]["name"] == "add_row")
+    assert add_row["function"]["parameters"]["required"] == ["description"]
+
+
 # 7. Regression for TDD (prior §16.8, "optimistic write result misleads the model"): a
 # queued write result must never be fed back to the model as if it already succeeded.
 @pytest.mark.asyncio

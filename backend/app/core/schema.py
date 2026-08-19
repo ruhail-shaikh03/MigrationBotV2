@@ -181,3 +181,40 @@ def bind_columns(
         if header:
             out.append({**col, "header": header})
     return out
+
+
+def default_critical_headers(
+    tab_schema: dict, headers: Optional[List[str]] = None
+) -> List[str]:
+    """The columns worth reporting on when nobody has named `critical_fields` explicitly.
+
+    Built from schema roles — id, module, type, description, status, then every people
+    column — and filtered to the headers this tab actually has. Three call sites used to
+    carry the same literal list from one customer's WRICEF tracker
+    (`["RICEFW ID", "Module", "Type", "Description", "Dev Status", "Technical Resource "]`):
+    `search_rows`' default return fields, `run_data_quality_check`'s blank-field default,
+    and `DataQualityChecker.completeness_score`. On any other sheet all three resolved to
+    columns that do not exist, so search returned nothing useful and the quality checks
+    counted every row as blank (§16.3).
+
+    Returns headers in the tab's own spelling, resolved through `resolve_header`, so the
+    result can be used as a row-dict key directly.
+    """
+    roles = [
+        tab_schema.get("primary_id_column"),
+        tab_schema.get("module_column"),
+        tab_schema.get("type_column"),
+        tab_schema.get("description_column"),
+        tab_schema.get("status_column"),
+    ]
+    people = [p.get("header") for p in get_people_columns(tab_schema)]
+
+    out: List[str] = []
+    for wanted in roles + people:
+        if not wanted:
+            continue
+        # With no header list to check against, the schema's own spelling is all there is.
+        resolved = resolve_header(headers, wanted) if headers else wanted
+        if resolved and resolved not in out:
+            out.append(resolved)
+    return out

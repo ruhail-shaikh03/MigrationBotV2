@@ -85,10 +85,16 @@ async def next_ricefw_id(
     data_start_row: int, 
     primary_id_pos: str = "B"
 ) -> str:
-    """Generate the next sequentially incremented RICEFW ID for a module."""
+    """Generate the next sequentially incremented ID, scoped to a module when there is one.
+
+    `module` may be empty: not every tracker has a category column, and requiring one made
+    `add_row` unusable on sheets that don't (§16.3). With no module the sequence is scoped
+    to the prefix alone, and the emitted ID drops the module segment rather than leaving it
+    blank — an empty segment produced ids like `"-001"` and `"PREFIX--001"`.
+    """
     actual_prefix = prefix if prefix is not None else await detect_prefix(service, spreadsheet_id, sheet_name, data_start_row, primary_id_pos)
     all_ids = await get_all_ids(service, spreadsheet_id, sheet_name, data_start_row, primary_id_pos)
-    
+
     nums = []
     module_upper = module.strip().upper()
     prefix_upper = actual_prefix.strip().upper() if actual_prefix else ""
@@ -99,19 +105,25 @@ async def next_ricefw_id(
             curr_prefix = parts[0].upper()
             curr_module = parts[1].upper()
             curr_num_str = parts[-1]
-            if (not prefix_upper or curr_prefix == prefix_upper) and curr_module == module_upper and curr_num_str.isdigit():
+            prefix_ok = not prefix_upper or curr_prefix == prefix_upper
+            module_ok = not module_upper or curr_module == module_upper
+            if prefix_ok and module_ok and curr_num_str.isdigit():
                 nums.append(int(curr_num_str))
         elif len(parts) == 2:
             curr_module = parts[0].upper()
             curr_num_str = parts[1]
-            if curr_module == module_upper and curr_num_str.isdigit():
+            # With no module to scope by, the leading segment is whatever this sheet uses
+            # — prefix or module — so only the numeric tail is meaningful.
+            module_ok = curr_module == module_upper if module_upper else True
+            if module_ok and curr_num_str.isdigit():
                 nums.append(int(curr_num_str))
+        elif len(parts) == 1 and not module_upper and parts[0].isdigit():
+            nums.append(int(parts[0]))
 
     next_num = (max(nums) + 1) if nums else 1
-    if prefix_upper:
-        return f"{prefix_upper}-{module_upper}-{next_num:03d}"
-    else:
-        return f"{module_upper}-{next_num:03d}"
+    segments = [s for s in (prefix_upper, module_upper) if s]
+    segments.append(f"{next_num:03d}")
+    return "-".join(segments)
 
 
 async def switch_module(

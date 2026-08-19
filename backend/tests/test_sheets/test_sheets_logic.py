@@ -7,7 +7,7 @@ from googleapiclient.errors import HttpError
 
 from app.sheets.retry import _with_retry
 from app.core.errors import AMBIGUOUS_ID
-from app.sheets.meta import get_id_row_map
+from app.sheets.meta import get_id_row_map, next_ricefw_id
 from app.sheets.read import (
     find_all_row_nums, find_row_num, get_bulk_rows_raw, search_rows, summarize,
     run_data_quality_check,
@@ -180,6 +180,54 @@ async def test_update_cell_rejects_a_row_number_that_no_longer_holds_the_id():
     assert res["ok"] is False
     assert "no longer holds" in res["error"]
     service.spreadsheets().values().batchUpdate.assert_not_called()
+
+
+# 2c. §16.3: a tracker with no category column must still get a well-formed new ID.
+@pytest.mark.asyncio
+async def test_next_id_without_a_module_drops_the_segment():
+    """An empty module used to produce `"-001"` / `"PREFIX--001"`, because the segment was
+    interpolated whether or not it had a value."""
+    service = _id_column_service([["001"], ["002"]])
+
+    new_id = await next_ricefw_id(
+        service=service, spreadsheet_id="sheet-123", sheet_name="Tasks",
+        module="", prefix="", data_start_row=3, primary_id_pos="B",
+    )
+
+    assert new_id == "003"
+
+
+@pytest.mark.asyncio
+async def test_next_id_still_scopes_by_module_when_there_is_one():
+    service = _id_column_service([["SD-001"], ["FI-001"], ["SD-002"]])
+
+    new_id = await next_ricefw_id(
+        service=service, spreadsheet_id="sheet-123", sheet_name="Tasks",
+        module="SD", prefix="", data_start_row=3, primary_id_pos="B",
+    )
+
+    assert new_id == "SD-003"
+
+
+@pytest.mark.asyncio
+async def test_search_returns_whole_rows_when_the_schema_names_no_roles():
+    """§16.3: the default return-field list was one customer's literal headers. On a tab
+    whose schema declares no roles it must not resolve to zero fields and hand back rows
+    with no cells in them."""
+    service = _mock_service_for_sheet(
+        headers_row=["Task ID", "Owner", "Progress"],
+        data_rows=[["T-1", "Sam", "Doing"]],
+    )
+
+    result = await search_rows(
+        spreadsheet_id="sheet-123", active_tab="Tasks",
+        filters=[{"field": "Owner", "value": "Sam", "match_type": "exact"}],
+        return_fields=None, limit=50,
+        schema_config={"data_start_row": 3}, column_map={}, service=service,
+    )
+
+    assert result["count"] == 1
+    assert result["rows"][0] == {"Task ID": "T-1", "Owner": "Sam", "Progress": "Doing"}
 
 
 # 3. Test queue job enqueuing

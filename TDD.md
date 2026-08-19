@@ -2342,9 +2342,9 @@ touch ignored files — but any *other* untracked file in the repo directory is 
 
 ### 15.3 Tests
 
-340 test functions across 20 files. `pytest tests/test_core tests/test_sheets` — the two
+348 test functions across 20 files. `pytest tests/test_core tests/test_sheets` — the two
 directories that need neither Postgres nor Redis, and therefore the only ones runnable on a
-developer machine without Docker — collects 374 cases from 321 of those functions, the difference
+developer machine without Docker — collects 382 cases from 329 of those functions, the difference
 being parametrisation.
 
 Earlier revisions of this paragraph gave a total that summed only the four files they happened to
@@ -2465,9 +2465,36 @@ idempotency key checked before the mutation rather than after it; the window is 
 it hasn't been observed, and it is recorded here rather than papered over.
 
 ### 16.3 SAP-specific assumptions still remain outside the prompt and tool schemas
-**Severity: medium.** The hard blocks were removed (§7.3, §8.1) and *who a row is assigned to* is
-now derived from value shape rather than English role vocabulary (§7.5), which was the largest
-remaining gap. What follows is what is still not generic:
+**Severity: low — the quality engine and `add_row` were made generic; naming remains.** The hard
+blocks were removed (§7.3, §8.1) and *who a row is assigned to* is now derived from value shape
+rather than English role vocabulary (§7.5), which was the largest remaining gap.
+
+**Resolved in this pass:**
+
+- **`core/data_quality.py` no longer carries literal headers.** Every column comes from a schema
+  role via `_schema_header` / `_date_header` / `_people_headers`, and a check with no column to
+  run against is *reported* rather than skipped in silence — `consistency_checks` appends an
+  `info` alert naming what it could not check. Silence and a clean bill of health had been
+  indistinguishable, which is the specific failure §10.4 cites for not reusing this class. It also
+  now reads finished statuses through `core/overdue.py:is_finished_status` instead of a fourth
+  private copy of that vocabulary, checks *every* people column rather than one, and reports
+  duplicated IDs (§16.7) so the agent can explain a refused write.
+- **One shared default instead of three literal copies.** `schema.py:default_critical_headers`
+  derives id/module/type/description/status plus every people column, resolved against the tab's
+  real headers. It replaces the identical hardcoded list that had been sitting in `search_rows`,
+  `run_data_quality_check` and `completeness_score`. `search_rows` additionally falls back to
+  *all* headers when a tab declares no roles at all, rather than returning rows with no cells.
+- **The alias map is genuinely last-resort now.** `search_rows` matched a filter term through
+  `resolve_column` *before* checking the real headers, so a sheet with its own `Owner` column had
+  that term rewritten to a canonical WRICEF header it does not have and the search failed with
+  "could not be mapped" while pointing at a column plainly on screen. An exact header match now
+  wins outright.
+- **`add_row` requires only `description`.** `module` and `type` were in the schema's `required`
+  list — a hard constraint the model cannot emit around — which forced it to invent values for
+  columns a sheet may not have. `meta.py:next_ricefw_id` was fixed alongside it: an empty module
+  used to be interpolated anyway, producing ids like `"-001"` and `"PREFIX--001"`.
+
+What follows is what is still not generic:
 
 - **Inline column defaults.** `read.py`/`write.py`/`worker.py` still default
   `primary_id_column` → `"RICEFW ID"`, `status_column` → `"Dev Status"` and `assignee_column` →
@@ -2477,18 +2504,17 @@ remaining gap. What follows is what is still not generic:
   so a key present-but-null no longer defeats the fallback; that spelling is what broke the overdue
   report on every project (§16.6). The deadline column no longer has an inline default at all —
   `schema.py:get_due_column` resolves it, falling back to a header scan.
-- **`core/data_quality.py` is written against one customer's tracker.** `consistency_checks` and
-  `completeness_score` fall back to literal `"RICEFW ID"`, `"Dev Status"`, `"Required"`,
-  `"Sign-Off Date"` and `"Completion Date"` headers, and on a sheet carrying none of them they
-  return `[]` and `100.0` respectively — *no problems found* and *perfect*, from a checker that
-  resolved nothing. It is reachable only through the agent's `data_quality` tool, where a human
-  reads the output in context. The dashboard's health panel was originally planned to reuse it and
-  deliberately does not; `core/health.py` drives every check from `schema_config` instead (§10.4).
-  Making `DataQualityChecker` itself generic is unstarted work, and until it is done its output
-  should not be surfaced anywhere a reader would take silence for a clean bill of health.
-- **`add_row` requires `module` and `type`.** Both are `required` in the tool schema and consumed
-  by `worker.py:process_job`. A sheet with no category or type column cannot satisfy them. Making
-  them optional means touching the write path, so it was left alone.
+- **`"Required"` is still a literal in `data_quality.py`.** It is the one column with no schema
+  role to resolve through, so it is treated as an optional column most sheets will not have: when
+  absent, the required-without-status check reports itself skipped rather than silently passing.
+  Giving it a schema role is the tidier fix and was not attempted.
+- **`module_column` → `"Module"` still defaults inline** in `read.py`'s `summarize` and the
+  `data_quality` scope filter. Lower risk than the others — it only scopes an optional filter, and
+  "Module" is not SAP vocabulary the way "RICEFW ID" is — but it is the same class of bug.
+- **`core/health.py` and `core/data_quality.py` still overlap.** Both now drive off
+  `schema_config`, and both implement a duplicate-ID check. The reason for not reusing one from
+  the other (§10.4) was that `DataQualityChecker` was SAP-shaped; that reason no longer holds, so
+  the split is now duplication rather than a deliberate separation and should be revisited.
 - **The `ricefw_id` parameter key** is unchanged across `tool_dispatch.py`, `read.py`, `write.py`
   and `worker.py`. Cosmetic for the model (its description no longer implies SAP), but it keeps the
   domain baked into the wire format.
