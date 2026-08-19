@@ -93,26 +93,81 @@ async def _cached_matrix(
     return await get_tab_matrix(service, spreadsheet_id, active_tab, data_start_row)
 
 
-async def find_row_num(
-    service: Any, 
-    spreadsheet_id: str, 
-    sheet_name: str, 
-    ricefw_id: str, 
+async def find_all_row_nums(
+    service: Any,
+    spreadsheet_id: str,
+    sheet_name: str,
+    ricefw_id: str,
     data_start_row: int,
     primary_id_pos: str = "B"
-) -> Optional[int]:
-    """Scans the ID column to map a RICEFW ID string to its spreadsheet row index."""
+) -> List[int]:
+    """Every spreadsheet row whose ID column holds this ID, in sheet order.
+
+    Returns a list rather than the first hit because a tracker's ID column is not
+    guaranteed unique — 27 of 412 rows on the reference sheet share an ID (§16.7) —
+    and a caller that cannot see the duplication cannot refuse to act on it.
+    """
     key = ricefw_id.strip().upper()
     col = primary_id_pos or "B"
     result = await _with_retry(lambda: service.spreadsheets().values().get(
         spreadsheetId=spreadsheet_id,
         range=f"{sheet_name}!{col}{data_start_row}:{col}"
     ).execute())
-    
-    for i, row in enumerate(result.get("values", [])):
-        if row and str(row[0]).strip().upper() == key:
-            return data_start_row + i
-    return None
+
+    return [
+        data_start_row + i
+        for i, row in enumerate(result.get("values", []))
+        if row and str(row[0]).strip().upper() == key
+    ]
+
+
+async def find_row_num(
+    service: Any,
+    spreadsheet_id: str,
+    sheet_name: str,
+    ricefw_id: str,
+    data_start_row: int,
+    primary_id_pos: str = "B"
+) -> Optional[int]:
+    """The first row matching this ID, or None.
+
+    Kept for read-side callers that only need *a* row. Write paths must use
+    `find_all_row_nums` and refuse on more than one match — silently taking the first
+    is precisely the bug §16.7 records.
+    """
+    matches = await find_all_row_nums(
+        service, spreadsheet_id, sheet_name, ricefw_id, data_start_row, primary_id_pos
+    )
+    return matches[0] if matches else None
+
+
+async def cached_id_row_nums(
+    spreadsheet_id: str,
+    active_tab: str,
+    ricefw_id: str,
+    schema_config: dict,
+    service: Any
+) -> List[int]:
+    """Rows matching this ID, answered from the cache tiers rather than a fresh scan.
+
+    Used only to refuse an ambiguous write early, so the user hears about it at dispatch
+    instead of as a queue failure seconds later. Advisory by construction: the cache can
+    be up to 60s stale, and the authoritative check is the live scan the worker already
+    performs inside `write.update_cell` (§16.7). Costs zero Sheets calls whenever the tab
+    is already cached, which is why the guard can be unconditional.
+    """
+    tab_schema = get_tab_schema(schema_config, active_tab)
+    data_start_row = tab_schema.get("data_start_row", 3)
+    id_idx = _column_letter_to_index(tab_schema.get("primary_id_position", "B"))
+
+    _, rows, _ = await _cached_matrix(service, spreadsheet_id, active_tab, data_start_row)
+
+    key = ricefw_id.strip().upper()
+    return [
+        data_start_row + i
+        for i, row in enumerate(rows)
+        if id_idx < len(row) and str(row[id_idx]).strip().upper() == key
+    ]
 
 
 async def get_row_raw(
@@ -121,15 +176,24 @@ async def get_row_raw(
     ricefw_id: str,
     fields: List[str],
     schema_config: dict,
-    service: Any
+    service: Any,
+    row_number: Optional[int] = None
 ) -> Dict[str, str]:
-    """Helper to fetch a single row's current values for auditing."""
+    """Helper to fetch a single row's current values for auditing.
+
+    `row_number` reads that physical row instead of resolving the ID. The dashboard passes
+    it so the audit "before" value describes the row the write will actually land on — on
+    a duplicated ID the two are not the same row, and an audit entry describing the wrong
+    one is what undo would later try to restore (§10.5, §16.7).
+    """
     schema_config = get_tab_schema(schema_config, active_tab)
     data_start_row = schema_config.get("data_start_row", 3)
     header_row_num = data_start_row - 1
     primary_id_pos = schema_config.get("primary_id_position", "B")
 
-    row_num = await find_row_num(service, spreadsheet_id, active_tab, ricefw_id, data_start_row, primary_id_pos)
+    row_num = row_number
+    if row_num is None:
+        row_num = await find_row_num(service, spreadsheet_id, active_tab, ricefw_id, data_start_row, primary_id_pos)
     if row_num is None:
         return {}
 
@@ -193,11 +257,15 @@ async def get_bulk_rows_raw(
     headers = await get_header_row(service, spreadsheet_id, active_tab, header_row_num)
     id_row_map = await get_id_row_map(service, spreadsheet_id, active_tab, data_start_row, primary_id_pos)
 
+    # Only unambiguous IDs get an audit "before" value. An ID matching several rows is
+    # one bulk_update will refuse outright, and reading one of its rows here would put a
+    # "before" value in the audit trail for a row that was never written — which is the
+    # value undo would later try to restore (§10.5).
     resolved: Dict[str, int] = {}
     for rid in target_ids:
-        row_num = id_row_map.get(rid.strip().upper())
-        if row_num is not None:
-            resolved[rid] = row_num
+        row_nums = id_row_map.get(rid.strip().upper()) or []
+        if len(row_nums) == 1:
+            resolved[rid] = row_nums[0]
 
     if not resolved:
         return {}

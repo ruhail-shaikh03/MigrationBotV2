@@ -2,8 +2,9 @@ import logging
 from typing import Any
 from app.sheets.retry import _with_retry
 from app.sheets.meta import get_sheet_id, get_header_row
-from app.sheets.read import find_row_num
+from app.sheets.read import find_all_row_nums
 from app.core.column_mapper import resolve_column
+from app.core.errors import ambiguous_id_result
 
 logger = logging.getLogger("sheets_format")
 
@@ -35,9 +36,14 @@ async def format_row(
     primary_id_pos = tab_schema.get("primary_id_position", "B")
     column_map = tab_schema.get("column_map") or schema_config.get("column_map") or {}
 
-    row_num = await find_row_num(service, spreadsheet_id, sheet_tab, ricefw_id, data_start_row, primary_id_pos)
-    if row_num is None:
+    row_nums = await find_all_row_nums(service, spreadsheet_id, sheet_tab, ricefw_id, data_start_row, primary_id_pos)
+    if not row_nums:
         return {"ok": False, "error": f"RICEFW ID '{ricefw_id}' not found."}
+    if len(row_nums) > 1:
+        # Colouring the wrong row is quieter than writing to it, and therefore worse:
+        # it looks applied, and the row that should have been flagged still isn't.
+        return ambiguous_id_result(ricefw_id, row_nums, "format_row")
+    row_num = row_nums[0]
 
     rgb = COLOR_MAP.get(color.lower().strip(), COLOR_MAP["white"])
     sheet_id = await get_sheet_id(service, spreadsheet_id, sheet_tab)

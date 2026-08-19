@@ -1,7 +1,7 @@
 import logging
 from typing import Dict, Any, Optional
 
-from app.core.errors import error_result, INVALID_REQUEST, USER_MESSAGE
+from app.core.errors import ambiguous_id_result, error_result, INVALID_REQUEST, USER_MESSAGE
 
 logger = logging.getLogger("tool_dispatch")
 
@@ -103,6 +103,26 @@ async def dispatch_tool(
         try:
             from app.sheets.client import build_sheets_service
             service = build_sheets_service(google_access_token, google_refresh_token)
+
+            # Refuse an ambiguous single-row target before it reaches the queue. The
+            # worker re-checks against a live scan and is what actually guarantees
+            # correctness; this exists so the user is told at dispatch rather than
+            # waiting for a queue_update failure. Answered from cache, so normally free.
+            if tool_name in ("update_cell", "format_row") and args.get("row_number") is None:
+                target_id = args.get("ricefw_id")
+                if target_id:
+                    try:
+                        from app.sheets.read import cached_id_row_nums
+                        matches = await cached_id_row_nums(
+                            spreadsheet_id, active_tab, target_id, schema_config, service
+                        )
+                    except Exception as ce:
+                        # A cache that cannot answer must not block a write the worker
+                        # would have accepted — same rule as every other cache tier.
+                        logger.warning(f"Ambiguity pre-check unavailable for {target_id}: {ce}")
+                        matches = []
+                    if len(matches) > 1:
+                        return ambiguous_id_result(target_id, matches, tool_name)
 
             # Pre-read current state to preserve 'old_value' for audit logging
             old_values = {}

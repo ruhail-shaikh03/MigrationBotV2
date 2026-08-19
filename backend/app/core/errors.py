@@ -29,12 +29,34 @@ logger = logging.getLogger("tool_errors")
 # tool call could plausibly succeed — only INVALID_REQUEST and NOT_FOUND qualify.
 INVALID_REQUEST = "invalid_request"
 NOT_FOUND = "not_found"
+AMBIGUOUS_ID = "ambiguous_id"
 PERMISSION = "permission"
 AUTH = "auth"
 RATE_LIMIT = "rate_limit"
 INFRASTRUCTURE = "infrastructure"
 UPSTREAM = "upstream"
 UNKNOWN = "unknown"
+
+
+class AmbiguousRowError(Exception):
+    """A primary ID matched more than one row, so no single row can be addressed.
+
+    Raised by the read path, where returning a sentinel would just be re-checked by
+    every caller. The write path returns `ambiguous_id_result()` instead, because the
+    worker reads `{"ok": ...}` dicts rather than catching (queue/worker.py:157).
+    Both routes end up classified as AMBIGUOUS_ID.
+    """
+
+    def __init__(self, primary_id: str, row_nums: Any):
+        self.primary_id = primary_id
+        self.row_nums = list(row_nums)
+        super().__init__(_ambiguity_detail(primary_id, self.row_nums))
+
+
+def _ambiguity_detail(primary_id: str, row_nums: Any) -> str:
+    nums = list(row_nums)
+    rows = ", ".join(str(n) for n in nums)
+    return f"'{primary_id}' matches {len(nums)} rows in this tab (rows {rows})."
 
 # What the model is told after each class of failure. Note that only the first
 # two invite a retry; the rest explicitly forbid one, because a retry there just
@@ -47,6 +69,12 @@ MODEL_GUIDANCE: Dict[str, str] = {
     NOT_FOUND: (
         "The record or column named does not exist in this tab. Use search_rows to locate the "
         "correct one before retrying, or tell the user it isn't there."
+    ),
+    AMBIGUOUS_ID: (
+        "That ID appears on more than one row, so there is no way to tell which one was meant. "
+        "Do NOT retry the identical call and do NOT guess a row — nothing you can put in the "
+        "arguments resolves this. Tell the user the ID is duplicated, name the row numbers, and "
+        "ask which row they mean or suggest they fix the duplicate in the sheet."
     ),
     PERMISSION: (
         "The user is not permitted to do this. Do NOT retry — say plainly which action was "
@@ -78,13 +106,21 @@ MODEL_GUIDANCE: Dict[str, str] = {
 # Shown to the user. Deliberately free of infrastructure nouns — "Redis",
 # "replica" and "asyncpg" mean nothing to someone editing a tracker.
 #
-# UNKNOWN is the exception: it means classification found nothing to say, so the
-# raw exception text is the *only* information available and suppressing it would
-# leave the user with a bare "Something went wrong". `error_result` appends the
-# detail for that kind alone — see _MAX_DETAIL_CHARS below.
+# Two kinds carry their detail through instead of replacing it:
+#
+#   UNKNOWN, because classification found nothing to say, so the raw exception text
+#   is the *only* information available and suppressing it would leave the user with
+#   a bare "Something went wrong".
+#
+#   AMBIGUOUS_ID, because the row numbers ARE the message. "That ID matches more than
+#   one row" without saying which rows leaves the user no way to act; with them, they
+#   can go look at rows 47 and 214 and decide which one they meant.
+#
+# See _CARRIES_DETAIL and _MAX_DETAIL_CHARS below.
 USER_MESSAGE: Dict[str, str] = {
     INVALID_REQUEST: "That didn't match the sheet's structure.",
     NOT_FOUND: "I couldn't find that record in this tab.",
+    AMBIGUOUS_ID: "That ID is on more than one row, so I didn't change anything.",
     PERMISSION: "You don't have permission to do that.",
     AUTH: "Your Google session expired — please sign out and back in.",
     RATE_LIMIT: "Google Sheets is rate-limiting us. Try again in a moment.",
@@ -98,17 +134,22 @@ USER_MESSAGE: Dict[str, str] = {
 # characters of URL and HTML, so an appended detail is capped.
 _MAX_DETAIL_CHARS = 180
 
+# The kinds whose detail is information the user needs, not infrastructure noise.
+_CARRIES_DETAIL = frozenset({UNKNOWN, AMBIGUOUS_ID})
+
 
 def user_message_for(kind: str, detail: str) -> str:
     """The message a human should see for this failure.
 
-    For every classified kind the curated sentence is strictly better than the
+    For most classified kinds the curated sentence is strictly better than the
     exception text — "You can't write against a read only replica" reads as a
-    spreadsheet permissions problem, which it isn't. For UNKNOWN there is no
-    curated knowledge to substitute, so the detail is carried through instead.
+    spreadsheet permissions problem, which it isn't. For the kinds in
+    _CARRIES_DETAIL there is either no curated knowledge to substitute (UNKNOWN)
+    or the detail is the actionable part (AMBIGUOUS_ID's row numbers), so it is
+    carried through instead.
     """
     base = USER_MESSAGE.get(kind, USER_MESSAGE[UNKNOWN])
-    if kind != UNKNOWN or not detail:
+    if kind not in _CARRIES_DETAIL or not detail:
         return base
     trimmed = detail if len(detail) <= _MAX_DETAIL_CHARS else detail[: _MAX_DETAIL_CHARS - 1] + "…"
     # rstrip the sentence-ending period so the join doesn't read "wrong.: detail".
@@ -133,6 +174,12 @@ def classify_error(exc: Exception) -> str:
     Imports are local so this module stays importable in test contexts that stub
     out the Google or Redis layers.
     """
+    # --- Our own: an ID that addresses more than one row ---
+    # Checked before the builtin-exception rule at the bottom, which would otherwise
+    # be reachable if this ever grows a ValueError base.
+    if isinstance(exc, AmbiguousRowError):
+        return AMBIGUOUS_ID
+
     # --- Backend infrastructure: Redis and Postgres ---
     try:
         import redis.exceptions as redis_exc
@@ -207,6 +254,24 @@ def error_result(exc: Exception, tool_name: str = "") -> Dict[str, Any]:
         "error": detail,
         "error_kind": kind,
         "user_message": user_message_for(kind, detail),
+    }
+
+
+def ambiguous_id_result(primary_id: str, row_nums: Any, tool_name: str = "") -> Dict[str, Any]:
+    """The refusal a write tool returns when its target ID is not unique.
+
+    Same shape as `error_result` so the worker's `res.get("ok")` / `res.get("error")`
+    reading is unchanged, but classified rather than a bare string — a bare error here
+    would be re-read by the model as a bad argument and retried against the 8-iteration
+    cap, which is exactly what the classification layer exists to prevent.
+    """
+    detail = _ambiguity_detail(primary_id, row_nums)
+    return {
+        "ok": False,
+        "error": detail,
+        "error_kind": AMBIGUOUS_ID,
+        "user_message": user_message_for(AMBIGUOUS_ID, detail),
+        "ambiguous_rows": list(row_nums),
     }
 
 

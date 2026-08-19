@@ -109,11 +109,13 @@ async def test_e2e_write_flow(db_session: AsyncSession):
     mock_values.get.return_value.execute.return_value = {"values": [["RICEFW ID", "Dev Status", "Business Owner"]]}
     mock_sheets_service.spreadsheets.return_value.values.return_value = mock_values
 
-    # Mock dynamic row detection (find_row_num)
+    # Mock dynamic row detection. A list, because the write path resolves every row an
+    # ID matches and refuses when there is more than one — a single row number here is
+    # the unambiguous case this test is about.
     mock_publish = AsyncMock()
     with patch("app.queue.worker.build_sheets_service", return_value=mock_sheets_service), \
          patch("app.queue.worker.publish_queue_update", mock_publish), \
-         patch("app.sheets.write.find_row_num", return_value=4):
+         patch("app.sheets.write.find_all_row_nums", return_value=[4]):
 
         # Execute the queue processing logic
         await process_job(job_envelope["job_id"], job_envelope["payload"])

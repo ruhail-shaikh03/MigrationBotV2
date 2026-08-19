@@ -38,21 +38,27 @@ async def get_all_ids(service: Any, spreadsheet_id: str, sheet_name: str, data_s
     return [str(r[0]).strip() for r in result.get("values", []) if r and str(r[0]).strip()]
 
 
-async def get_id_row_map(service: Any, spreadsheet_id: str, sheet_name: str, data_start_row: int, primary_id_pos: str = "B") -> Dict[str, int]:
-    """Scans the ID column once and returns {RICEFW_ID (stripped, uppercased): row_num}.
+async def get_id_row_map(service: Any, spreadsheet_id: str, sheet_name: str, data_start_row: int, primary_id_pos: str = "B") -> Dict[str, List[int]]:
+    """Scans the ID column once and returns {RICEFW_ID (stripped, uppercased): [row_num, ...]}.
     find_row_num does the same scan but for a single ID and throws the result away —
     called once per target ID from a bulk op, that was ~N full-column scans for N
     IDs. Callers resolving multiple IDs in the same operation (bulk_update,
-    get_bulk_rows_raw) should scan once here and look up row numbers in memory."""
+    get_bulk_rows_raw) should scan once here and look up row numbers in memory.
+
+    Every match is kept, not just the last. This used to be `id_map[key] = row_num`,
+    which meant a duplicated ID silently resolved to its *last* occurrence — while
+    `find_row_num` resolved the same ID to its *first*. `update_cell` and `bulk_update`
+    could therefore write to two different physical rows for one ID (§16.7). Callers
+    must decide what a multi-row match means; none of them may quietly pick one."""
     col = primary_id_pos or "B"
     result = await _with_retry(lambda: service.spreadsheets().values().get(
         spreadsheetId=spreadsheet_id,
         range=f"{sheet_name}!{col}{data_start_row}:{col}"
     ).execute())
-    id_map: Dict[str, int] = {}
+    id_map: Dict[str, List[int]] = {}
     for i, row in enumerate(result.get("values", [])):
         if row and str(row[0]).strip():
-            id_map[str(row[0]).strip().upper()] = data_start_row + i
+            id_map.setdefault(str(row[0]).strip().upper(), []).append(data_start_row + i)
     return id_map
 
 
