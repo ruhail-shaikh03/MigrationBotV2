@@ -2,8 +2,9 @@ import logging
 from typing import List, Any, Optional
 from app.sheets.retry import _with_retry
 from app.sheets.meta import get_header_row, get_id_row_map
-from app.sheets.read import find_row_num, idx_to_col_letter, search_rows
+from app.sheets.read import find_all_row_nums, idx_to_col_letter, search_rows
 from app.core.column_mapper import resolve_column
+from app.core.errors import ambiguous_id_result
 from app.core.schema import get_tab_schema
 
 logger = logging.getLogger("sheets_write")
@@ -15,10 +16,16 @@ async def update_cell(
     ricefw_id: str,
     updates: List[dict],
     schema_config: dict,
+    row_number: Optional[int] = None,
 ) -> dict:
     """
     Updates one or more fields for a specific RICEFW ID.
     Groups updates into a single batchUpdate operation to minimize API latency and quota consumption.
+
+    `row_number` pins the target to one physical row. Only a caller that genuinely knows
+    which row the user meant may pass it — the dashboard does, because the user clicked a
+    rendered grid row (api/dashboard.py:patch_row). The agent never does: it has an ID and
+    nothing else, so an ID matching several rows is refused rather than guessed at.
     """
     # Resolve tab-specific schema if using the new multi-tab format
     tab_schema = get_tab_schema(schema_config, sheet_tab)
@@ -27,9 +34,26 @@ async def update_cell(
     primary_id_pos = tab_schema.get("primary_id_position", "B")
     column_map = tab_schema.get("column_map") or schema_config.get("column_map") or {}
 
-    row_num = await find_row_num(service, spreadsheet_id, sheet_tab, ricefw_id, data_start_row, primary_id_pos)
-    if row_num is None:
+    row_nums = await find_all_row_nums(service, spreadsheet_id, sheet_tab, ricefw_id, data_start_row, primary_id_pos)
+    if not row_nums:
         return {"ok": False, "error": f"RICEFW ID '{ricefw_id}' not found in active tab."}
+    if row_number is not None:
+        # The pin is verified against the live scan rather than trusted: a row that no
+        # longer holds this ID means the sheet moved under the user between render and
+        # write, and writing to it anyway would hit whatever now occupies that row.
+        if row_number not in row_nums:
+            return {
+                "ok": False,
+                "error": (
+                    f"Row {row_number} no longer holds '{ricefw_id}' — the sheet changed. "
+                    "Reload and try again."
+                ),
+            }
+        row_num = row_number
+    elif len(row_nums) > 1:
+        return ambiguous_id_result(ricefw_id, row_nums, "update_cell")
+    else:
+        row_num = row_nums[0]
 
     headers = await get_header_row(service, spreadsheet_id, sheet_tab, header_row_num)
     col_idx = {h.lower().strip(): i for i, h in enumerate(headers)}
@@ -127,18 +151,32 @@ async def bulk_update(
 
     col_letter = idx_to_col_letter(set_col_idx)
 
+    ambiguous = []
+
     for rid in target_ids:
-        row_num = id_row_map.get(rid.strip().upper())
-        if row_num is None:
+        row_nums = id_row_map.get(rid.strip().upper()) or []
+        if not row_nums:
             not_found.append({"id": rid, "error": "Not found in sheet"})
             continue
+        if len(row_nums) > 1:
+            # Skipped, not guessed. A bulk update is exactly where taking the first (or,
+            # as this function used to, the last) match does the most damage: nobody is
+            # reading 50 row numbers to notice one landed somewhere else.
+            ambiguous.append({
+                "id": rid,
+                "error": ambiguous_id_result(rid, row_nums, "bulk_update")["error"],
+            })
+            continue
         data_items.append({
-            "range": f"{sheet_tab}!{col_letter}{row_num}",
+            "range": f"{sheet_tab}!{col_letter}{row_nums[0]}",
             "values": [[set_value]]
         })
 
     succeeded = []
-    failed = list(not_found)
+    failed = list(not_found) + list(ambiguous)
+    # Never written, so never "succeeded" — and never retried by the individual-write
+    # fallback below, which would otherwise reintroduce the first-match guess.
+    skipped = {f["id"] for f in failed}
 
     if data_items:
         try:
@@ -151,12 +189,12 @@ async def bulk_update(
                 }
             ).execute())
             
-            succeeded = [rid for rid in target_ids if rid not in {f["id"] for f in not_found}]
+            succeeded = [rid for rid in target_ids if rid not in skipped]
         except Exception as e:
             # Fallback to individual writes if batchUpdate fails completely
             logger.warning(f"Batch update failed. Retrying cell writes individually: {e}")
             for rid in target_ids:
-                if rid in {f["id"] for f in not_found}:
+                if rid in skipped:
                     continue
                 res = await update_cell(
                     service=service,

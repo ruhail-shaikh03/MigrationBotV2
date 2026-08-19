@@ -6,7 +6,13 @@ from unittest.mock import MagicMock, AsyncMock, patch
 from googleapiclient.errors import HttpError
 
 from app.sheets.retry import _with_retry
-from app.sheets.read import find_row_num, get_bulk_rows_raw, search_rows, summarize, run_data_quality_check
+from app.core.errors import AMBIGUOUS_ID
+from app.sheets.meta import get_id_row_map
+from app.sheets.read import (
+    find_all_row_nums, find_row_num, get_bulk_rows_raw, search_rows, summarize,
+    run_data_quality_check,
+)
+from app.sheets.write import bulk_update, update_cell
 from app.queue.producer import enqueue_write_job
 from app.queue.worker import (
     start_worker, recover_stale_jobs, QUEUE_KEY, PROCESSING_KEY, DEAD_LETTER_KEY,
@@ -65,6 +71,115 @@ async def test_read_find_row():
     )
     
     assert row_num == 4  # Index 1 + data_start_row 3 = row 4
+
+
+def _id_column_service(values):
+    """A Sheets service whose ID-column scan returns `values` (a list of single-cell rows)."""
+    mock_service = MagicMock()
+    mock_get = MagicMock()
+    mock_get.execute.return_value = {"values": values}
+    mock_service.spreadsheets().values().get.return_value = mock_get
+    return mock_service
+
+
+# 2b. Duplicate primary IDs — the resolution layer must report them, not pick one.
+@pytest.mark.asyncio
+async def test_find_all_row_nums_returns_every_match():
+    """A duplicated ID resolves to all of its rows, so a caller can refuse (§16.7)."""
+    service = _id_column_service([["SD-001"], ["SD-002"], ["SD-003"], ["SD-002"]])
+
+    rows = await find_all_row_nums(
+        service=service, spreadsheet_id="sheet-123", sheet_name="SD",
+        ricefw_id="SD-002", data_start_row=3, primary_id_pos="B",
+    )
+
+    assert rows == [4, 6]
+
+
+@pytest.mark.asyncio
+async def test_id_row_map_keeps_every_row_not_just_the_last():
+    """This map used to overwrite, resolving a duplicate to its *last* row while
+    find_row_num resolved the same ID to its *first* — so update_cell and bulk_update
+    could write to two different rows for one ID."""
+    service = _id_column_service([["SD-001"], ["SD-002"], ["SD-003"], ["SD-002"]])
+
+    id_map = await get_id_row_map(service, "sheet-123", "SD", 3, "B")
+
+    assert id_map["SD-002"] == [4, 6]
+    assert id_map["SD-001"] == [3]
+
+
+@pytest.mark.asyncio
+async def test_update_cell_refuses_a_duplicated_id():
+    """The write is refused outright rather than landing on an arbitrary row."""
+    service = _id_column_service([["SD-001"], ["SD-002"], ["SD-002"]])
+
+    res = await update_cell(
+        service=service, spreadsheet_id="sheet-123", sheet_tab="SD",
+        ricefw_id="SD-002", updates=[{"field": "Dev Status", "value": "Done"}],
+        schema_config={"data_start_row": 3, "primary_id_position": "B"},
+    )
+
+    assert res["ok"] is False
+    assert res["error_kind"] == AMBIGUOUS_ID
+    assert res["ambiguous_rows"] == [4, 5]
+    # The row numbers reach the user, since they are the only actionable part.
+    assert "4, 5" in res["user_message"]
+    # Nothing was written.
+    service.spreadsheets().values().batchUpdate.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_bulk_update_refuses_the_same_duplicated_id():
+    """The regression that proves the first-match/last-match divergence is gone: the two
+    tools must now agree about what a duplicated ID means."""
+    service = _id_column_service([["SD-001"], ["SD-002"], ["SD-002"]])
+    with patch("app.sheets.write.get_header_row", AsyncMock(return_value=["RICEFW ID", "Dev Status"])):
+        res = await bulk_update(
+            service=service, spreadsheet_id="sheet-123", sheet_tab="SD",
+            args={"ricefw_ids": ["SD-001", "SD-002"], "set_field": "Dev Status", "set_value": "Done"},
+            schema_config={"data_start_row": 3, "primary_id_position": "B"},
+        )
+
+    assert res["ok"] is False
+    assert res["succeeded"] == ["SD-001"]
+    assert [f["id"] for f in res["failed"]] == ["SD-002"]
+    assert "rows 4, 5" in res["failed"][0]["error"]
+
+
+@pytest.mark.asyncio
+async def test_update_cell_writes_when_a_row_number_pins_the_target():
+    """The dashboard knows which row the user clicked, so it may name one."""
+    service = _id_column_service([["SD-001"], ["SD-002"], ["SD-002"]])
+    with patch("app.sheets.write.get_header_row", AsyncMock(return_value=["RICEFW ID", "Dev Status"])):
+        res = await update_cell(
+            service=service, spreadsheet_id="sheet-123", sheet_tab="SD",
+            ricefw_id="SD-002", updates=[{"field": "Dev Status", "value": "Done"}],
+            schema_config={"data_start_row": 3, "primary_id_position": "B"},
+            row_number=5,
+        )
+
+    assert res["ok"] is True
+    body = service.spreadsheets().values().batchUpdate.call_args.kwargs["body"]
+    # The second occurrence, not the first — which is what the pin exists to achieve.
+    assert body["data"][0]["range"] == "SD!B5"
+
+
+@pytest.mark.asyncio
+async def test_update_cell_rejects_a_row_number_that_no_longer_holds_the_id():
+    """A stale grid must not redirect an edit onto whatever now occupies that row."""
+    service = _id_column_service([["SD-001"], ["SD-002"]])
+
+    res = await update_cell(
+        service=service, spreadsheet_id="sheet-123", sheet_tab="SD",
+        ricefw_id="SD-002", updates=[{"field": "Dev Status", "value": "Done"}],
+        schema_config={"data_start_row": 3, "primary_id_position": "B"},
+        row_number=9,
+    )
+
+    assert res["ok"] is False
+    assert "no longer holds" in res["error"]
+    service.spreadsheets().values().batchUpdate.assert_not_called()
 
 
 # 3. Test queue job enqueuing

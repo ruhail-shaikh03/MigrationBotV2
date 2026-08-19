@@ -83,16 +83,32 @@ def _tab_for(project: Project, tab: Optional[str]) -> str:
     return resolved
 
 
-def _row_dicts(headers: List[str], rows: List[List[str]]) -> List[Dict[str, str]]:
+# The sheet row a row dict came from, attached under a key no header can collide with
+# (`_row_dicts` skips empty headers, and a real header is never dunder-wrapped). Only the
+# grid asks for it — it is what lets an inline edit name the exact row the user clicked,
+# which is the one thing the agent cannot do for a duplicated ID (§16.7).
+_ROW_NUMBER_KEY = "__row_number__"
+
+
+def _row_dicts(
+    headers: List[str], rows: List[List[str]], data_start_row: Optional[int] = None
+) -> List[Dict[str, str]]:
     """Zip the raw matrix into per-row dicts keyed by the sheet's own headers.
 
     Rows come back ragged — Sheets omits trailing empty cells — so short rows are padded
     rather than truncating the header list, which would drop real columns from the grid.
+
+    With `data_start_row`, each dict also carries its sheet row under `_ROW_NUMBER_KEY`.
+    The matrix is in sheet order, so the row number is the index plus that offset — the
+    same arithmetic `core/health.py:row_ref` uses to point at a duplicate.
     """
     out = []
-    for row in rows:
+    for i, row in enumerate(rows):
         padded = list(row) + [""] * (len(headers) - len(row))
-        out.append({h: padded[i] for i, h in enumerate(headers) if h})
+        mapped = {h: padded[j] for j, h in enumerate(headers) if h}
+        if data_start_row is not None:
+            mapped[_ROW_NUMBER_KEY] = data_start_row + i
+        out.append(mapped)
     return out
 
 
@@ -205,7 +221,13 @@ async def _filter_rows(
 
     filtered = []
     for row in rows:
-        if q and not any(q.lower().strip() in str(v).lower() for v in row.values()):
+        # The row-number key is bookkeeping, not sheet content: searching "12" must match
+        # cells containing 12, not every row that happens to sit at row 12.
+        if q and not any(
+            q.lower().strip() in str(v).lower()
+            for k, v in row.items()
+            if k != _ROW_NUMBER_KEY
+        ):
             continue
         if status and not _matches(row, status_header, status):
             continue
@@ -255,7 +277,7 @@ async def list_rows(
     headers, raw_rows, truncated = await get_tab_matrix(
         service, project.spreadsheet_id, active_tab, data_start_row
     )
-    rows = _row_dicts(headers, raw_rows)
+    rows = _row_dicts(headers, raw_rows, data_start_row)
     people = bind_columns(get_people_columns(tab_schema), headers)
 
     filtered = await _filter_rows(
@@ -315,6 +337,11 @@ class RowUpdate(BaseModel):
 class RowPatch(BaseModel):
     tab: Optional[str] = None
     updates: List[RowUpdate]
+    # The sheet row the client actually rendered, from `_ROW_NUMBER_KEY` on the row it
+    # edited. It disambiguates a duplicated ID, which the grid can do and the agent
+    # cannot: the user pointed at one row. Optional so an older client still works —
+    # it just gets the refusal instead.
+    row_number: Optional[int] = None
 
 
 @router.patch("/projects/{project_id}/rows/{row_id}", response_model=Dict[str, Any])
@@ -348,6 +375,10 @@ async def patch_row(
 
     updates = [{"field": u.field, "value": u.value} for u in payload.updates]
     args = {"ricefw_id": row_id, "updates": updates}
+    if payload.row_number is not None:
+        # The worker verifies this row still holds `row_id` before writing, so a stale
+        # grid cannot redirect an edit onto whatever now occupies that row.
+        args["row_number"] = payload.row_number
 
     checker = await get_user_permissions(db, current_user.email, project_id)
     allowed, reason = checker.can_execute("update_cell", args)
@@ -390,6 +421,7 @@ async def patch_row(
             [u["field"] for u in updates],
             project.schema_config or {},
             service,
+            row_number=payload.row_number,
         )
     except Exception as e:
         logger.warning(f"Failed to pre-read row {row_id} for audit: {e}")

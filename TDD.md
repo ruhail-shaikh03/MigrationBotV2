@@ -342,7 +342,7 @@ re-detected.
 | 15 | project lookup | `worker.py:process_job` | re-reads `schema_config` from Postgres |
 | 16 | `build_sheets_service` | `worker.py:process_job` | rebuilds client from the token in the job |
 | 17 | `update_cell` | `worker.py:process_job` → `write.py:update_cell` | the mutation |
-| 18 | `find_row_num` | `write.py:update_cell` → `read.py:find_row_num` | scans the ID column live from Sheets |
+| 18 | `find_all_row_nums` | `write.py:update_cell` → `read.py:find_all_row_nums` | scans the ID column live from Sheets; more than one match is refused, not guessed (§16.7) |
 | 19 | `get_header_row` | `write.py:update_cell` → `meta.py:get_header_row` | fetches headers |
 | 20 | `resolve_column` | `write.py:update_cell` → `column_mapper.py:resolve_column` | maps field name to a real header |
 | 21 | `_with_retry(batchUpdate)` | `write.py:update_cell` → `retry.py:_with_retry` | one `values().batchUpdate` |
@@ -878,12 +878,13 @@ model as an undifferentiated string, so it kept rewriting a call that could not 
 reached the user as *"this is a read-only replica"* — which they reasonably read as a permissions
 problem with their own spreadsheet.
 
-`core/errors.py:classify_error` maps an exception to one of eight kinds:
+`core/errors.py:classify_error` maps an exception to one of nine kinds:
 
 | Kind | Raised by | Model told to retry? |
 |---|---|---|
 | `invalid_request` | `KeyError`/`ValueError`/`TypeError`/`IndexError`, Google 4xx | yes, once, with corrected arguments |
 | `not_found` | Google 404 | yes — locate the record with `search_rows` first |
+| `ambiguous_id` | `AmbiguousRowError`, or a write tool resolving one ID to several rows (§16.7) | **no** — and explicitly *do not guess a row*; ask the user which one |
 | `permission` | RBAC denial (`agentic_loop.py`), Google 403 | **no** |
 | `auth` | `RefreshError`/`GoogleAuthError`, Google 401 | **no** — user must re-authenticate |
 | `rate_limit` | Google 429, 403 with a quota reason | **no** |
@@ -894,6 +895,12 @@ problem with their own spreadsheet.
 A failure result now carries three things instead of one: `error` (raw, for logs and the audit
 row), `error_kind`, and `user_message` — the last written without infrastructure nouns, since
 "replica" and "asyncpg" mean nothing to someone editing a tracker.
+
+Two kinds are exempt from that substitution and carry their detail through instead, via
+`errors.py:_CARRIES_DETAIL`. `unknown`, because classification found nothing to say and the
+exception text is the only information there is. And `ambiguous_id`, because the row numbers
+*are* the message: "that ID is duplicated" alone leaves the user nowhere to go, while "rows 47
+and 214" tells them exactly where to look.
 `core/errors.py:failure_note` builds the per-kind `[System Note]`, and only the first two rows
 above invite a retry; the rest say *do not retry* explicitly, because a retry there merely burns
 iterations against the 8-iteration cap before the user hears anything.
@@ -1162,7 +1169,13 @@ a dashboard that silently under-reports is worse than one that says it is partia
 ### 10.2 Inline reassign
 
 `PATCH /api/projects/{id}/rows/{row_id}` (`dashboard.py:patch_row`), body
-`{tab, updates: [{field, value}]}`. It is the only write path outside the agentic loop.
+`{tab, updates: [{field, value}], row_number?}`. It is the only write path outside the agentic loop.
+
+`row_number` is what the grid knows and the agent does not: which physical row the user clicked.
+On a tracker whose IDs are not unique (§16.7) that is the difference between an edit that lands
+and an edit that is refused — the chat path can only refuse, because an ID is all it has. It is
+optional, so an older client still works; it just gets the refusal. The worker re-checks that the
+named row still holds `row_id` before writing, so a stale grid cannot redirect the edit.
 
 Order matters and is deliberate: resolve the project (same visibility rule as the reads above) →
 `get_user_permissions` → `can_execute("update_cell", args)` with the exact tool-contract arg shape
@@ -1411,15 +1424,16 @@ errors propagate.
 |---|---|---|
 | `get_header_row` | `meta.py:get_header_row` | 1 — strips every cell |
 | `get_sheet_id` | `meta.py:get_sheet_id` | 1 |
-| `find_row_num` | `read.py:find_row_num` | 1 — full ID-column scan |
+| `find_all_row_nums` | `read.py:find_all_row_nums` | 1 — full ID-column scan (`find_row_num` is a wrapper over it, same cost) |
 | `get_id_row_map` | `meta.py:get_id_row_map` | 1 — full ID-column scan, resolves every ID in one pass |
+| `cached_id_row_nums` | `read.py:cached_id_row_nums` | 0 on a cached tab — the dispatch-time ambiguity pre-check reads through `get_tab_matrix` |
 | `get_row` | `read.py:get_row` | 3 — `find_row_num` + row fetch + headers |
 | `get_row_raw` | `read.py:get_row_raw` | 3 — same shape (still per-ID; only ever called for a single ID) |
 | `get_bulk_rows_raw` | `read.py:get_bulk_rows_raw` | 2 + 1 `batchGet` — headers, one `get_id_row_map` scan, one `batchGet` covering every resolved row |
 | `search_rows` | `read.py:search_rows` | 1 + ⌈rows / 2000⌉ — headers + paginated (`read.py:_fetch_all_rows`) |
 | `summarize` | `read.py:summarize` | same shape as `search_rows` |
 | `run_data_quality_check` | `read.py:run_data_quality_check` | same shape (+1 or +2 for `consistency`/`stale` DB reads) |
-| `update_cell` | `write.py:update_cell` | 3 — `find_row_num` + headers + one `batchUpdate` |
+| `update_cell` | `write.py:update_cell` | 3 — `find_all_row_nums` + headers + one `batchUpdate` |
 | `bulk_update` | `write.py:bulk_update` | 2 + one `get_id_row_map` scan (not one `find_row_num` per target ID) |
 | `add_row` | `write.py:add_row` | 1 + headers, `values().append` |
 | `format_row` | `format.py:format_row` | `spreadsheets().batchUpdate` `repeatCell` |
@@ -1539,7 +1553,10 @@ row is far worse than a slow one. ID matching stays `.strip().upper()`, as `find
 
 **`get_row_raw` is deliberately not cached.** It serves the write path's audit pre-read, and a
 60-second-old "before" value would put a wrong `old_value` in the audit trail — and therefore a
-wrong value behind every undo (§10.5). `get_bulk_rows_raw` and `find_row_num` are likewise untouched.
+wrong value behind every undo (§10.5). `get_bulk_rows_raw` and `find_all_row_nums` are likewise
+untouched. The one cached ID lookup is `read.py:cached_id_row_nums`, and it deliberately feeds no
+write: it only previews the duplicate-ID refusal at dispatch, and the authoritative check runs
+against a live scan inside the worker (§16.7).
 
 `sheets/rows_cache.py:get_tab_matrix()` caches
 `{headers, rows, truncated}` as JSON under `migrationbot:rows:{spreadsheet_id}:{tab}` with a
@@ -2019,7 +2036,15 @@ Dawood Umer`, multi-person cells (`Minhaj Alam & Dawood`, `Ahmed Qamar/Asif`) an
 matching, no fuzzy merging, no comma splitting (§7.4) — and the conservative choice is still right,
 since merging `Ahmad`/`Ahmed Qamar` would silently fuse two people who may be distinct. But the
 cost is now visible: one person's workload is split across several entries. The admin-maintained
-alias map noted in §7.4 is the fix, and it is not built.
+alias map noted in §7.4 is the fix.
+
+**Superseded — that alias map was subsequently built (§7.5, §10.3, §14.7), and this paragraph
+described it as missing for several revisions after it shipped.** The filter is fed from
+`analytics.workload` (`page.tsx:everyone`), which resolves through `dashboard.py:_resolver_for` →
+`collect_assignments`, and the person filter matches through the same resolver — so a merged name
+selects every spelling it covers, and a shared cell matches both people it names. What remains
+true is only the *conservative* half: merging still requires an explicit human confirmation in
+`/admin/people`, so un-merged spellings continue to appear separately until someone confirms them.
 
 Tab switching is an explicit control frame, not prompt-driven (`chat/page.tsx:handleTabChange`):
 the client sends `{type: "switch_tab", tab_name}` and only applies the new `activeTab` once the
@@ -2159,7 +2184,7 @@ The list is re-read after a successful undo rather than patched in place, becaus
 not a state change to the row above it — it is a new queued write that will appear as its own audit
 entry moments later.
 
-&
+### 14.10 CSV export
 
 A download button in the dashboard toolbar, hidden on the health view — whose numbers describe the
 whole tab rather than the filtered selection the button would export.
@@ -2317,16 +2342,16 @@ touch ignored files — but any *other* untracked file in the repo directory is 
 
 ### 15.3 Tests
 
-332 test functions across 20 files. `pytest tests/test_core tests/test_sheets` — the two
+340 test functions across 20 files. `pytest tests/test_core tests/test_sheets` — the two
 directories that need neither Postgres nor Redis, and therefore the only ones runnable on a
-developer machine without Docker — collects 366 cases from 313 of those functions, the difference
+developer machine without Docker — collects 374 cases from 321 of those functions, the difference
 being parametrisation.
 
 Earlier revisions of this paragraph gave a total that summed only the four files they happened to
 name, omitting fourteen others; the count is stated in full here so it cannot drift that way again.
 The largest files are `test_core/test_aliases.py` (38), `test_core/test_health.py` (26),
 `test_core/test_column_profile.py` (26), `test_core/test_people_schema.py` (26),
-`test_core/test_core_logic.py` (24), `test_sheets/test_sheets_logic.py` (24) and — added with the
+`test_sheets/test_sheets_logic.py` (30), `test_core/test_core_logic.py` (26) and — added with the
 durable row cache — `test_sheets/test_records_cache.py` (24), `tests/integration/test_records_cache_db.py`
 (10) and `test_core/test_webhooks.py` (8).
 
@@ -2584,20 +2609,63 @@ on `main`: `What's overdue?` on HEDP produced exactly one `summarize(report_type
 and a complete 8-item table with descriptions and assignees. The dashboard's overdue-only grid filter
 independently returned the same 8 rows. Chat and dashboard have not disagreed on this since.
 
-### 16.7 Duplicated primary IDs — write ambiguity, not yet addressed
+### 16.7 Duplicated primary IDs — write ambiguity — RESOLVED
 
-**Severity: medium, confirmed live, unfixed.** The new health check (§13, `Duplicated WRICEF No.
-values`) found **27 of 412 HEDP rows share their WRICEF No. with another row** — e.g. `SLCM-0005`
-and `SLCM-0825` both appear twice. Every write path (`update_cell`, `bulk_update`, undo, the
-dashboard's inline reassign) addresses a row by this column via `find_row_num`, which returns the
-first match. A write aimed at the second occurrence of a duplicated ID silently lands on the first
-one instead — no error, no audit anomaly, just the wrong row changed.
+**Was: severity medium, confirmed live. Fixed and unit-tested; awaiting live verification.**
+The health check (§13, `Duplicated WRICEF No. values`) found **27 of 412 HEDP rows share their
+WRICEF No. with another row** — e.g. `SLCM-0005` and `SLCM-0825` both appear twice. Every write
+path addressed a row by this column and silently took one of the matches: no error, no audit
+anomaly, just the wrong row changed.
 
-This is now *visible* (the health panel lists all 27, with row numbers) but not *prevented*: nothing
-stops a write from being enqueued against an ambiguous ID, and `find_row_num` has no way to report
-"which one did you mean." Fixing it properly needs either a disambiguating write path (row number
-instead of, or alongside, the ID) or a refusal at dispatch time when the target ID is not unique —
-both are scoped for a future stage, not attempted here.
+**The two resolvers disagreed with each other, which the original write-up of this section did
+not record.** There were two independent resolution strategies, not one:
+
+| Helper | On a duplicated ID | Used by |
+|---|---|---|
+| `read.py:find_row_num` | `return`ed on the **first** match | `update_cell`, `format_row`, `get_row_raw` |
+| `meta.py:get_id_row_map` | `id_map[key] = row_num` overwrite loop → the **last** match | `bulk_update`, `get_bulk_rows_raw` |
+
+So `update_cell` and `bulk_update`, given the same ID on the same tab, wrote to two *different
+physical rows*. The section previously described the bug as uniformly first-match; it was not.
+
+**The fix, in four parts.**
+
+*Resolution reports ambiguity instead of hiding it.* `read.py:find_all_row_nums` returns every
+matching row, and `find_row_num` is now a thin `matches[0] if matches else None` over it — kept
+because read-side callers legitimately only need *a* row. `get_id_row_map` returns
+`Dict[str, List[int]]` and appends rather than overwrites, which is what removes the divergence:
+both tools now see the same set of candidate rows and apply the same rule to it.
+
+*Chat refuses; the dashboard pins.* The agent has an ID and nothing else, so on more than one
+match the write tools return `ambiguous_id_result()` — classified as `ambiguous_id` (§8.2), naming
+the row numbers, telling the model explicitly not to guess. The dashboard has strictly more
+information: the user clicked a rendered grid row. `_row_dicts` now attaches that row under
+`_ROW_NUMBER_KEY`, `RowPatch.row_number` carries it, and `update_cell(row_number=…)` writes to
+exactly that row. **The pin is verified, not trusted** — the worker checks the row still holds
+that ID against its own live scan, so a stale grid cannot redirect an edit onto whatever now
+occupies the position.
+
+*The refusal is enforced where the live scan is, and previewed where the user is.* The
+authoritative check lives in `write.py`/`format.py`, against the ID-column scan the worker already
+performs — it cannot be defeated by a stale cache. `tool_dispatch.py` additionally refuses at
+dispatch using `read.py:cached_id_row_nums`, purely so the user hears about it immediately rather
+than as a `queue_update` failure seconds later. That check is advisory by construction: it reads
+through the cache tiers, costs zero Sheets calls on a cached tab, and a cache that cannot answer
+degrades to letting the write through to the authoritative check — never to blocking it.
+
+*Audit "before" values follow the row actually written.* `get_row_raw` accepts a `row_number`, and
+`get_bulk_rows_raw` pre-reads only unambiguous IDs. Previously the pre-read could describe one row
+while the write landed on another — and that wrong "before" value is what undo would later try to
+restore (§10.5).
+
+Six unit tests cover it in `test_sheets_logic.py`, including the regression that matters most:
+`update_cell` and `bulk_update` given the same duplicated ID must now both refuse. Two more in
+`test_core_logic.py` pin the classification and the row numbers reaching the user.
+
+**Still open:** `add_row` can still create a duplicate in the first place, and nothing reconciles
+the 27 existing pairs on the HEDP tracker — they remain visible in the health panel and are now
+un-writable through chat until a human resolves them, which is the intended trade. Cleaning them
+is a data task, not a code one.
 
 **`sheet_records.ix_sheet_records_primary_id` is deliberately non-unique, because of this.**
 `models/sheet_record.py:SheetRecord`'s docstring and `0002_sheet_records.py`'s migration comment
@@ -2609,10 +2677,11 @@ both occurrences of a duplicated ID are stored and both come back from a scan. T
 **queryable in SQL for the first time**: `SELECT primary_id, count(*) FROM sheet_records GROUP BY
 spreadsheet_id, tab, primary_id HAVING count(*) > 1` finds every one of them directly, where before
 this cache existed the only way to find them was `core/health.py:assess_tab`'s `duplicate_id` check
-re-scanning the live sheet. **This does not fix the write ambiguity above** — it only makes the
-underlying condition easier to see. `find_row_num`, `update_cell`, `bulk_update` and the dashboard's
-inline reassign are all unchanged: a write aimed at the second occurrence of a duplicated ID still
-silently lands on the first, cache or no cache.
+re-scanning the live sheet. **The index did not fix the write ambiguity** — it only made the
+underlying condition easier to see; the write path had to be changed separately, above. Keeping the
+index non-unique remains correct after that fix, and more clearly so: the write path now needs to
+*count* a duplicated ID's rows in order to refuse or pin them, which a cache that had silently
+discarded one of them could not support.
 
 ---
 

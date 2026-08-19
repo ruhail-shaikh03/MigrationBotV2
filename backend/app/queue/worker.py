@@ -152,7 +152,11 @@ async def process_job(job_id: str, payload_dict: dict) -> None:
                 sheet_tab=payload.sheet_tab,
                 ricefw_id=ricefw_id,
                 updates=updates,
-                schema_config=schema_config
+                schema_config=schema_config,
+                # Set only by callers that know which physical row the user meant —
+                # the dashboard's inline reassign. Absent for every chat write, which
+                # is what makes a duplicated ID a refusal there rather than a guess.
+                row_number=args.get("row_number"),
             )
             result_ok = res.get("ok", False)
             error_msg = res.get("error")

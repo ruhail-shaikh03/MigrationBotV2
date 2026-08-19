@@ -9,8 +9,8 @@ from app.core import audit
 from app.core.agentic_loop import run_agentic_loop
 from app.core.data_quality import DataQualityChecker
 from app.core.errors import (
-    classify_error, error_result, failure_note,
-    AUTH, INFRASTRUCTURE, NOT_FOUND, RATE_LIMIT, UPSTREAM,
+    classify_error, error_result, failure_note, ambiguous_id_result, AmbiguousRowError,
+    AMBIGUOUS_ID, AUTH, INFRASTRUCTURE, NOT_FOUND, RATE_LIMIT, UPSTREAM,
 )
 
 # Test cases below
@@ -647,6 +647,31 @@ def test_failure_note_guidance_differs_by_kind():
     bad_args = failure_note("search_rows", error_result(KeyError("Dev Status"), "search_rows"))
     assert "invalid_request" in bad_args
     assert "retry once with corrected arguments" in bad_args
+
+
+# 21b. A duplicated ID is not a bad argument. No rewrite of the call can fix it, so the
+# model must be told to stop and ask rather than spend iterations rephrasing (§16.7).
+def test_ambiguous_id_is_classified_and_forbids_a_retry():
+    assert classify_error(AmbiguousRowError("SD-002", [4, 6])) == AMBIGUOUS_ID
+
+    result = ambiguous_id_result("SD-002", [4, 6], "update_cell")
+    assert result["ok"] is False
+    assert result["error_kind"] == AMBIGUOUS_ID
+    assert result["ambiguous_rows"] == [4, 6]
+
+    note = failure_note("update_cell", result)
+    assert "ambiguous_id" in note
+    assert "Do NOT retry" in note
+    # The alternative offered must be asking the user, not picking a row.
+    assert "guess" in note
+
+
+def test_ambiguous_id_user_message_names_the_rows():
+    """Row numbers are the actionable part — "it's duplicated" alone leaves the user
+    nowhere to go, so this kind carries its detail through rather than replacing it."""
+    message = ambiguous_id_result("SD-002", [4, 6])["user_message"]
+    assert "4, 6" in message
+    assert "SD-002" in message
 
 
 # 22. Google HTTP statuses map to distinct kinds — 429 must not read as a

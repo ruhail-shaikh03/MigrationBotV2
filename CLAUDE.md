@@ -122,6 +122,12 @@ of that spreadsheet dirty. Anything that claims to know which cell changed is wr
   only over the compose network; `DB_PASSWORD` and `REDIS_PASSWORD` are required and compose
   aborts without them. Re-adding a `ports:` mapping puts that service on the public internet —
   Docker's iptables rules bypass UFW, which is how the 2026-08 host compromise happened (TDD §15.1).
+- **A primary ID does not identify a row.** 27 of 412 rows on the reference tracker share an
+  ID. Write paths resolve with `read.py:find_all_row_nums` (or `meta.py:get_id_row_map`, which
+  returns `Dict[str, List[int]]`) and **refuse** on more than one match via
+  `errors.py:ambiguous_id_result` — never take the first. The one caller allowed to pin a row is
+  the dashboard, which passes `row_number` because the user clicked it; the worker still verifies
+  that row holds the ID. A new write tool that calls `find_row_num` is the §16.7 bug again.
 - **Tool failures are classified, not stringified.** `core/errors.py:classify_error` assigns an
   `error_kind` and a user-safe `user_message`; `failure_note()` picks the guidance the model sees.
   Returning a bare `{"ok": False, "error": str(e)}` from a new tool regresses this — the model

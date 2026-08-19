@@ -52,7 +52,10 @@ interface RowsResponse {
   columns: ColumnDescriptor[]
   people_columns: RoleColumn[]
   primary_id_column: string | null
-  rows: Record<string, string>[]
+  /* Cell values are strings, keyed by the sheet's own headers. `__row_number__` is the
+   * one exception — the server attaches the sheet row each dict came from, so an inline
+   * edit can name a specific row when the tracker's IDs are not unique. */
+  rows: (Record<string, string> & { __row_number__?: number })[]
   total: number
   offset: number
   limit: number
@@ -331,14 +334,21 @@ export default function ProjectDashboard() {
   }, [pending, apiToken, authHeaders, load])
 
   const saveCell = useCallback(
-    async (rowId: string, header: string, value: string) => {
+    async (rowId: string, header: string, value: string, rowNumber?: number) => {
       const key = `${rowId}::${header}`
       setEditing(null)
       try {
         const res = await fetch(`/api/projects/${projectId}/rows/${encodeURIComponent(rowId)}`, {
           method: "PATCH",
           headers: { ...authHeaders, "Content-Type": "application/json" },
-          body: JSON.stringify({ tab: rowsData?.tab, updates: [{ field: header, value }] }),
+          // `row_number` names the row actually on screen. IDs are not unique on every
+          // tracker — 27 of 412 rows on the reference sheet share one — so without it the
+          // server can only refuse the edit rather than guess which row was clicked.
+          body: JSON.stringify({
+            tab: rowsData?.tab,
+            updates: [{ field: header, value }],
+            row_number: rowNumber,
+          }),
         })
         const body = await res.json().catch(() => ({}))
         if (!res.ok) {
@@ -643,6 +653,10 @@ export default function ProjectDashboard() {
                     const rowId = rowsData?.rows[rowIndex]?.[idHeader]
                     if (!rowId) return undefined
 
+                    // The sheet row this cell was rendered from, so an edit to a
+                    // duplicated ID lands on the row the user is looking at.
+                    const rowNumber = rowsData?.rows[rowIndex]?.__row_number__
+
                     const key = `${rowId}::${header}`
                     const edit = pending[key]
                     const cellId = `${key}::cell`
@@ -653,7 +667,7 @@ export default function ProjectDashboard() {
                           autoFocus
                           defaultValue={value}
                           aria-label={`${label} for ${rowId}`}
-                          onBlur={(e) => saveCell(rowId, header, e.target.value)}
+                          onBlur={(e) => saveCell(rowId, header, e.target.value, rowNumber)}
                           onKeyDown={(e) => {
                             if (e.key === "Enter") (e.target as HTMLInputElement).blur()
                             if (e.key === "Escape") setEditing(null)
