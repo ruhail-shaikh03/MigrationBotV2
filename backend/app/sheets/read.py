@@ -7,7 +7,9 @@ from app.core.column_mapper import resolve_column
 from app.core.data_quality import DataQualityChecker
 from app.core.overdue import is_finished_status
 from app.core.people import parse_date
-from app.core.schema import get_due_column, get_people_columns, get_tab_schema
+from app.core.schema import (
+    default_critical_headers, get_due_column, get_people_columns, get_tab_schema,
+)
 from app.models.audit_log import AuditLog
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -344,20 +346,34 @@ async def search_rows(
     # normalized on both sides — same pattern write.py already uses.
     col_idx = {h.lower().strip(): i for i, h in enumerate(headers)}
 
-    # Defaults fields to return if none specified
-    critical_fields = schema_config.get("critical_fields", [])
-    if not critical_fields:
-        critical_fields = ["RICEFW ID", "Module", "Type", "Description", "Dev Status", "Technical Resource "]
+    # Defaults fields to return if none specified. Derived from schema roles, not one
+    # customer's literal headers — those resolved to nothing on any other tracker, so
+    # `return_fields` filtered down to an empty list and search returned bare rows (§16.3).
+    critical_fields = schema_config.get("critical_fields") \
+        or default_critical_headers(schema_config, headers)
 
     return_fields = return_fields or [f for f in critical_fields if f.lower().strip() in col_idx]
+    # A tab whose schema names no roles at all (un-detected, or a tracker that simply has
+    # none) would otherwise resolve to zero fields and return rows with no cells in them.
+    # Every column is the honest answer there: the caller asked for the row.
+    if not return_fields:
+        return_fields = [h for h in headers if h]
 
     resolved_filters = []
 
     for f in filters:
         term = f.get("field", "")
-        # Resolve user natural term to actual header name
-        canonical = resolve_column(term, column_map) or term
-        norm_canonical = canonical.lower().strip()
+        # A term that already names a real header wins outright. Going through
+        # resolve_column first let the legacy WRICEF alias map (§7.2, kept only as a last
+        # resort) hijack it: a sheet with its own "Owner" column had that term rewritten
+        # to a canonical SAP header the sheet does not have, and the search failed with
+        # "could not be mapped" while pointing at a column plainly on screen.
+        norm_term = str(term).lower().strip()
+        if norm_term in col_idx:
+            norm_canonical = norm_term
+        else:
+            canonical = resolve_column(term, column_map) or term
+            norm_canonical = canonical.lower().strip()
         if norm_canonical not in col_idx:
             return {"ok": False, "error": f"Column '{term}' could not be mapped to sheet headers."}
         resolved_filters.append({
@@ -682,9 +698,11 @@ async def run_data_quality_check(
     }
 
     if check_type in ("blank_fields", "all"):
-        fields = args.get("fields") or schema_config.get("critical_fields") or [
-            "RICEFW ID", "Module", "Type", "Description", "Dev Status", "Technical Resource "
-        ]
+        # Schema roles, not one customer's literal headers. The old list here counted
+        # every row as blank on any sheet that did not use those exact names — a tracker
+        # with no "Dev Status" column reported 100% of its rows missing one.
+        fields = args.get("fields") or schema_config.get("critical_fields") \
+            or checker.default_critical_fields()
         report["blank_field_counts"] = checker.blank_field_counts(fields)
 
     if check_type in ("consistency", "all"):

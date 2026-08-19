@@ -99,14 +99,16 @@ TOOLS: List[Dict[str, Any]] = [
                             "The row's category, as this sheet expresses it — whatever "
                             "value belongs in its category/module column (e.g. SD, SLCM, "
                             "Finance, Onboarding). Use a value consistent with existing "
-                            "rows; do not translate it into some other vocabulary."
+                            "rows; do not translate it into some other vocabulary. Omit it "
+                            "if this sheet has no category column; do not invent one."
                         )
                     },
                     "type": {
                         "type": "string",
                         "description": (
                             "The row's type/classification as this sheet expresses it. "
-                            "Match the convention already used in the sheet's type column."
+                            "Match the convention already used in the sheet's type column. "
+                            "Omit it if this sheet has no such column."
                         )
                     },
                     "description": {"type": "string"},
@@ -116,7 +118,12 @@ TOOLS: List[Dict[str, Any]] = [
                         "additionalProperties": {"type": "string"}
                     }
                 },
-                "required": ["module", "type", "description"]
+                # Only `description` is universal. `module` and `type` were required here
+                # because the reference tracker has both columns; on a sheet without them
+                # that forced the model to invent values for columns that do not exist
+                # (§16.3). A required list is a hard constraint the model cannot emit
+                # around, so this was not something prompt wording could soften.
+                "required": ["description"]
             }
         }
     },
