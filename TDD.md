@@ -2132,7 +2132,7 @@ The list is re-read after a successful undo rather than patched in place, becaus
 not a state change to the row above it — it is a new queued write that will appear as its own audit
 entry moments later.
 
-### 14.10 Export control
+&
 
 A download button in the dashboard toolbar, hidden on the health view — whose numbers describe the
 whole tab rather than the filtered selection the button would export.
@@ -2145,6 +2145,33 @@ for a proxy that strips the header.
 
 The query mirrors the grid's exactly, minus `limit`/`offset`, and passes `include_empty` when the
 user has revealed the empty columns — so the file matches the columns on screen as well as the rows.
+
+---
+
+### 14.11 Live sync control
+
+`/admin/projects` (`admin/projects/page.tsx`) carries a **Live sync** column, one row per project,
+which is the only interface to the Drive push channels of §10.8 and §11.2. Registering a channel
+needs both the backend JWT and the caller's `X-Google-Access-Token`, which is impractical to
+assemble by hand; without this column the endpoints existed but had no usable entry point.
+
+The cell renders four states, and three of them are not errors. `Not configured` means the
+deployment has no `PUBLIC_BASE_URL`/`DRIVE_WEBHOOK_TOKEN` (§3) and therefore cannot open a channel;
+`Enable` means it can but none is open; `Live · Nh` shows a channel with its remaining lifetime. All
+three are working configurations that differ only in how a freshness check is answered — pushed, or
+polled via `modifiedTime` — so the copy deliberately avoids failure styling for any of them. Only a
+rejected registration is an error, and the handler surfaces the backend's `detail` verbatim rather
+than a generic message, because those details name the actual cause: an unset variable, or a
+callback domain Google has not been told to trust (§11.2).
+
+Status is fetched per project in a `useEffect` separate from the project list, and every failure
+resolves to "no status" rather than propagating. A deployment without push configured is the normal
+case, and neither it nor a Drive outage may take the projects page down with it.
+
+Nothing here renews a channel. Renewal is automatic and happens on the read path
+(`records_cache.py:_maybe_renew_channel`, §11.2); the `needs_renewal` flag this column reads is
+shown for visibility only, and an admin who never opens this page still keeps their channels alive
+by using the application.
 
 ---
 

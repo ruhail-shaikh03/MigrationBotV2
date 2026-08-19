@@ -3,7 +3,7 @@
 import { useSession } from "next-auth/react"
 import { useEffect, useState } from "react"
 import {
-  FolderKanban, Plus, Edit2, Trash2, X, Check, AlertTriangle
+  FolderKanban, Plus, Edit2, Trash2, X, Check, AlertTriangle, RadioTower, Loader2
 } from "lucide-react"
 import Modal from "@/components/Modal"
 import RoleColumnsEditor, { RoleColumn } from "@/components/RoleColumnsEditor"
@@ -29,6 +29,22 @@ interface Project {
   created_at: string
 }
 
+/** State of the Google Drive push-notification channel for one project's spreadsheet,
+ *  from `GET /api/watch/projects/{id}`.
+ *
+ *  `configured` is false when the deployment has no PUBLIC_BASE_URL / DRIVE_WEBHOOK_TOKEN,
+ *  which is a normal state rather than an error: reads still work, they just poll Drive
+ *  for changes instead of being pushed them. `active` false with `configured` true means
+ *  no channel is open — also survivable, and the same fallback. */
+interface WatchStatus {
+  configured: boolean
+  active: boolean
+  expires_in_seconds?: number
+  needs_renewal?: boolean
+  registered_by?: string
+  detail?: string
+}
+
 export default function AdminProjects() {
   const { data: session } = useSession()
   const apiToken = session?.apiToken || ""
@@ -37,6 +53,9 @@ export default function AdminProjects() {
   const [projects, setProjects] = useState<Project[]>([])
   const [isLoading, setIsLoading] = useState(true)
   const [errorMsg, setErrorMsg] = useState("")
+
+  const [watchStatus, setWatchStatus] = useState<Record<number, WatchStatus>>({})
+  const [watchBusy, setWatchBusy] = useState<Record<number, boolean>>({})
 
   // Form Modal states
   const [isModalOpen, setIsModalOpen] = useState(false)
@@ -83,6 +102,149 @@ export default function AdminProjects() {
       fetchProjects()
     }
   }, [apiToken])
+
+  // Watch status is fetched per project, separately from the project list, and every
+  // failure resolves to "no status" rather than propagating. A deployment with push
+  // notifications unconfigured is a normal state, not an error, and neither it nor a
+  // Drive outage should be able to take the projects page down with it.
+  useEffect(() => {
+    if (!apiToken || projects.length === 0) return
+    let cancelled = false
+
+    const load = async () => {
+      const entries = await Promise.all(
+        projects.map(async (p) => {
+          try {
+            const res = await fetch(`/api/watch/projects/${p.id}`, {
+              headers: { "Authorization": `Bearer ${apiToken}` }
+            })
+            if (!res.ok) return [p.id, null] as const
+            return [p.id, (await res.json()) as WatchStatus] as const
+          } catch {
+            return [p.id, null] as const
+          }
+        })
+      )
+      if (cancelled) return
+      const next: Record<number, WatchStatus> = {}
+      for (const [id, status] of entries) {
+        if (status) next[id] = status
+      }
+      setWatchStatus(next)
+    }
+
+    load()
+    return () => { cancelled = true }
+  }, [apiToken, projects])
+
+  const handleToggleWatch = async (p: Project) => {
+    const enabling = !watchStatus[p.id]?.active
+    const googleToken = session?.googleAccessToken || ""
+    const googleRefreshToken = session?.googleRefreshToken || ""
+
+    if (!googleToken) {
+      setErrorMsg("Google access token is missing. Please sign out and sign back in.")
+      return
+    }
+
+    setErrorMsg("")
+    setWatchBusy((b) => ({ ...b, [p.id]: true }))
+    try {
+      const res = await fetch(`/api/watch/projects/${p.id}`, {
+        method: enabling ? "POST" : "DELETE",
+        headers: {
+          "Authorization": `Bearer ${apiToken}`,
+          "X-Google-Access-Token": googleToken,
+          "X-Google-Refresh-Token": googleRefreshToken
+        }
+      })
+      const data = await res.json().catch(() => ({}))
+
+      if (!res.ok) {
+        // The backend's 400 and 502 details name the actual cause — an unset
+        // PUBLIC_BASE_URL, or a callback domain Google has not been told to trust.
+        // Surfacing them verbatim is the difference between a message an admin can act
+        // on and "something went wrong".
+        setErrorMsg(data.detail || `Could not ${enabling ? "enable" : "disable"} live sync.`)
+        return
+      }
+
+      setWatchStatus((s) => ({
+        ...s,
+        [p.id]: {
+          configured: true,
+          active: Boolean(data.active),
+          expires_in_seconds: data.expiration
+            ? Math.max(0, Math.floor((new Date(data.expiration).getTime() - Date.now()) / 1000))
+            : undefined
+        }
+      }))
+    } catch (err) {
+      console.error(err)
+      setErrorMsg("Failed to communicate with server.")
+    } finally {
+      setWatchBusy((b) => ({ ...b, [p.id]: false }))
+    }
+  }
+
+  const renderWatchCell = (p: Project) => {
+    if (watchBusy[p.id]) {
+      return (
+        <span className="status inline-flex items-center gap-1.5">
+          <Loader2 className="h-3 w-3 animate-spin" /> Working
+        </span>
+      )
+    }
+
+    const st = watchStatus[p.id]
+    if (!st) return <span className="status" title="Status unavailable">&mdash;</span>
+
+    if (!st.configured) {
+      return (
+        <span
+          className="status"
+          title="PUBLIC_BASE_URL and DRIVE_WEBHOOK_TOKEN are not set on this deployment, so no push channel can be opened. Reads still work — they check Drive for changes instead of being told about them."
+        >
+          Not configured
+        </span>
+      )
+    }
+
+    if (!st.active) {
+      return (
+        <button
+          onClick={() => handleToggleWatch(p)}
+          className="btn btn-ghost px-2 py-1 text-xs"
+          title="Open a Drive push channel so edits made directly in Google Sheets invalidate the cache immediately. Without it, reads fall back to checking Drive on each refresh."
+        >
+          <RadioTower className="h-3.5 w-3.5 mr-1.5" /> Enable
+        </button>
+      )
+    }
+
+    const hours = Math.floor((st.expires_in_seconds ?? 0) / 3600)
+    return (
+      <div className="flex items-center gap-2">
+        <span
+          className={st.needs_renewal ? "status" : "status status-applied"}
+          title={
+            st.needs_renewal
+              ? "Renews automatically on the next read of this project."
+              : `Renews automatically. Registered by ${st.registered_by ?? "an admin"}.`
+          }
+        >
+          Live{hours ? ` · ${hours}h` : ""}
+        </span>
+        <button
+          onClick={() => handleToggleWatch(p)}
+          className="btn btn-ghost px-2 py-1 text-xs"
+          title="Close the push channel. Reads keep working, using a Drive check on each refresh."
+        >
+          Disable
+        </button>
+      </div>
+    )
+  }
 
   // Helper to dynamically build the JSON schema string based on the selected tabs
   const rebuildSchemaConfig = (tabsMap: Record<string, any>, selected: Record<string, boolean>, prefix: string) => {
@@ -438,6 +600,7 @@ export default function AdminProjects() {
                   <th className="label-micro whitespace-nowrap p-4">Default Tab</th>
                   <th className="label-micro whitespace-nowrap p-4">Prefix</th>
                   <th className="label-micro whitespace-nowrap p-4">Status</th>
+                  <th className="label-micro whitespace-nowrap p-4">Live sync</th>
                   <th className="label-micro whitespace-nowrap p-4 text-right">Actions</th>
                 </tr>
               </thead>
@@ -459,6 +622,7 @@ export default function AdminProjects() {
                         <span className="status status-denied">Inactive</span>
                       )}
                     </td>
+                    <td className="p-4 text-xs whitespace-nowrap">{renderWatchCell(p)}</td>
                     <td className="p-4 text-right flex items-center justify-end gap-2.5">
                       <button
                         onClick={() => handleOpenEditModal(p)}
