@@ -1650,6 +1650,33 @@ either variable ever being set — they just never get a push, and lean entirely
 check — and only `POST`/`DELETE /api/watch/projects/{id}` refuse, with a message naming what's
 missing (`api/watch.py:_require_push_config`).
 
+**Verified live, 2026-08-19.** Deployed to migrationbot.duckdns.org and confirmed end to end by the
+operator: the three tables were created by `alembic upgrade head` at container start, a Drive push
+channel registered successfully, and cached reads and push invalidation both behaved as described
+above. This is operator confirmation of behaviour, not an instrumented call count — nothing here
+records a measured before/after figure for Sheets API calls, and §15.4's standing caveat applies.
+
+Two environment-specific findings from that deployment, recorded because both cost time and neither
+is discoverable from the code:
+
+* **`drive.metadata.readonly` is a *restricted* scope**, not merely sensitive — the Cloud Console
+  lists it under "Your restricted scopes". For an app whose audience is **Internal**, which this
+  deployment is, that carries no consequence: no verification, no user cap, no unverified-app
+  interstitial. It would matter a great deal for an External app in production, where a restricted
+  Drive scope requires a third-party security assessment. Anyone considering publishing this app
+  externally should treat that as a blocking prerequisite rather than a formality.
+* **The Cloud Console domain-verification page is legacy and effectively unlisted** — console search
+  does not return it, and it is reachable only at
+  `console.cloud.google.com/apis/credentials/domainverification`. In this deployment, verifying the
+  domain in Google Search Console under the same account proved sufficient on its own and the
+  separate Cloud Console registration was never needed. That may not generalise; the reliable test
+  is to attempt registration, since Drive's refusal for an unverified callback domain is specific
+  ("Unauthorized WebHook callback channel") and `api/watch.py` surfaces it verbatim.
+
+Note also that `docker compose logs backend | grep "Running upgrade"` came back **empty** on a
+deployment where the migrations had in fact run. Alembic's output is not a reliable signal after the
+fact; the schema is. `\dt sheet*` against the database is the check worth trusting.
+
 ---
 
 ## 12. Audit Logging
