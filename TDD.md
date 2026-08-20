@@ -2666,8 +2666,10 @@ both tools now see the same set of candidate rows and apply the same rule to it.
 match the write tools return `ambiguous_id_result()` — classified as `ambiguous_id` (§8.2), naming
 the row numbers, telling the model explicitly not to guess. The dashboard has strictly more
 information: the user clicked a rendered grid row. `_row_dicts` now attaches that row under
-`_ROW_NUMBER_KEY`, `RowPatch.row_number` carries it, and `update_cell(row_number=…)` writes to
-exactly that row. **The pin is verified, not trusted** — the worker checks the row still holds
+`ROW_NUMBER_KEY` — defined in `core/schema.py`, not `api/dashboard.py`, because `core/timeline.py`
+reads the same key and two copies of that magic string are how the grid and the timeline end up
+disagreeing about which physical row a click meant. `RowPatch.row_number` carries it, and
+`update_cell(row_number=…)` writes to exactly that row. **The pin is verified, not trusted** — the worker checks the row still holds
 that ID against its own live scan, so a stale grid cannot redirect an edit onto whatever now
 occupies the position.
 

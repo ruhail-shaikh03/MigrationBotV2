@@ -13,8 +13,6 @@ scanning the sheet and evaluates to nothing in every calculation.
 
 from datetime import date
 
-import pytest
-
 from app.core.timeline import classify_row
 
 START = "Start Date"
@@ -45,6 +43,9 @@ def test_only_a_start_date_is_a_milestone():
     kind, start, end = classify_row(_row("01/02/2026", ""), START, DUE)
     assert kind == "milestone"
     assert start == date(2026, 2, 1)
+    # Both ends carry the one readable value, as the docstring promises, so a caller can
+    # position the point without asking which column it came from.
+    assert end == date(2026, 2, 1)
 
 
 def test_neither_date_is_undated():
@@ -64,8 +65,11 @@ def test_a_malformed_date_is_unparsed_not_undated():
 def test_unparsed_wins_over_a_readable_partner():
     """Drawing the readable half would hide the unreadable one, which is the whole point
     of having this state at all."""
-    kind, _, _ = classify_row(_row("17/0/2026", "09/02/2026"), START, DUE)
+    kind, start, end = classify_row(_row("17/0/2026", "09/02/2026"), START, DUE)
     assert kind == "unparsed"
+    # And it yields no dates at all. Handing back the readable half would let a caller that
+    # destructures the return draw the row anyway, which is the state's whole point undone.
+    assert start is None and end is None
 
 
 def test_whitespace_only_counts_as_absent_not_as_unparsed():

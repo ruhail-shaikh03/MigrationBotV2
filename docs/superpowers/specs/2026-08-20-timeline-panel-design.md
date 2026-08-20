@@ -151,7 +151,7 @@ _resolve_project → _tab_for → get_tab_schema → build_sheets_service
 Four requirements on that pipeline:
 
 1. **`_row_dicts` must be called with `data_start_row`**, unlike `preview_digest`, so each
-   row carries `_ROW_NUMBER_KEY`. Without it a bar cannot open an editable row: the inline
+   row carries `ROW_NUMBER_KEY` (`core/schema.py`). Without it a bar cannot open an editable row: the inline
    edit path needs the physical row number to pin a duplicated ID (TDD §16.7), and 27 of
    412 rows on the reference tracker share an ID.
 2. **`_filter_rows` must be reused, not reimplemented.** It was extracted precisely so the
