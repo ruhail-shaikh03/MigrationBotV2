@@ -301,3 +301,12 @@ def default_critical_headers(
         if resolved and resolved not in out:
             out.append(resolved)
     return out
+
+
+# The sheet row a row dict came from, attached under a key no header can collide with
+# (`_row_dicts` skips empty headers, and a real header is never dunder-wrapped). It lives
+# here rather than in api/dashboard.py because core/timeline.py reads it too, and two
+# copies of a magic string are how the grid and the timeline end up disagreeing about
+# which row the user clicked — which for a duplicated ID is the difference between an
+# edit that lands and an edit that lands somewhere else (§16.7).
+ROW_NUMBER_KEY = "__row_number__"

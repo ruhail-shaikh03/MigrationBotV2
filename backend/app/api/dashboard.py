@@ -31,8 +31,8 @@ from app.core.people import collect_assignments, normalise_person, parse_date, r
 from app.core.permissions import get_user_permissions
 from app.core.health import assess_tab
 from app.core.schema import (
-    bind_columns, get_available_tabs, get_due_column, get_effort_columns, get_people_columns,
-    get_tab_schema, resolve_header,
+    ROW_NUMBER_KEY, bind_columns, get_available_tabs, get_due_column, get_effort_columns,
+    get_people_columns, get_tab_schema, resolve_header,
 )
 from app.db.engine import get_db
 from app.deps import get_current_user, get_google_auth
@@ -83,13 +83,6 @@ def _tab_for(project: Project, tab: Optional[str]) -> str:
     return resolved
 
 
-# The sheet row a row dict came from, attached under a key no header can collide with
-# (`_row_dicts` skips empty headers, and a real header is never dunder-wrapped). Only the
-# grid asks for it — it is what lets an inline edit name the exact row the user clicked,
-# which is the one thing the agent cannot do for a duplicated ID (§16.7).
-_ROW_NUMBER_KEY = "__row_number__"
-
-
 def _row_dicts(
     headers: List[str], rows: List[List[str]], data_start_row: Optional[int] = None
 ) -> List[Dict[str, str]]:
@@ -98,7 +91,7 @@ def _row_dicts(
     Rows come back ragged — Sheets omits trailing empty cells — so short rows are padded
     rather than truncating the header list, which would drop real columns from the grid.
 
-    With `data_start_row`, each dict also carries its sheet row under `_ROW_NUMBER_KEY`.
+    With `data_start_row`, each dict also carries its sheet row under `ROW_NUMBER_KEY`.
     The matrix is in sheet order, so the row number is the index plus that offset — the
     same arithmetic `core/health.py:row_ref` uses to point at a duplicate.
     """
@@ -107,7 +100,7 @@ def _row_dicts(
         padded = list(row) + [""] * (len(headers) - len(row))
         mapped = {h: padded[j] for j, h in enumerate(headers) if h}
         if data_start_row is not None:
-            mapped[_ROW_NUMBER_KEY] = data_start_row + i
+            mapped[ROW_NUMBER_KEY] = data_start_row + i
         out.append(mapped)
     return out
 
@@ -226,7 +219,7 @@ async def _filter_rows(
         if q and not any(
             q.lower().strip() in str(v).lower()
             for k, v in row.items()
-            if k != _ROW_NUMBER_KEY
+            if k != ROW_NUMBER_KEY
         ):
             continue
         if status and not _matches(row, status_header, status):
@@ -337,7 +330,7 @@ class RowUpdate(BaseModel):
 class RowPatch(BaseModel):
     tab: Optional[str] = None
     updates: List[RowUpdate]
-    # The sheet row the client actually rendered, from `_ROW_NUMBER_KEY` on the row it
+    # The sheet row the client actually rendered, from `ROW_NUMBER_KEY` on the row it
     # edited. It disambiguates a duplicated ID, which the grid can do and the agent
     # cannot: the user pointed at one row. Optional so an older client still works —
     # it just gets the refusal instead.
