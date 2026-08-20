@@ -1,3 +1,4 @@
+import re
 from typing import Any, Dict, List, Optional
 
 from app.core.people import slugify_role
@@ -121,13 +122,24 @@ def get_due_column(tab_schema: Dict[str, Any], headers: Optional[List[str]] = No
     return None
 
 
-# Words that mark a column as a *planned start*. Deliberately excludes "assigned":
-# schema_detect's structural fallback matches start columns with
-# ["start", "created", "opened", "assigned"], and "assigned" is a substring of
-# "Assigned To" — a people column on most trackers, which would draw every bar from a
-# person's name. Also excludes "actual" and "finish", mirroring why _DUE_WORDS excludes
-# "completion": when work really began is a different fact from when it was due to.
+# Words that mark a column as a *planned start*, and the guard that keeps them off people
+# columns. schema_detect's structural fallback matches start columns with
+# ["start", "created", "opened", "assigned"] — but "assigned" is a substring of "Assigned
+# To", and "created"/"opened"/"raised" are each a substring of "Created By"/"Opened
+# By"/"Raised By". Those are people columns on most trackers. One idea covers all of them:
+# a header that names *who* did something never says *when* it happened. So "assigned" is
+# left out of the word list, and any header carrying a standalone "by" token is rejected
+# even when it matches a start word. The words themselves have to stay — "Raised On" and
+# "Date Created" are genuine starts — so the guard is on "by", not on the vocabulary.
+#
+# This matters more than a merely-missing bar: a person's name parses to no date, so every
+# such row would land in the `unparsed` bucket that is reserved for malformed dates like
+# "17/0/2026", quietly corrupting the coverage figure the panel exists to be honest about.
+#
+# "by" is matched as a whole token, never as a substring — "Standby Start Date" is a real
+# start column and rejecting it would be the guard overreaching.
 _START_WORDS = ("start", "begin", "kickoff", "kick-off", "created", "opened", "raised")
+_BY_TOKEN = re.compile(r"\bby\b")
 
 
 def _same_header(a: Optional[str], b: Optional[str]) -> bool:
@@ -159,6 +171,11 @@ def get_start_column(
     tab resolves the same header to both ends of the span and every row draws a
     zero-length bar. A zero-length bar looks like data; no bar at all looks like the
     mapping gap it actually is.
+
+    The header scan additionally refuses any header carrying a standalone "by" token, so
+    "Created By" and "Raised By" stay people columns — see the note above `_START_WORDS`.
+    A mapping the schema states explicitly is trusted and skips that guard: it is a human
+    decision, not a guess from a substring.
     """
     dates = tab_schema.get("date_columns") or {}
     value = dates.get("start")
@@ -168,7 +185,10 @@ def get_start_column(
     for header in headers or []:
         if not header or _same_header(header, exclude):
             continue
-        if any(word in str(header).casefold() for word in _START_WORDS):
+        candidate = str(header).casefold()
+        if _BY_TOKEN.search(candidate):
+            continue
+        if any(word in candidate for word in _START_WORDS):
             return header
 
     return None

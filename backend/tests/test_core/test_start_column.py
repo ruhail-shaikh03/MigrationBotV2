@@ -14,8 +14,6 @@ start column with the word list ["start", "created", "opened", "assigned"] — a
 Matching it here would draw every bar from a person's name.
 """
 
-import pytest
-
 from app.core.schema import get_start_column
 
 
@@ -68,6 +66,28 @@ def test_a_completion_column_is_never_a_start():
 
 def test_no_start_column_reports_none_rather_than_guessing():
     assert get_start_column({}, ["ID", "Owner", "Notes"]) is None
+
+
+def test_created_by_is_a_person_not_a_start():
+    """Same trap as "Assigned To": a name parses to no date, so every row would land in
+    the `unparsed` bucket that is reserved for genuinely malformed dates."""
+    assert get_start_column({}, ["ID", "Created By", "Status"]) is None
+
+
+def test_raised_by_is_a_person_not_a_start():
+    assert get_start_column({}, ["ID", "Raised By", "Status"]) is None
+
+
+def test_opened_by_is_a_person_not_a_start():
+    assert get_start_column({}, ["ID", "Opened By", "Status"]) is None
+
+
+def test_by_is_rejected_as_a_token_not_as_a_substring():
+    """"Standby Start Date" is a real start column whose *substring* "by" must not reject
+    it. The header has to contain a start word to reach the guard at all, which is why
+    this is not the plain "Standby Date" — that resolves to None for the ordinary reason
+    that nothing in it looks like a start, and so proves nothing about the guard."""
+    assert get_start_column({}, ["ID", "Standby Start Date", "Status"]) == "Standby Start Date"
 
 
 # --- the collision with _DUE_WORDS -------------------------------------------
