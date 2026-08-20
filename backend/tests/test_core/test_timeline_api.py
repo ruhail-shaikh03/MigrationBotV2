@@ -14,7 +14,6 @@ TestClient is constructed without its context manager, matching test_webhooks.py
 FastAPI's lifespan — and therefore init_db()'s connection attempt — never runs.
 """
 
-from datetime import date
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -107,6 +106,9 @@ def test_it_reports_the_project_and_tab_it_read():
     assert body["tab"] == "SD"
     assert body["project_name"] == "HEDP Tracker"
     assert body["primary_id_column"] == "WRICEF No."
+    # Task 7 renders the tab switcher from this key, so it has to be present even when a
+    # flat single-tab config leaves it empty — there is nowhere to switch to.
+    assert body["tabs"] == []
 
 
 def test_it_names_the_columns_it_resolved():
@@ -139,6 +141,16 @@ def test_a_project_the_caller_cannot_see_is_404_not_403():
     assert response.status_code == 404
 
 
+# --- tab resolution -------------------------------------------------------------
+
+def test_a_project_with_no_default_tab_and_no_tab_argument_is_refused():
+    """`_tab_for`'s refusal, which an inline `tab or project.default_tab` does not make.
+    Charting whatever came back for an unnamed tab is worse than saying no: the caller
+    would be reading a chart of a tab nobody chose."""
+    tabless = SimpleNamespace(**{**vars(PROJECT), "default_tab": None})
+    assert _get(project=tabless).status_code == 400
+
+
 # --- filtering ------------------------------------------------------------------
 
 def test_the_grid_filters_are_forwarded_verbatim():
@@ -158,6 +170,24 @@ def test_the_grid_filters_are_forwarded_verbatim():
     assert kwargs["overdue"] is True
     assert kwargs["role_key"] == "dev"
     assert kwargs["status"] == "Open"
+
+
+def test_only_the_filtered_rows_are_charted():
+    """The spy above proves the filters *arrive*; this proves the filtered result is what
+    gets drawn. Every other test stubs `_filter_rows` to the identity, which cannot tell a
+    handler that charts `filtered` apart from one that charts the unfiltered `rows` — and
+    the second silently ignores every filter the user set."""
+    first_only = AsyncMock(side_effect=lambda db, pid, rows, *a, **k: rows[:1])
+    with patch("app.api.timeline._resolve_project", AsyncMock(return_value=PROJECT)), \
+         patch("app.api.timeline.build_sheets_service", MagicMock()), \
+         patch("app.api.timeline.get_tab_matrix", AsyncMock(return_value=(HEADERS, MATRIX_ROWS, False))), \
+         patch("app.api.timeline._resolver_for", AsyncMock(return_value=None)), \
+         patch("app.api.timeline._filter_rows", first_only):
+        body = client.get(ENDPOINT).json()
+
+    assert body["counts"]["total"] == 1
+    assert body["counts"]["charted"] == 1
+    assert {g["label"] for g in body["groups"]} == {"SD"}
 
 
 def test_group_by_is_honoured():
