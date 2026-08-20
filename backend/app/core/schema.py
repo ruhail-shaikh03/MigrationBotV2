@@ -137,7 +137,10 @@ def get_due_column(tab_schema: Dict[str, Any], headers: Optional[List[str]] = No
 # "17/0/2026", quietly corrupting the coverage figure the panel exists to be honest about.
 #
 # "by" is matched as a whole token, never as a substring — "Standby Start Date" is a real
-# start column and rejecting it would be the guard overreaching.
+# start column and rejecting it would be the guard overreaching. The guard does cost one
+# genuine case: "Start By" (plausibly the latest acceptable start) now resolves to nothing,
+# which is the safe direction — a missing bar is visible, a bar drawn from a person's name
+# is not — and schema_config overrides it for any sheet that really uses that wording.
 _START_WORDS = ("start", "begin", "kickoff", "kick-off", "created", "opened", "raised")
 _BY_TOKEN = re.compile(r"\bby\b")
 
@@ -170,7 +173,10 @@ def get_start_column(
     Start" contains "planned", which is in `_DUE_WORDS` — so without this a single-date
     tab resolves the same header to both ends of the span and every row draws a
     zero-length bar. A zero-length bar looks like data; no bar at all looks like the
-    mapping gap it actually is.
+    mapping gap it actually is. When the *explicit* mapping is the one that collides, this
+    returns None outright rather than scanning on: a schema that names one column for both
+    ends of the span is a mapping error, and substituting some other start-looking header
+    for the one a human chose would hide it behind a bar drawn from the wrong column.
 
     The header scan additionally refuses any header carrying a standalone "by" token, so
     "Created By" and "Raised By" stay people columns — see the note above `_START_WORDS`.
@@ -179,8 +185,12 @@ def get_start_column(
     """
     dates = tab_schema.get("date_columns") or {}
     value = dates.get("start")
-    if value and str(value).strip() and not _same_header(value, exclude):
-        return value
+    if value and str(value).strip():
+        # A mapping that collides with the due column is a mapping error, and the honest
+        # answer is no start column at all. Scanning on from here would return some other
+        # start-looking header in place of the one the human actually chose — trading a
+        # stated decision for a guess, which is exactly what reading the schema first is for.
+        return None if _same_header(value, exclude) else value
 
     for header in headers or []:
         if not header or _same_header(header, exclude):

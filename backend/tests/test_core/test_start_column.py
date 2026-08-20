@@ -24,7 +24,11 @@ def test_explicit_null_start_does_not_resolve_to_a_column():
 
 
 def test_a_mapped_start_column_wins_over_the_header_scan():
-    headers = ["Kickoff", "Begin Work"]
+    """The header order matters to this test. "Begin Work" is scanned first and matches
+    `_START_WORDS`, so a scan-only implementation returns it; only an implementation that
+    reads the schema key first returns "Kickoff". With the two in the other order both
+    implementations agree and the test proves nothing."""
+    headers = ["Begin Work", "Kickoff"]
     assert get_start_column({"date_columns": {"start": "Kickoff"}}, headers) == "Kickoff"
 
 
@@ -108,3 +112,13 @@ def test_exclusion_matching_ignores_whitespace_and_case():
 def test_exclusion_does_not_suppress_a_genuinely_different_column():
     headers = ["ID", "Start Date", "Due Date"]
     assert get_start_column({}, headers, exclude="Due Date") == "Start Date"
+
+
+def test_an_excluded_explicit_mapping_reports_nothing_rather_than_scanning_on():
+    """A mapping that collides with the due column is a mapping error, and the honest
+    answer is no start column at all. Falling through to the header scan here would hand
+    back "Kickoff Date" — a column the human never mapped — in place of the decision they
+    did make, which is the substitution the schema-first rule exists to prevent."""
+    headers = ["ID", "Planned Start", "Kickoff Date"]
+    schema = {"date_columns": {"start": "Planned Start"}}
+    assert get_start_column(schema, headers, exclude="Planned Start") is None
