@@ -159,10 +159,17 @@ def test_every_row_lands_in_exactly_one_bucket():
 
 
 def test_undrawable_rows_are_counted_but_produce_no_items():
-    rows = [_tracker_row("W-3"), _tracker_row("W-4", due="17/0/2026")]
+    """The drawable sibling is load-bearing: without it nothing on the tab parses, the
+    refusal path empties `groups`, and the assertion passes without ever reaching the code
+    that skips an undrawable row."""
+    rows = [
+        _tracker_row("W-1", start="01/02/2026", due="09/02/2026"),
+        _tracker_row("W-3"),
+        _tracker_row("W-4", due="17/0/2026"),
+    ]
     result = _build(rows)
-    assert result["counts"]["total"] == 2
-    assert sum(len(g["items"]) for g in result["groups"]) == 0
+    assert result["counts"]["total"] == 3
+    assert sum(len(g["items"]) for g in result["groups"]) == 1
 
 
 # --- grouping -----------------------------------------------------------------
@@ -230,9 +237,11 @@ def test_groups_past_the_cap_fold_into_one_other_bucket():
 # --- rollup -------------------------------------------------------------------
 
 def test_a_group_header_spans_the_min_and_max_of_its_children():
+    """Deliberately out of order: the latest end is listed first and the earliest start
+    last, so neither `starts[0]` nor `ends[-1]` can pass for a real min/max."""
     rows = [
-        _tracker_row("W-1", start="01/02/2026", due="09/02/2026"),
         _tracker_row("W-2", start="05/02/2026", due="23/02/2026"),
+        _tracker_row("W-1", start="01/02/2026", due="09/02/2026"),
     ]
     group = _build(rows)["groups"][0]
     assert group["start"] == "2026-02-01"
