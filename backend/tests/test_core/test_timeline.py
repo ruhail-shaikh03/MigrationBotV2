@@ -103,3 +103,258 @@ def test_an_end_before_its_start_is_still_a_bar_and_is_not_silently_swapped():
     assert kind == "bar"
     assert start == date(2026, 2, 9)
     assert end == date(2026, 2, 1)
+
+
+# ---------------------------------------------------------------------------
+# build_timeline
+# ---------------------------------------------------------------------------
+
+from app.core.aliases import PersonResolver
+from app.core.timeline import MAX_GROUPS, OTHER_GROUP_LABEL, UNGROUPED_LABEL, build_timeline
+
+TODAY = date(2026, 3, 1)
+
+HEADERS = ["WRICEF No.", "Description", "Module", "Dev Status", "Start Date",
+           "Expected Completetion Date", "Developer Name"]
+
+SCHEMA = {
+    "primary_id_column": "WRICEF No.",
+    "description_column": "Description",
+    "module_column": "Module",
+    "status_column": "Dev Status",
+    "date_columns": {"start": "Start Date", "due": "Expected Completetion Date"},
+    "people_columns": [{"key": "dev", "label": "Developer", "header": "Developer Name"}],
+}
+
+
+def _tracker_row(rid, module="SD", start="", due="", status="In Progress",
+                 dev="Sara Iqbal", desc="Migrate BOM report", row_number=None):
+    row = {
+        "WRICEF No.": rid, "Description": desc, "Module": module,
+        "Dev Status": status, "Start Date": start,
+        "Expected Completetion Date": due, "Developer Name": dev,
+    }
+    if row_number is not None:
+        row["__row_number__"] = row_number
+    return row
+
+
+def _build(rows, **kwargs):
+    kwargs.setdefault("today", TODAY)
+    return build_timeline(HEADERS, rows, SCHEMA, **kwargs)
+
+
+# --- the counts are the contract ---------------------------------------------
+
+def test_every_row_lands_in_exactly_one_bucket():
+    rows = [
+        _tracker_row("W-1", start="01/02/2026", due="09/02/2026"),
+        _tracker_row("W-2", due="09/02/2026"),
+        _tracker_row("W-3"),
+        _tracker_row("W-4", due="17/0/2026"),
+    ]
+    counts = _build(rows)["counts"]
+    assert counts == {"total": 4, "charted": 1, "milestone_only": 1, "undated": 1, "unparsed": 1}
+    assert counts["charted"] + counts["milestone_only"] + counts["undated"] + counts["unparsed"] == counts["total"]
+
+
+def test_undrawable_rows_are_counted_but_produce_no_items():
+    rows = [_tracker_row("W-3"), _tracker_row("W-4", due="17/0/2026")]
+    result = _build(rows)
+    assert result["counts"]["total"] == 2
+    assert sum(len(g["items"]) for g in result["groups"]) == 0
+
+
+# --- grouping -----------------------------------------------------------------
+
+def test_rows_group_by_the_schema_module_column_by_default():
+    rows = [
+        _tracker_row("W-1", module="SD", start="01/02/2026", due="09/02/2026"),
+        _tracker_row("W-2", module="MM", start="03/02/2026", due="11/02/2026"),
+    ]
+    result = _build(rows)
+    assert result["group_by"] == "Module"
+    assert {g["label"] for g in result["groups"]} == {"SD", "MM"}
+
+
+def test_a_tab_with_no_module_column_yields_one_implicit_group():
+    schema = {k: v for k, v in SCHEMA.items() if k != "module_column"}
+    result = build_timeline(HEADERS, [_tracker_row("W-1", start="01/02/2026", due="09/02/2026")],
+                            schema, today=TODAY)
+    assert result["group_by"] is None
+    assert [g["label"] for g in result["groups"]] == [UNGROUPED_LABEL]
+
+
+def test_an_explicit_group_by_overrides_the_default():
+    rows = [_tracker_row("W-1", status="On Hold", start="01/02/2026", due="09/02/2026")]
+    result = _build(rows, group_by="Dev Status")
+    assert result["group_by"] == "Dev Status"
+    assert [g["label"] for g in result["groups"]] == ["On Hold"]
+
+
+def test_grouping_by_a_people_column_splits_a_shared_cell():
+    """The dashboard already reports two people here; the timeline must not report one."""
+    rows = [_tracker_row("W-1", dev="Ahmed Qamar/Asif", start="01/02/2026", due="09/02/2026")]
+    result = _build(rows, group_by="Developer Name")
+    assert {g["label"] for g in result["groups"]} == {"Ahmed Qamar", "Asif"}
+
+
+def test_grouping_by_a_plain_column_never_splits_on_an_ampersand():
+    """"Sales & Distribution" is one module, not two — the distinction summarize makes."""
+    rows = [_tracker_row("W-1", module="Sales & Distribution", start="01/02/2026", due="09/02/2026")]
+    result = _build(rows)
+    assert [g["label"] for g in result["groups"]] == ["Sales & Distribution"]
+
+
+def test_grouping_by_a_people_column_applies_the_alias_map():
+    resolver = PersonResolver({"madiha": ["Madiha Shah Bukhari"]})
+    rows = [
+        _tracker_row("W-1", dev="Madiha", start="01/02/2026", due="09/02/2026"),
+        _tracker_row("W-2", dev="Madiha Shah Bukhari", start="02/02/2026", due="10/02/2026"),
+    ]
+    result = _build(rows, group_by="Developer Name", resolver=resolver)
+    assert [g["label"] for g in result["groups"]] == ["Madiha Shah Bukhari"]
+    assert result["groups"][0]["count"] == 2
+
+
+def test_groups_past_the_cap_fold_into_one_other_bucket():
+    rows = [
+        _tracker_row(f"W-{i}", module=f"M{i:02d}", start="01/02/2026", due="09/02/2026")
+        for i in range(MAX_GROUPS + 5)
+    ]
+    labels = [g["label"] for g in _build(rows)["groups"]]
+    assert len(labels) == MAX_GROUPS + 1
+    assert labels[-1] == OTHER_GROUP_LABEL
+
+
+# --- rollup -------------------------------------------------------------------
+
+def test_a_group_header_spans_the_min_and_max_of_its_children():
+    rows = [
+        _tracker_row("W-1", start="01/02/2026", due="09/02/2026"),
+        _tracker_row("W-2", start="05/02/2026", due="23/02/2026"),
+    ]
+    group = _build(rows)["groups"][0]
+    assert group["start"] == "2026-02-01"
+    assert group["end"] == "2026-02-23"
+
+
+def test_a_group_with_nothing_dated_has_no_span_but_keeps_its_count():
+    """Needs a dated sibling group: a tab where *nothing* is dated returns a reason and no
+    groups at all, which is the separate case below."""
+    rows = [
+        _tracker_row("W-1", module="SD", start="01/02/2026", due="09/02/2026"),
+        _tracker_row("W-2", module="MM"),
+        _tracker_row("W-3", module="MM"),
+    ]
+    groups = {g["label"]: g for g in _build(rows)["groups"]}
+    assert groups["MM"]["start"] is None and groups["MM"]["end"] is None
+    assert groups["MM"]["count"] == 2
+
+
+def test_a_milestone_contributes_to_its_group_span():
+    rows = [
+        _tracker_row("W-1", start="01/02/2026", due="09/02/2026"),
+        _tracker_row("W-2", due="28/02/2026"),
+    ]
+    group = _build(rows)["groups"][0]
+    assert group["end"] == "2026-02-28"
+
+
+# --- items --------------------------------------------------------------------
+
+def test_an_item_carries_the_row_number_for_the_duplicate_id_pin():
+    rows = [_tracker_row("W-1", start="01/02/2026", due="09/02/2026", row_number=47)]
+    item = _build(rows)["groups"][0]["items"][0]
+    assert item["row_number"] == 47
+
+
+def test_an_item_is_labelled_with_its_description():
+    rows = [_tracker_row("W-1", desc="Migrate BOM report", start="01/02/2026", due="09/02/2026")]
+    assert _build(rows)["groups"][0]["items"][0]["label"] == "Migrate BOM report"
+
+
+def test_a_past_deadline_on_unfinished_work_is_overdue():
+    rows = [_tracker_row("W-1", start="01/01/2026", due="09/01/2026", status="In Progress")]
+    assert _build(rows)["groups"][0]["items"][0]["overdue"] is True
+
+
+def test_a_past_deadline_on_finished_work_is_not_overdue():
+    """"Completed" is the reference tracker's value, and it must not read as overdue —
+    the §16.6 divergence that had chat reporting 171 finished rows as late."""
+    rows = [_tracker_row("W-1", start="01/01/2026", due="09/01/2026", status="Completed")]
+    assert _build(rows)["groups"][0]["items"][0]["overdue"] is False
+
+
+def test_a_reversed_pair_is_drawn_forwards_and_flagged():
+    rows = [_tracker_row("W-1", start="09/02/2026", due="01/02/2026")]
+    item = _build(rows)["groups"][0]["items"][0]
+    assert item["start"] == "2026-02-01"
+    assert item["end"] == "2026-02-09"
+    assert item["reversed"] is True
+
+
+def test_an_item_carries_the_raw_cell_text_for_the_editable_fields():
+    """The modal writes back what the user types; handing it an ISO date would rewrite a
+    sheet that spells dates '10.05.2026' into a different format on every edit."""
+    rows = [_tracker_row("W-1", start="10.05.2026", due="12.05.2026")]
+    item = _build(rows)["groups"][0]["items"][0]
+    assert item["values"]["Start Date"] == "10.05.2026"
+    assert item["values"]["Developer Name"] == "Sara Iqbal"
+
+
+# --- headers, range and refusal ------------------------------------------------
+
+def test_the_resolved_column_names_are_reported():
+    result = _build([_tracker_row("W-1", start="01/02/2026", due="09/02/2026")])
+    assert result["start_header"] == "Start Date"
+    assert result["due_header"] == "Expected Completetion Date"
+
+
+def test_a_schema_header_with_a_trailing_space_binds_to_the_stripped_row_key():
+    """The §7.2 asymmetry: schema_config stores headers verbatim, row dicts are stripped."""
+    schema = {**SCHEMA, "date_columns": {"start": "Start Date ", "due": "Expected Completetion Date"}}
+    result = build_timeline(HEADERS, [_tracker_row("W-1", start="01/02/2026", due="09/02/2026")],
+                            schema, today=TODAY)
+    assert result["start_header"] == "Start Date"
+    assert result["counts"]["charted"] == 1
+
+
+def test_the_axis_range_spans_every_drawn_date():
+    rows = [
+        _tracker_row("W-1", start="01/02/2026", due="09/02/2026"),
+        _tracker_row("W-2", due="28/02/2026"),
+    ]
+    result = _build(rows)
+    assert result["range_start"] == "2026-02-01"
+    assert result["range_end"] == "2026-02-28"
+
+
+def test_a_tab_with_no_date_columns_says_so_instead_of_returning_zeroes():
+    schema = {"primary_id_column": "WRICEF No."}
+    result = build_timeline(["WRICEF No."], [{"WRICEF No.": "W-1"}], schema, today=TODAY)
+    assert result["reason"] is not None
+    assert result["groups"] == []
+
+
+def test_a_tab_where_no_row_is_readable_says_so():
+    result = _build([_tracker_row("W-1"), _tracker_row("W-2")])
+    assert result["reason"] is not None
+
+
+def test_a_tab_with_drawable_rows_has_no_reason():
+    assert _build([_tracker_row("W-1", start="01/02/2026", due="09/02/2026")])["reason"] is None
+
+
+def test_groupable_offers_low_cardinality_columns_and_omits_free_text():
+    rows = [_tracker_row(f"W-{i}", desc=f"unique description {i}", start="01/02/2026",
+                         due="09/02/2026") for i in range(MAX_GROUPS + 5)]
+    groupable = _build(rows)["groupable"]
+    assert "Module" in groupable
+    assert "Description" not in groupable
+
+
+def test_a_people_column_is_always_groupable_regardless_of_cardinality():
+    rows = [_tracker_row(f"W-{i}", dev=f"Person {i}", start="01/02/2026", due="09/02/2026")
+            for i in range(MAX_GROUPS + 5)]
+    assert "Developer Name" in _build(rows)["groupable"]
