@@ -121,6 +121,59 @@ def get_due_column(tab_schema: Dict[str, Any], headers: Optional[List[str]] = No
     return None
 
 
+# Words that mark a column as a *planned start*. Deliberately excludes "assigned":
+# schema_detect's structural fallback matches start columns with
+# ["start", "created", "opened", "assigned"], and "assigned" is a substring of
+# "Assigned To" — a people column on most trackers, which would draw every bar from a
+# person's name. Also excludes "actual" and "finish", mirroring why _DUE_WORDS excludes
+# "completion": when work really began is a different fact from when it was due to.
+_START_WORDS = ("start", "begin", "kickoff", "kick-off", "created", "opened", "raised")
+
+
+def _same_header(a: Optional[str], b: Optional[str]) -> bool:
+    """Whitespace- and case-insensitive header comparison."""
+    if not a or not b:
+        return False
+    return str(a).strip().casefold() == str(b).strip().casefold()
+
+
+def get_start_column(
+    tab_schema: Dict[str, Any],
+    headers: Optional[List[str]] = None,
+    exclude: Optional[str] = None,
+) -> Optional[str]:
+    """The column holding each row's planned start, verbatim, or None if there is none.
+
+    `get_due_column`'s mirror, and it repeats that function's shape deliberately rather
+    than sharing an abstraction: the two word lists encode opposite judgements about the
+    same headers, and a shared helper would invite someone to "unify" them.
+
+    Reads the schema key with a truthiness test rather than `dict.get(key, default)`.
+    Detection writes `date_columns` keys holding a literal `null` on the LLM path
+    (`schema_detect.detect_schema_config`; only `_structural_fallback` strips falsy keys),
+    and a key that exists holding None ignores the default — the exact defect that broke
+    `summarize(report_type="overdue")` on every registered project (§16.6).
+
+    `exclude` is the already-resolved due column. The two word lists overlap — "Planned
+    Start" contains "planned", which is in `_DUE_WORDS` — so without this a single-date
+    tab resolves the same header to both ends of the span and every row draws a
+    zero-length bar. A zero-length bar looks like data; no bar at all looks like the
+    mapping gap it actually is.
+    """
+    dates = tab_schema.get("date_columns") or {}
+    value = dates.get("start")
+    if value and str(value).strip() and not _same_header(value, exclude):
+        return value
+
+    for header in headers or []:
+        if not header or _same_header(header, exclude):
+            continue
+        if any(word in str(header).casefold() for word in _START_WORDS):
+            return header
+
+    return None
+
+
 def get_available_tabs(schema_config: Dict[str, Any]) -> List[str]:
     """Resolve the tab names this project can switch between, for system-prompt injection.
 
