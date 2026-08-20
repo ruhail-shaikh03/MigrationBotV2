@@ -360,6 +360,25 @@ def test_the_resolved_column_names_are_reported():
     assert result["due_header"] == "Expected Completetion Date"
 
 
+def test_a_header_named_in_two_roles_is_offered_for_editing_once():
+    """`people_columns` is free-form, so nothing forbids a schema naming its status column
+    as a people column too — a tracker whose "Dev Status" cell holds "In Progress (Sara)"
+    is a plausible reason to. Listing the header twice would render the same field twice in
+    the row dialog, and a second box writing to the same cell is a conflict the user has no
+    way to resolve."""
+    schema = {**SCHEMA, "people_columns": [
+        {"key": "dev", "label": "Developer", "header": "Developer Name"},
+        {"key": "status_owner", "label": "Status owner", "header": "Dev Status"},
+    ]}
+    result = build_timeline(HEADERS, [_tracker_row("W-1", start="01/02/2026", due="09/02/2026")],
+                            schema, today=TODAY)
+    editable = result["editable_headers"]
+    assert editable.count("Dev Status") == 1
+    # The other roles survive, in first-occurrence order: the duplicate does not shunt the
+    # status column down to where the people columns start.
+    assert editable == ["Start Date", "Expected Completetion Date", "Dev Status", "Developer Name"]
+
+
 def test_a_schema_header_with_a_trailing_space_binds_to_the_stripped_row_key():
     """The §7.2 asymmetry: schema_config stores headers verbatim, row dicts are stripped."""
     schema = {**SCHEMA, "date_columns": {"start": "Start Date ", "due": "Expected Completetion Date"}}
