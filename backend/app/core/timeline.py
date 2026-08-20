@@ -180,7 +180,13 @@ def build_timeline(
     # Which cells the row dialog may edit. Dates and status join the people columns here;
     # RBAC still gates every one of them field-by-field at dispatch (§6.2), so widening
     # the affordance cannot widen anyone's permissions.
-    editable = [h for h in ([start_header, due_header, status_header] + people_headers) if h]
+    #
+    # Deduplicated because `people_columns` is free-form: nothing stops a schema declaring
+    # the status column as a people column too, and a header listed twice renders the same
+    # field twice in the row dialog.
+    editable = list(dict.fromkeys(
+        h for h in ([start_header, due_header, status_header] + people_headers) if h
+    ))
 
     group_header = resolve_header(
         headers, group_by if group_by else tab_schema.get("module_column")

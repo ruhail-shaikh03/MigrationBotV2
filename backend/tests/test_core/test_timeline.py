@@ -13,7 +13,14 @@ scanning the sheet and evaluates to nothing in every calculation.
 
 from datetime import date
 
-from app.core.timeline import classify_row
+from app.core.aliases import PersonResolver
+from app.core.timeline import (
+    MAX_GROUPS,
+    OTHER_GROUP_LABEL,
+    UNGROUPED_LABEL,
+    build_timeline,
+    classify_row,
+)
 
 START = "Start Date"
 DUE = "Expected Completetion Date"
@@ -108,9 +115,6 @@ def test_an_end_before_its_start_is_still_a_bar_and_is_not_silently_swapped():
 # ---------------------------------------------------------------------------
 # build_timeline
 # ---------------------------------------------------------------------------
-
-from app.core.aliases import PersonResolver
-from app.core.timeline import MAX_GROUPS, OTHER_GROUP_LABEL, UNGROUPED_LABEL, build_timeline
 
 TODAY = date(2026, 3, 1)
 
@@ -225,13 +229,29 @@ def test_grouping_by_a_people_column_applies_the_alias_map():
 
 
 def test_groups_past_the_cap_fold_into_one_other_bucket():
+    """The fold is the only lossy-*looking* step in the function, so the bucket has to
+    account for everything it swallowed — its count, its rows and its span, not just its
+    name. Dates vary per row on purpose: with one shared span, `Other`'s would be
+    indistinguishable from every other group's and a wrong rollup would still look right.
+    """
     rows = [
-        _tracker_row(f"W-{i}", module=f"M{i:02d}", start="01/02/2026", due="09/02/2026")
+        _tracker_row(f"W-{i}", module=f"M{i:02d}",
+                     start=f"{i + 1:02d}/02/2026", due=f"{i + 1:02d}/03/2026")
         for i in range(MAX_GROUPS + 5)
     ]
-    labels = [g["label"] for g in _build(rows)["groups"]]
+    result = _build(rows)
+    labels = [g["label"] for g in result["groups"]]
     assert len(labels) == MAX_GROUPS + 1
     assert labels[-1] == OTHER_GROUP_LABEL
+
+    # Groups sort earliest-start first, so the five folded away are the five latest —
+    # M12..M16, starting 13-17 Feb and ending 13-17 Mar.
+    other = result["groups"][-1]
+    assert other["count"] == 5
+    assert other["collapsed_groups"] == 5
+    assert len(other["items"]) == 5
+    assert other["start"] == "2026-02-13"
+    assert other["end"] == "2026-03-17"
 
 
 # --- rollup -------------------------------------------------------------------
@@ -295,6 +315,26 @@ def test_a_past_deadline_on_finished_work_is_not_overdue():
     assert _build(rows)["groups"][0]["items"][0]["overdue"] is False
 
 
+def test_a_start_only_milestone_is_never_overdue_however_old():
+    """A start date promises nothing, so a stale one is not a missed deadline. Reporting it
+    as one invents an obligation the sheet never recorded."""
+    rows = [_tracker_row("W-1", start="01/01/2026", due="")]
+    item = _build(rows)["groups"][0]["items"][0]
+    assert item["kind"] == "milestone"
+    assert item["milestone_of"] == "start"
+    assert item["overdue"] is False
+
+
+def test_a_due_only_milestone_past_its_date_is_overdue():
+    """The mirror. A deadline with no start is still a deadline, and a milestone that never
+    flags is the §16.6 under-reporting again, one bucket over."""
+    rows = [_tracker_row("W-1", start="", due="09/01/2026")]
+    item = _build(rows)["groups"][0]["items"][0]
+    assert item["kind"] == "milestone"
+    assert item["milestone_of"] == "due"
+    assert item["overdue"] is True
+
+
 def test_a_reversed_pair_is_drawn_forwards_and_flagged():
     rows = [_tracker_row("W-1", start="09/02/2026", due="01/02/2026")]
     item = _build(rows)["groups"][0]["items"][0]
@@ -349,6 +389,12 @@ def test_a_tab_with_no_date_columns_says_so_instead_of_returning_zeroes():
 def test_a_tab_where_no_row_is_readable_says_so():
     result = _build([_tracker_row("W-1"), _tracker_row("W-2")])
     assert result["reason"] is not None
+    # Refusal is the one path that empties the chart, so it is the one place a row could
+    # vanish without a count moving. The counts have to survive it intact — a caption
+    # reading "0 of 0" over a refused tab is a different and much softer lie than "2 rows,
+    # neither dated".
+    assert result["counts"] == {"total": 2, "charted": 0, "milestone_only": 0,
+                                "undated": 2, "unparsed": 0}
 
 
 def test_a_tab_with_drawable_rows_has_no_reason():
