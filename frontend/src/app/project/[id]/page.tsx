@@ -7,12 +7,13 @@ import {
   Bar, BarChart, Cell, LabelList, ResponsiveContainer, Tooltip, XAxis, YAxis,
 } from "recharts"
 import {
-  AlertTriangle, ArrowLeft, Download, Grid3x3, Pencil, RefreshCw, Search, Stethoscope, Users,
+  AlertTriangle, ArrowLeft, Download, Grid3x3, RefreshCw, Search, Stethoscope, Users,
 } from "lucide-react"
 
 import {
-  ChartFrame, DataTable, HoverTip, MAX_BARS, SERIES_HUE, StatTile,
+  ChartFrame, DataTable, EditableCell, HoverTip, MAX_BARS, SERIES_HUE, StatTile,
 } from "@/components/DataDisplay"
+import { useRowEdits } from "@/hooks/useRowEdits"
 
 /**
  * The project dashboard: the sheet itself, rather than answers about it.
@@ -60,16 +61,6 @@ interface RowsResponse {
   offset: number
   limit: number
   truncated: boolean
-}
-
-/** An edit that has been queued but not yet confirmed applied by the worker, keyed
- *  `${rowId}::${header}`. Writes are eventually consistent (the worker applies at
- *  1 req/sec), so the cell has to show its own pending state or the edit looks lost. */
-interface PendingEdit {
-  jobId: string
-  value: string
-  state: "queued" | "failed"
-  error?: string
 }
 
 interface WorkloadEntry {
@@ -130,8 +121,6 @@ export default function ProjectDashboard() {
   const [isLoading, setIsLoading] = useState(true)
   const [errorMsg, setErrorMsg] = useState("")
 
-  const [pending, setPending] = useState<Record<string, PendingEdit>>({})
-  const [editing, setEditing] = useState<string | null>(null)
   const [showEmptyColumns, setShowEmptyColumns] = useState(false)
   const [exporting, setExporting] = useState(false)
 
@@ -197,6 +186,14 @@ export default function ProjectDashboard() {
       setIsLoading(false)
     }
   }, [apiToken, projectId, tab, offset, q, person, roleKey, overdueOnly, authHeaders])
+
+  const { pending, editing, setEditing, saveCell } = useRowEdits({
+    projectId,
+    tab: rowsData?.tab,
+    authHeaders,
+    apiToken,
+    onApplied: load,
+  })
 
   /**
    * Download the filtered tab.
@@ -267,109 +264,6 @@ export default function ProjectDashboard() {
     run()
     return () => { cancelled = true }
   }, [view, tab, apiToken, projectId, authHeaders])
-
-  // Reassignments land through the queue, so the terminal frame is the cue to re-read.
-  // Reusing the existing queue_update -> CustomEvent bridge means the dashboard reflects
-  // an edit made from chat, too.
-  useEffect(() => {
-    const onQueueUpdate = (event: Event) => {
-      const detail = (event as CustomEvent).detail as
-        | { job_id?: string; status?: string; error?: string }
-        | undefined
-
-      if (detail?.job_id) {
-        setPending((prev) => {
-          const key = Object.keys(prev).find((k) => prev[k].jobId === detail.job_id)
-          if (!key) return prev
-          const next = { ...prev }
-          if (detail.status === "completed") {
-            // Applied: drop the pending marker and let the reload below show the real
-            // cell. Keeping it would leave the UI asserting a value the sheet may have
-            // normalised differently.
-            delete next[key]
-          } else {
-            next[key] = { ...next[key], state: "failed", error: detail.error }
-          }
-          return next
-        })
-      }
-      if (detail?.status === "completed") load()
-    }
-    window.addEventListener("queue_update", onQueueUpdate)
-    return () => window.removeEventListener("queue_update", onQueueUpdate)
-  }, [load])
-
-  // A terminal frame can be missed — a reload, a reconnect, a worker restart — which
-  // would strand a cell on "queued" forever. GET /api/jobs/{id} is the authoritative
-  // fallback for exactly that, and until now nothing in the app called it.
-  useEffect(() => {
-    const stuck = Object.entries(pending).filter(([, p]) => p.state === "queued")
-    if (stuck.length === 0 || !apiToken) return
-
-    const timer = setTimeout(async () => {
-      for (const [key, entry] of stuck) {
-        try {
-          const res = await fetch(`/api/jobs/${entry.jobId}`, { headers: authHeaders })
-          if (!res.ok) continue
-          const job = await res.json()
-          if (job.status === "done") {
-            setPending((prev) => {
-              const next = { ...prev }
-              delete next[key]
-              return next
-            })
-            load()
-          } else if (job.status === "error" || job.status === "dead_letter") {
-            setPending((prev) => ({
-              ...prev,
-              [key]: { ...prev[key], state: "failed", error: job.error },
-            }))
-          }
-        } catch {
-          // Reconciliation is best-effort; the next poll or a manual refresh will catch it.
-        }
-      }
-    }, 8000)
-    return () => clearTimeout(timer)
-  }, [pending, apiToken, authHeaders, load])
-
-  const saveCell = useCallback(
-    async (rowId: string, header: string, value: string, rowNumber?: number) => {
-      const key = `${rowId}::${header}`
-      setEditing(null)
-      try {
-        const res = await fetch(`/api/projects/${projectId}/rows/${encodeURIComponent(rowId)}`, {
-          method: "PATCH",
-          headers: { ...authHeaders, "Content-Type": "application/json" },
-          // `row_number` names the row actually on screen. IDs are not unique on every
-          // tracker — 27 of 412 rows on the reference sheet share one — so without it the
-          // server can only refuse the edit rather than guess which row was clicked.
-          body: JSON.stringify({
-            tab: rowsData?.tab,
-            updates: [{ field: header, value }],
-            row_number: rowNumber,
-          }),
-        })
-        const body = await res.json().catch(() => ({}))
-        if (!res.ok) {
-          // A 403 here is the RBAC checker refusing the write; show its own wording
-          // rather than a generic failure, since it explains what to ask an admin for.
-          setPending((prev) => ({
-            ...prev,
-            [key]: { jobId: "", value, state: "failed", error: body.detail || `Refused (${res.status}).` },
-          }))
-          return
-        }
-        setPending((prev) => ({ ...prev, [key]: { jobId: body.job_id, value, state: "queued" } }))
-      } catch {
-        setPending((prev) => ({
-          ...prev,
-          [key]: { jobId: "", value, state: "failed", error: "Could not reach the server." },
-        }))
-      }
-    },
-    [projectId, authHeaders, rowsData]
-  )
 
   // Switching tab invalidates the people- and role-filters with it: the names and role
   // keys on one tab generally do not exist on another, so carrying them across would
@@ -656,51 +550,18 @@ export default function ProjectDashboard() {
                     // The sheet row this cell was rendered from, so an edit to a
                     // duplicated ID lands on the row the user is looking at.
                     const rowNumber = rowsData?.rows[rowIndex]?.__row_number__
+                    const cellId = `${rowId}::${header}::cell`
 
-                    const key = `${rowId}::${header}`
-                    const edit = pending[key]
-                    const cellId = `${key}::cell`
-
-                    if (editing === cellId) {
-                      return (
-                        <input
-                          autoFocus
-                          defaultValue={value}
-                          aria-label={`${label} for ${rowId}`}
-                          onBlur={(e) => saveCell(rowId, header, e.target.value, rowNumber)}
-                          onKeyDown={(e) => {
-                            if (e.key === "Enter") (e.target as HTMLInputElement).blur()
-                            if (e.key === "Escape") setEditing(null)
-                          }}
-                          className="w-full rounded border border-brass-500 bg-ink-950 px-1.5 py-0.5 text-[12.5px] text-ink-100 focus:outline-none"
-                        />
-                      )
-                    }
-
-                    // The dotted underline is the affordance. Without it an editable cell
-                    // is visually identical to a read-only one, so the feature is
-                    // undiscoverable — nobody clicks a table cell on spec.
                     return (
-                      <button
-                        onClick={() => setEditing(cellId)}
-                        title={edit?.error || `Reassign ${label}`}
-                        className="group flex w-full cursor-pointer items-center gap-1 text-left"
-                      >
-                        <span
-                          className={`decoration-dotted underline-offset-4 group-hover:text-brass-300 group-hover:underline ${
-                            edit?.state === "failed" ? "text-failed" : "underline decoration-ink-600"
-                          }`}
-                        >
-                          {edit ? edit.value : value || <span className="text-ink-600">Unassigned</span>}
-                        </span>
-                        <Pencil className="h-3 w-3 shrink-0 text-ink-600 opacity-0 transition group-hover:opacity-100" />
-                        {edit?.state === "queued" && (
-                          <span className="status status-queued ml-1">queued</span>
-                        )}
-                        {edit?.state === "failed" && (
-                          <span className="status status-failed ml-1">failed</span>
-                        )}
-                      </button>
+                      <EditableCell
+                        label={`${label} for ${rowId}`}
+                        value={value}
+                        edit={pending[`${rowId}::${header}`]}
+                        isEditing={editing === cellId}
+                        onBeginEdit={() => setEditing(cellId)}
+                        onCancel={() => setEditing(null)}
+                        onSave={(next) => saveCell(rowId, header, next, rowNumber)}
+                      />
                     )
                   }}
                 />

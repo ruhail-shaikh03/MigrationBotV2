@@ -1,5 +1,7 @@
 "use client"
 
+import { Pencil } from "lucide-react"
+
 /**
  * Shared display primitives for anything that draws sheet data.
  *
@@ -163,5 +165,69 @@ export function DataTable({
         </table>
       </div>
     </div>
+  )
+}
+
+/**
+ * One editable sheet cell, with its own queued/failed state.
+ *
+ * Extracted from the dashboard grid's `renderCell` closure so the timeline's row dialog
+ * shows the identical control rather than a second implementation of it. The dotted
+ * underline is the affordance and is not decorative: without it an editable cell is
+ * visually identical to a read-only one, so nobody discovers the feature.
+ */
+export function EditableCell({
+  label,
+  value,
+  edit,
+  isEditing,
+  onBeginEdit,
+  onCancel,
+  onSave,
+  placeholder = "Unassigned",
+}: {
+  /** The column's display label, used in the accessible name and the hover title. */
+  label: string
+  value: string
+  edit?: { value: string; state: "queued" | "failed"; error?: string }
+  isEditing: boolean
+  onBeginEdit: () => void
+  onCancel: () => void
+  onSave: (next: string) => void
+  placeholder?: string
+}) {
+  if (isEditing) {
+    return (
+      <input
+        autoFocus
+        defaultValue={edit ? edit.value : value}
+        aria-label={label}
+        onBlur={(e) => onSave(e.target.value)}
+        onKeyDown={(e) => {
+          if (e.key === "Enter") (e.target as HTMLInputElement).blur()
+          if (e.key === "Escape") onCancel()
+        }}
+        className="w-full rounded border border-brass-500 bg-ink-950 px-1.5 py-0.5 text-[12.5px] text-ink-100 focus:outline-none"
+      />
+    )
+  }
+
+  return (
+    <button
+      onClick={onBeginEdit}
+      title={edit?.error || `Edit ${label}`}
+      className="group flex w-full cursor-pointer items-center gap-1 text-left"
+    >
+      <span
+        className={`decoration-dotted underline-offset-4 group-hover:text-brass-300 group-hover:underline ${
+          edit?.state === "failed" ? "text-failed" : "underline decoration-ink-600"
+        }`}
+      >
+        {edit ? edit.value : value || <span className="text-ink-600">{placeholder}</span>}
+      </span>
+      <Pencil className="h-3 w-3 shrink-0 text-ink-600 opacity-0 transition group-hover:opacity-100" />
+      {edit?.state === "queued" && <span className="status status-queued ml-1">queued</span>}
+      {edit?.state === "failed" && <span className="status status-failed ml-1">failed</span>}
+    </button>
   )
 }
