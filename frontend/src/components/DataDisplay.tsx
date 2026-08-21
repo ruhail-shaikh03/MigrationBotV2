@@ -185,8 +185,9 @@ export function EditableCell({
   onCancel,
   onSave,
   placeholder = "Unassigned",
+  title = `Edit ${label}`,
 }: {
-  /** The column's display label, used in the accessible name and the hover title. */
+  /** The column's display label, used in the accessible name and in the default title. */
   label: string
   value: string
   edit?: { value: string; state: "queued" | "failed"; error?: string }
@@ -195,11 +196,21 @@ export function EditableCell({
   onCancel: () => void
   onSave: (next: string) => void
   placeholder?: string
+  /** Hover title for the read state. Defaults to `Edit {label}`; the dashboard grid passes
+   *  "Reassign {label}" because it only makes people-columns editable, where that is the
+   *  verb the user is looking for. A failed edit's error still takes precedence over it. */
+  title?: string
 }) {
   if (isEditing) {
     return (
       <input
         autoFocus
+        // Seeded from the pending edit rather than from `value`, which is what the closure
+        // this was extracted from used. The read state below already renders `edit.value`,
+        // so opening the input on the stale sheet value would replace what the cell was
+        // displaying a moment earlier with something else. A deliberate, reviewed
+        // divergence from the pre-extraction behaviour; the rest of the extraction is a
+        // no-op.
         defaultValue={edit ? edit.value : value}
         aria-label={label}
         onBlur={(e) => onSave(e.target.value)}
@@ -215,7 +226,7 @@ export function EditableCell({
   return (
     <button
       onClick={onBeginEdit}
-      title={edit?.error || `Edit ${label}`}
+      title={edit?.error || title}
       className="group flex w-full cursor-pointer items-center gap-1 text-left"
     >
       <span

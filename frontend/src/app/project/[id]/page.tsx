@@ -555,6 +555,10 @@ export default function ProjectDashboard() {
                     return (
                       <EditableCell
                         label={`${label} for ${rowId}`}
+                        // The grid only makes people-columns editable, so "Reassign" is the
+                        // verb here — EditableCell's generic default is for surfaces that
+                        // also edit dates and status.
+                        title={`Reassign ${label}`}
                         value={value}
                         edit={pending[`${rowId}::${header}`]}
                         isEditing={editing === cellId}
