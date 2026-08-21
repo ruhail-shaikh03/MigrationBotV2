@@ -111,15 +111,17 @@ interface HealthResponse {
   truncated: boolean
 }
 
+/** What the timeline panel reads, which is a subset of what the endpoint sends. It also
+ *  returns `tab`, `tabs`, `project_name`, `people_columns` and `primary_id_column`; the
+ *  panel takes its tab and its tab list from the rows request that already drives the
+ *  header, and addresses a row by the id the item itself carries. Declaring fields nothing
+ *  reads only invites a later reader to believe something depends on them. */
 interface TimelineResponse {
-  tab: string
-  project_name: string
   start_header: string | null
   due_header: string | null
   group_by: string | null
   groupable: string[]
   editable_headers: string[]
-  people_columns: RoleColumn[]
   range_start: string | null
   range_end: string | null
   today: string
@@ -128,8 +130,22 @@ interface TimelineResponse {
   /** Why there is nothing to draw. Present instead of an empty chart, because an empty
    *  chart reads as "no work is late" rather than as "this sheet records no dates". */
   reason: string | null
-  primary_id_column: string | null
   truncated: boolean
+}
+
+/** A timeline payload with the request that produced it.
+ *
+ *  `key` is the whole filter signature; `tab` is carried separately rather than parsed
+ *  back out of it, both because a tab name may legitimately contain the delimiter and
+ *  because the two are needed at different granularities — the chart must not show another
+ *  filter's answer, while the Group-by control only has to not show another *tab's*
+ *  columns. `error` is the server's own wording for a failed read, which for an RBAC
+ *  refusal names the fields the user lacks. */
+interface TimelineState {
+  key: string
+  tab: string
+  data: TimelineResponse | null
+  error?: string
 }
 
 const PAGE_SIZE = 50
@@ -159,7 +175,7 @@ export default function ProjectDashboard() {
   const [health, setHealth] = useState<{ key: string; data: HealthResponse | null } | null>(null)
   // Carries the filter signature it was fetched under, so the panel can tell "this is the
   // answer to what is on screen" from "this is the previous filter's answer".
-  const [timeline, setTimeline] = useState<{ key: string; data: TimelineResponse | null } | null>(null)
+  const [timeline, setTimeline] = useState<TimelineState | null>(null)
   const [groupBy, setGroupBy] = useState("")
   const [selected, setSelected] = useState<TimelineItem | null>(null)
   // Bumped when a queued write actually lands. Not part of `timelineKey`: a reload is the
@@ -183,10 +199,15 @@ export default function ProjectDashboard() {
   const [overdueOnly, setOverdueOnly] = useState(false)
   const [offset, setOffset] = useState(0)
 
+  // Trimmed once, here, and used for both the signature and the request — as `load` does
+  // for the grid. Sending the raw value would make a trailing space a different signature
+  // and fire a whole-tab scan for a search the server treats as identical.
+  const qTrimmed = q.trim()
+
   // Everything the timeline request depends on, in one string. Written once and read by
   // both the fetch and the render for the same reason `editKey` exists: two spellings of
   // one signature is how a panel ends up believing stale data is current.
-  const timelineKey = `${tab}|${q}|${person}|${roleKey}|${overdueOnly}|${groupBy}`
+  const timelineKey = `${tab}|${qTrimmed}|${person}|${roleKey}|${overdueOnly}|${groupBy}`
 
   const apiToken = session?.apiToken || ""
   const googleToken = session?.googleAccessToken || ""
@@ -354,7 +375,7 @@ export default function ProjectDashboard() {
     const run = async () => {
       const params = new URLSearchParams()
       if (tab) params.set("tab", tab)
-      if (q) params.set("q", q)
+      if (qTrimmed) params.set("q", qTrimmed)
       if (person) params.set("person", person)
       if (roleKey) params.set("role_key", roleKey)
       if (overdueOnly) params.set("overdue", "true")
@@ -363,10 +384,29 @@ export default function ProjectDashboard() {
         const res = await fetch(`/api/projects/${projectId}/timeline?${params.toString()}`, {
           headers: authHeaders,
         })
-        const body = res.ok ? await res.json() : null
-        if (!cancelled) setTimeline({ key: timelineKey, data: body })
+        if (res.ok) {
+          const body = await res.json()
+          if (!cancelled) setTimeline({ key: timelineKey, tab, data: body })
+          return
+        }
+        // The server's own wording, as `load` does for the grid. A 403 here is the RBAC
+        // checker refusing the read and names what the caller lacks; collapsing that into
+        // "could not be loaded" makes a permissions problem look like an outage, and the
+        // two want completely different actions from the user. `detail` is only trusted
+        // when it is a string — FastAPI answers 422 with a list of objects.
+        const err = await res.json().catch(() => ({}))
+        if (!cancelled) {
+          setTimeline({
+            key: timelineKey,
+            tab,
+            data: null,
+            error: typeof err.detail === "string" ? err.detail : `The server answered ${res.status}.`,
+          })
+        }
       } catch {
-        if (!cancelled) setTimeline({ key: timelineKey, data: null })
+        if (!cancelled) {
+          setTimeline({ key: timelineKey, tab, data: null, error: "Could not reach the server." })
+        }
       }
     }
 
@@ -378,7 +418,7 @@ export default function ProjectDashboard() {
       cancelled = true
       clearTimeout(timer)
     }
-  }, [view, tab, q, person, roleKey, overdueOnly, groupBy, apiToken, projectId, authHeaders, timelineKey, reloadToken])
+  }, [view, tab, qTrimmed, person, roleKey, overdueOnly, groupBy, apiToken, projectId, authHeaders, timelineKey, reloadToken])
 
   // Switching tab invalidates the people- and role-filters with it: the names and role
   // keys on one tab generally do not exist on another, so carrying them across would
@@ -458,6 +498,16 @@ export default function ProjectDashboard() {
   // else is the previous filter's answer, and printing its coverage under the new
   // filter's name is the one thing the coverage line exists to prevent.
   const timelineData = timeline && timeline.key === timelineKey ? timeline.data : null
+
+  // The same payload at a coarser grain, for the Group-by control alone. That control must
+  // not unmount for the length of its own re-read — changing the grouping invalidates the
+  // whole signature, and a control that vanishes each time it is used cannot be used twice
+  // — but it also must not offer another *tab's* columns, which the full-signature test
+  // would have allowed for a debounce plus a whole-tab scan after every tab switch.
+  // Picking one of those columns would send a `group_by` the new tab cannot resolve, which
+  // degrades silently to a single bucket: exactly what clearing `groupBy` in `changeTab`
+  // is there to prevent. Matching on the tab satisfies both.
+  const timelineForTab = timeline && timeline.tab === tab ? timeline.data : null
 
   // Overdue, in words. The chart marks it with a `failed` outline and a `title`, and a
   // title is invisible to keyboard and touch users — for whom overdue would otherwise be
@@ -544,9 +594,13 @@ export default function ProjectDashboard() {
           </div>
 
           <div className="flex items-center gap-2">
+            {/* The brass fill is the only signal these four carry, and a screen reader
+                cannot see it, so each reports `aria-pressed`. All four as a set:
+                pressed-ness only reads as a state when every member of a group has it. */}
             <div className="flex rounded-lg border border-[var(--color-rule-strong)] p-0.5">
               <button
                 onClick={() => setView("grid")}
+                aria-pressed={view === "grid"}
                 className={`inline-flex items-center gap-1.5 rounded px-3 py-1.5 text-xs transition cursor-pointer ${
                   view === "grid" ? "bg-brass-400/15 text-brass-300" : "text-ink-400 hover:text-ink-200"
                 }`}
@@ -555,6 +609,7 @@ export default function ProjectDashboard() {
               </button>
               <button
                 onClick={() => setView("workload")}
+                aria-pressed={view === "workload"}
                 className={`inline-flex items-center gap-1.5 rounded px-3 py-1.5 text-xs transition cursor-pointer ${
                   view === "workload" ? "bg-brass-400/15 text-brass-300" : "text-ink-400 hover:text-ink-200"
                 }`}
@@ -563,6 +618,7 @@ export default function ProjectDashboard() {
               </button>
               <button
                 onClick={() => setView("health")}
+                aria-pressed={view === "health"}
                 className={`inline-flex items-center gap-1.5 rounded px-3 py-1.5 text-xs transition cursor-pointer ${
                   view === "health" ? "bg-brass-400/15 text-brass-300" : "text-ink-400 hover:text-ink-200"
                 }`}
@@ -571,6 +627,7 @@ export default function ProjectDashboard() {
               </button>
               <button
                 onClick={() => setView("timeline")}
+                aria-pressed={view === "timeline"}
                 className={`inline-flex items-center gap-1.5 rounded px-3 py-1.5 text-xs transition cursor-pointer ${
                   view === "timeline" ? "bg-brass-400/15 text-brass-300" : "text-ink-400 hover:text-ink-200"
                 }`}
@@ -788,11 +845,14 @@ export default function ProjectDashboard() {
                 so a re-read never prints one filter's counts under another's name. */}
             {timelineData && (
               <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-[11px] text-ink-500">
+                {/* Named by what the chart actually draws. "41 of 412 charted" invites
+                    reading 41 as everything on screen, when the milestone rows are drawn
+                    too — as diamonds — and are not in that 41. The four states below sum
+                    to the total, which is the whole point of the line. */}
                 <span className="tabular-nums">
-                  <span className="text-ink-300">{timelineData.counts.charted}</span> of{" "}
-                  {timelineData.counts.total} charted
+                  <span className="text-ink-300">{timelineData.counts.charted}</span> bars
                 </span>
-                <span className="tabular-nums">{timelineData.counts.milestone_only} milestone-only</span>
+                <span className="tabular-nums">{timelineData.counts.milestone_only} milestones</span>
                 <span className="tabular-nums">{timelineData.counts.undated} undated</span>
                 {timelineData.counts.unparsed > 0 && (
                   <button
@@ -811,11 +871,20 @@ export default function ProjectDashboard() {
                 )}
                 {foldedGroups > 0 && (
                   <span className="tabular-nums">
-                    {foldedGroups} smaller groups folded into Other
+                    {foldedGroups} smaller {foldedGroups === 1 ? "group" : "groups"} folded into Other
                   </span>
                 )}
-                {timelineData.start_header && (
-                  <span className="stamp stamp-muted">{timelineData.start_header} → {timelineData.due_header}</span>
+                {/* Either column is enough to draw with, and either can be missing: a tab
+                    with only a deadline charts as milestone diamonds and resolves no start
+                    header at all. Gating on the start column alone dropped the stamp
+                    precisely there — the case where a reader most needs to tell "no bars"
+                    from "the wrong column was resolved". Each side names its own absence
+                    rather than rendering an arrow that points at nothing. */}
+                {(timelineData.start_header || timelineData.due_header) && (
+                  <span className="stamp stamp-muted">
+                    {timelineData.start_header ?? "no start column"} →{" "}
+                    {timelineData.due_header ?? "no deadline column"}
+                  </span>
                 )}
                 {timelineData.truncated && (
                   <span className="text-failed">Partial scan — every count is a floor.</span>
@@ -823,15 +892,15 @@ export default function ProjectDashboard() {
               </div>
             )}
 
-            {/* Deliberately rendered from the last payload rather than only the fresh one:
-                changing the grouping invalidates the key, and a control that vanishes for
-                the length of its own re-read is a control nobody can use twice. */}
-            {timeline?.data && timeline.data.groupable.length > 0 && (
+            {/* Tab-scoped, not signature-scoped — see `timelineForTab`. It survives its
+                own grouping re-read and disappears on a tab change, which is the pair of
+                behaviours wanted. */}
+            {timelineForTab && timelineForTab.groupable.length > 0 && (
               <div className="flex items-center gap-2">
                 <label className="label-micro" htmlFor="tl-group">Group by</label>
                 <select
                   id="tl-group"
-                  value={groupBy || timeline.data.group_by || ""}
+                  value={groupBy || timelineForTab.group_by || ""}
                   onChange={(e) => setGroupBy(e.target.value)}
                   className="cursor-pointer rounded-lg border border-[var(--color-rule-strong)] bg-ink-950 px-2.5 py-1.5 text-xs text-ink-100 focus:border-brass-500 focus:outline-none"
                 >
@@ -841,9 +910,9 @@ export default function ProjectDashboard() {
                       Calling it "No grouping" unconditionally would name an outcome the
                       request cannot ask for. */}
                   <option value="">
-                    {timeline.data.group_by ? `Sheet default · ${timeline.data.group_by}` : "No grouping"}
+                    {timelineForTab.group_by ? `Sheet default · ${timelineForTab.group_by}` : "No grouping"}
                   </option>
-                  {timeline.data.groupable.map((h) => (
+                  {timelineForTab.groupable.map((h) => (
                     <option key={h} value={h}>{h}</option>
                   ))}
                 </select>
@@ -857,6 +926,12 @@ export default function ProjectDashboard() {
               timeline && timeline.key === timelineKey ? (
                 <div className="well rounded-xl p-8 text-center text-sm text-ink-500">
                   The timeline could not be loaded.
+                  {/* The server's own sentence, not a paraphrase. An RBAC refusal names the
+                      fields the caller lacks, and that is the difference between "ask an
+                      admin" and "try again in a minute". */}
+                  {timeline.error && (
+                    <div className="mt-2 text-xs text-failed">{timeline.error}</div>
+                  )}
                 </div>
               ) : (
                 <div className="well rounded-xl p-8 text-center text-sm text-ink-500">Reading the sheet…</div>
@@ -882,8 +957,9 @@ export default function ProjectDashboard() {
                 //
                 // 360px is everything above and below the chart: the page header with its
                 // title, row count and view toggle, main's padding, the filter bar, the
-                // coverage line and the Group-by control. That is the grid's 320px (line
-                // 650, same header and filter bar) plus the two rows only this panel has.
+                // coverage line and the Group-by control. That is the grid's DataTable
+                // figure — same header, same filter bar — plus the two rows only this
+                // panel has.
                 maxHeight="calc(100vh - 360px)"
               />
             )}
@@ -903,6 +979,10 @@ export default function ProjectDashboard() {
         title={selectedRow?.id || "Row"}
         description={selectedRow?.label}
         size="lg"
+        // A cell commits on blur. A stray backdrop click unmounts the whole dialog, so the
+        // input never blurs, `onSave` never fires, and what the user typed is gone with no
+        // sign it was discarded — the case Modal's own prop exists for.
+        dismissOnBackdrop={false}
       >
         {selectedRow && (
           <div className="space-y-3">
@@ -920,7 +1000,7 @@ export default function ProjectDashboard() {
                 it. The values below are from the last read that still listed it.
               </p>
             )}
-            {timeline?.data?.editable_headers.map((header) => {
+            {timelineData?.editable_headers.map((header) => {
               const cellId = `${editKey(selectedRow.id, header)}::modal`
               return (
                 <div key={header} className="flex items-baseline gap-3">
