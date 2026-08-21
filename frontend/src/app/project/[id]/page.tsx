@@ -515,12 +515,16 @@ export default function ProjectDashboard() {
   }, [timelineData])
 
   // How much of the grouping the chart is not showing. Past its cap the API folds the
-  // tail into one "Other" bucket and records how many groups went in; the chart draws the
-  // bucket but never that number, so without this the count of hidden groups is lost.
-  const foldedGroups = useMemo(
-    () => (timelineData?.groups || []).reduce((n, g) => n + (g.collapsed_groups || 0), 0),
-    [timelineData]
-  )
+  // tail into one bucket and records how many groups went in; the chart draws the bucket
+  // but never that number, so without this the count of hidden groups is lost.
+  //
+  // The bucket's label is read from the payload rather than spelled here, because the API
+  // moves it off "Other" when a real group on the tab already carries that name — naming
+  // it inline would point the reader at a group that is not the one that was folded.
+  const folded = useMemo(() => {
+    const bucket = (timelineData?.groups || []).find((g) => g.collapsed_groups)
+    return { count: bucket?.collapsed_groups ?? 0, label: bucket?.label ?? "" }
+  }, [timelineData])
 
   /**
    * The open row, re-read from the freshest payload rather than frozen at the click.
@@ -851,15 +855,25 @@ export default function ProjectDashboard() {
                     {timelineData.counts.unparsed} unreadable
                   </button>
                 )}
+                {/* The denominator, and it is not optional. §14.5's correction was making
+                    it inescapable — "525 days across 41 of 412 rows", never a bare total —
+                    because four counts with nothing to divide into read as the whole tab.
+                    Naming the states for what the chart draws was the right rename; it was
+                    never an argument for dropping what they are counts OF. Closes the four
+                    states, before the derived figures that follow. */}
+                <span className="tabular-nums">
+                  of {timelineData.counts.total} {timelineData.counts.total === 1 ? "row" : "rows"}
+                </span>
                 {/* Overdue as text, not only as the bar outline the chart draws it with.
                     An outline plus a hover title is colour-only for anyone not using a
                     mouse, which is the dependence the palette rule exists to avoid. */}
                 {overdueCount > 0 && (
                   <span className="tabular-nums text-failed">{overdueCount} overdue</span>
                 )}
-                {foldedGroups > 0 && (
+                {folded.count > 0 && (
                   <span className="tabular-nums">
-                    {foldedGroups} smaller {foldedGroups === 1 ? "group" : "groups"} folded into Other
+                    {folded.count} smaller {folded.count === 1 ? "group" : "groups"} folded into{" "}
+                    {folded.label}
                   </span>
                 )}
                 {/* Either column is enough to draw with, and either can be missing: a tab

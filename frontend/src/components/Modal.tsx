@@ -93,6 +93,26 @@ export default function Modal({
   const handleKeyDown = useCallback(
     (e: KeyboardEvent) => {
       if (e.key === "Escape") {
+        // A field that handles Escape itself keeps it. This listener is on `document` in
+        // the CAPTURE phase, so it runs before any handler on the field — including a
+        // native capture listener, since capture descends from document to the target —
+        // and `stopPropagation` then meant the field's own Escape never ran at all. In the
+        // timeline's row dialog that discarded what the user had typed *and* unmounted the
+        // dialog around it: the same failure `dismissOnBackdrop={false}` was added to
+        // prevent, left open on the other input path.
+        //
+        // Opt-in via `data-escape-handled`, not a blanket "focus is in an input" test. The
+        // admin dialogs autofocus their first field on open, so a blanket test would stop
+        // Escape closing them at the moment it is most likely to be pressed. Nothing that
+        // does not set the attribute changes behaviour.
+        const active = document.activeElement
+        if (
+          active instanceof HTMLElement &&
+          active.dataset.escapeHandled !== undefined &&
+          panelRef.current?.contains(active)
+        ) {
+          return
+        }
         e.stopPropagation()
         onClose()
         return

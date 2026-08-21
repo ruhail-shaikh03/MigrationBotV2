@@ -215,6 +215,10 @@ export function EditableCell({
         // no-op.
         defaultValue={edit ? edit.value : value}
         aria-label={label}
+        // Claims Escape from any enclosing Modal, whose document-level capture listener
+        // would otherwise close the dialog before `onCancel` below ever ran — taking the
+        // typed value with it. Escape reverts the cell; it does not dismiss the dialog.
+        data-escape-handled=""
         onBlur={(e) => onSave(e.target.value)}
         onKeyDown={(e) => {
           if (e.key === "Enter") (e.target as HTMLInputElement).blur()
@@ -295,9 +299,10 @@ function toUTC(iso: string): number {
 
 /** Ticks whose spacing suits the span, rather than a zoom control nobody asked for.
  *  The step is picked from the PADDED span, and the thresholds below read: up to ~45 days
- *  weeks, to ~200 days months, to ~800 days quarters, beyond that years. So a quarter-long
- *  plan gets weeks, a year-long one quarters, and a three-year one years — quarters serve
- *  roughly seven months to 2.2 years, not three-year spans.
+ *  weeks, to ~200 days months, to ~800 days quarters, beyond that years. So a six-week plan
+ *  gets weeks, a quarter-long one months (91 days is inside the ~200-day bracket), a
+ *  year-long one quarters, and a three-year one years — quarters serve roughly seven months
+ *  to 2.2 years, not three-year spans.
  *
  *  Returns absolute timestamps rather than percentages, so the caller positions them with
  *  the same `pct` the bars use. Computing tick positions against their own span is how an
@@ -478,7 +483,14 @@ export function TimelineChart({
                       const width = item.start && item.end ? Math.max(pct(item.end) - left, 0.4) : 0
                       return (
                         <button
-                          key={itemKey(item)}
+                          // Group-qualified. One row belongs to two groups by design when
+                          // the grouping column names two people, so the bare item key is
+                          // only unique *within* a group. The API dedupes the folded
+                          // bucket, which is where the same row could otherwise arrive
+                          // twice under one label — but a list key should not depend on a
+                          // server-side invariant to be unique, and qualifying it here
+                          // makes the two independent.
+                          key={`${group.label}::${itemKey(item)}`}
                           onClick={() => onSelectItem?.(item)}
                           className="flex w-full items-center text-left hover:bg-ink-800/60"
                         >
