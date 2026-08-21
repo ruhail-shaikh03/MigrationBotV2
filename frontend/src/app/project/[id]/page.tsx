@@ -134,6 +134,19 @@ interface TimelineResponse {
 
 const PAGE_SIZE = 50
 
+/** What identifies a timeline row across two reads of the same tab.
+ *
+ *  Matches the key `TimelineChart` lists its rows under, deliberately: the same tuple has
+ *  to mean the same row in the chart, in the overdue count and in the open dialog, or a
+ *  re-read reconnects the dialog to the wrong row. `row_number` is always present —
+ *  api/timeline.py builds its rows with `data_start_row` precisely so a bar can address
+ *  its own sheet row — so this is effectively the row number; the label is a fallback for
+ *  a payload that somehow lacks one, and the ID alone is never enough, because 27 of 412
+ *  rows on the reference tracker share one. */
+function itemKey(item: TimelineItem): string {
+  return `${item.id}-${item.row_number ?? item.label}`
+}
+
 export default function ProjectDashboard() {
   const { data: session, status: authStatus } = useSession()
   const router = useRouter()
@@ -149,6 +162,10 @@ export default function ProjectDashboard() {
   const [timeline, setTimeline] = useState<{ key: string; data: TimelineResponse | null } | null>(null)
   const [groupBy, setGroupBy] = useState("")
   const [selected, setSelected] = useState<TimelineItem | null>(null)
+  // Bumped when a queued write actually lands. Not part of `timelineKey`: a reload is the
+  // same question asked again, not a different one, so the panel keeps rendering the
+  // payload it has until the fresh one replaces it rather than flashing "Reading…".
+  const [reloadToken, setReloadToken] = useState(0)
   const [isLoading, setIsLoading] = useState(true)
   const [errorMsg, setErrorMsg] = useState("")
 
@@ -223,12 +240,36 @@ export default function ProjectDashboard() {
     }
   }, [apiToken, projectId, tab, offset, q, person, roleKey, overdueOnly, authHeaders])
 
+  /**
+   * A landed write refreshes every surface that shows the row, not just the grid.
+   *
+   * `load` re-reads rows and analytics; the timeline has its own fetch and nothing else
+   * would trigger it. Without the token the sequence a user sees is: edit a date in the
+   * dialog, watch the `queued` chip appear, watch it clear on success — and watch the old
+   * value come back, because the dialog was still rendering the payload from before the
+   * write. That is TDD §14.3's problem one degree worse: not "I cannot tell whether it
+   * landed" but the UI asserting a value the sheet no longer holds.
+   *
+   * Referentially stable, and that is load-bearing rather than tidiness. `useRowEdits`
+   * depends on this in both its `queue_update` listener effect and its 8-second job poll;
+   * an inline arrow would be a new function every render, detaching and re-attaching the
+   * listener and restarting the poll continuously. Its only dependency is `load`, itself a
+   * `useCallback` over primitives plus the memoised `authHeaders`, and `setReloadToken` is
+   * a `useState` setter, which React guarantees is stable for the component's lifetime. So
+   * this changes identity exactly as often as `load` did when it was passed directly —
+   * i.e. this adds no churn at all.
+   */
+  const onApplied = useCallback(() => {
+    load()
+    setReloadToken((n) => n + 1)
+  }, [load])
+
   const { pending, editing, setEditing, saveCell } = useRowEdits({
     projectId,
     tab: rowsData?.tab,
     authHeaders,
     apiToken,
-    onApplied: load,
+    onApplied,
   })
 
   /**
@@ -304,6 +345,8 @@ export default function ProjectDashboard() {
   // Fetched only while the panel is open. Unlike health it narrows with the filters, so
   // it must re-read when they change — debounced, because a timeline scans the whole tab
   // and the 60s row cache only makes that cheap if it is not requested on every keystroke.
+  // `reloadToken` re-runs it for a landed write as well; the same debounce absorbs a burst
+  // of edits confirming together into one scan.
   useEffect(() => {
     if (view !== "timeline" || !apiToken || !projectId) return
     let cancelled = false
@@ -335,7 +378,7 @@ export default function ProjectDashboard() {
       cancelled = true
       clearTimeout(timer)
     }
-  }, [view, tab, q, person, roleKey, overdueOnly, groupBy, apiToken, projectId, authHeaders, timelineKey])
+  }, [view, tab, q, person, roleKey, overdueOnly, groupBy, apiToken, projectId, authHeaders, timelineKey, reloadToken])
 
   // Switching tab invalidates the people- and role-filters with it: the names and role
   // keys on one tab generally do not exist on another, so carrying them across would
@@ -427,7 +470,7 @@ export default function ProjectDashboard() {
     const seen = new Set<string>()
     timelineData?.groups.forEach((g) =>
       g.items.forEach((i) => {
-        if (i.overdue) seen.add(`${i.id}-${i.row_number ?? i.label}`)
+        if (i.overdue) seen.add(itemKey(i))
       })
     )
     return seen.size
@@ -440,6 +483,32 @@ export default function ProjectDashboard() {
     () => (timelineData?.groups || []).reduce((n, g) => n + (g.collapsed_groups || 0), 0),
     [timelineData]
   )
+
+  /**
+   * The open row, re-read from the freshest payload rather than frozen at the click.
+   *
+   * `selected` holds the item the user clicked, and its `values` are a snapshot. Once a
+   * write lands the hook drops the pending marker, so a frozen snapshot would put the
+   * pre-edit value straight back on screen — which is the failure `onApplied` exists to
+   * prevent, and re-reading the timeline alone would not have fixed it. Looked up by
+   * `itemKey`, so it survives a tab whose IDs repeat.
+   */
+  const selectedFresh = useMemo(() => {
+    if (!selected || !timelineData) return null
+    const key = itemKey(selected)
+    for (const group of timelineData.groups) {
+      const found = group.items.find((i) => itemKey(i) === key)
+      if (found) return found
+    }
+    return null
+  }, [selected, timelineData])
+
+  // An edit can move a row out of the active filter — a reassignment under "Assigned to",
+  // a new deadline under "Overdue only" — and the re-read then legitimately does not list
+  // it. The dialog stays open on the last values rather than closing under the user, and
+  // says so, because silently showing a snapshot is the thing being fixed here.
+  const selectedRow = selectedFresh ?? selected
+  const selectedDropped = selected !== null && timelineData !== null && selectedFresh === null
 
   const total = rowsData?.total ?? 0
   const showingTo = Math.min(offset + PAGE_SIZE, total)
@@ -810,6 +879,11 @@ export default function ProjectDashboard() {
                 // Not optional in practice: the chart's axis is `sticky`, which resolves
                 // against the nearest scrollport, and without a height cap that scrollport
                 // is the content itself — the date header scrolls away on a long tracker.
+                //
+                // 360px is everything above and below the chart: the page header with its
+                // title, row count and view toggle, main's padding, the filter bar, the
+                // coverage line and the Group-by control. That is the grid's 320px (line
+                // 650, same header and filter bar) plus the two rows only this panel has.
                 maxHeight="calc(100vh - 360px)"
               />
             )}
@@ -824,24 +898,30 @@ export default function ProjectDashboard() {
           The cells are the grid's own, through the shared hook, so the two surfaces
           cannot disagree about what "queued" means. */}
       <Modal
-        open={selected !== null}
+        open={selectedRow !== null}
         onClose={() => setSelected(null)}
-        title={selected?.id || "Row"}
-        description={selected?.label}
+        title={selectedRow?.id || "Row"}
+        description={selectedRow?.label}
         size="lg"
       >
-        {selected && (
+        {selectedRow && (
           <div className="space-y-3">
             {/* Overdue in words. The bar says it with an outline and a hover title, and
                 neither reaches a keyboard or a touch user; this is the channel that does. */}
-            {selected.overdue && (
+            {selectedRow.overdue && (
               <p className="flex items-center gap-2 text-[12.5px] text-ink-400">
                 <span className="status status-failed">Overdue</span>
                 <span>Its deadline has passed and its status is not a finished one.</span>
               </p>
             )}
+            {selectedDropped && (
+              <p className="text-[12px] leading-relaxed text-ink-500">
+                This row is no longer in the filtered set — an edit may have moved it out of
+                it. The values below are from the last read that still listed it.
+              </p>
+            )}
             {timeline?.data?.editable_headers.map((header) => {
-              const cellId = `${editKey(selected.id, header)}::modal`
+              const cellId = `${editKey(selectedRow.id, header)}::modal`
               return (
                 <div key={header} className="flex items-baseline gap-3">
                   <div className="w-40 shrink-0">
@@ -852,30 +932,30 @@ export default function ProjectDashboard() {
                         applies: a write addresses a row by its ID, so a blank one has no
                         address and the PATCH could only fail. Offering the affordance
                         anyway would put an edit box on a cell that cannot be saved. */}
-                    {selected.id ? (
+                    {selectedRow.id ? (
                       <EditableCell
-                        label={`${header} for ${selected.id}`}
-                        value={selected.values[header] ?? ""}
-                        edit={pending[editKey(selected.id, header)]}
+                        label={`${header} for ${selectedRow.id}`}
+                        value={selectedRow.values[header] ?? ""}
+                        edit={pending[editKey(selectedRow.id, header)]}
                         isEditing={editing === cellId}
                         onBeginEdit={() => setEditing(cellId)}
                         onCancel={() => setEditing(null)}
                         // `row_number` is the sheet row this bar was drawn from, so an edit
                         // to a duplicated ID lands on the row that was clicked.
-                        onSave={(next) => saveCell(selected.id, header, next, selected.row_number)}
+                        onSave={(next) => saveCell(selectedRow.id, header, next, selectedRow.row_number)}
                         // "Unassigned" is the grid's default and is grid-shaped; this dialog
                         // also edits dates and status, where it would be a false statement.
                         placeholder="—"
                       />
                     ) : (
-                      selected.values[header] || <span className="text-ink-600">—</span>
+                      selectedRow.values[header] || <span className="text-ink-600">—</span>
                     )}
                   </div>
                 </div>
               )
             })}
             <p className="pt-2 text-[11px] leading-relaxed text-ink-500">
-              {selected.id
+              {selectedRow.id
                 ? "Edits are queued and applied to the spreadsheet a moment later. Dates are written exactly as typed, so keep the format this sheet already uses."
                 : "This row carries no ID, so a write has no way to address it and these cells are read-only. Map a primary ID column in Admin → Projects to edit from here."}
             </p>
