@@ -11,7 +11,8 @@ import {
 } from "lucide-react"
 
 import {
-  ChartFrame, DataTable, EditableCell, HoverTip, MAX_BARS, SERIES_HUE, StatTile, TimelineChart,
+  ChartFrame, DataTable, EditableCell, HoverTip, itemKey, MAX_BARS, SERIES_HUE, StatTile,
+  TimelineChart,
 } from "@/components/DataDisplay"
 import type { TimelineGroup, TimelineItem } from "@/components/DataDisplay"
 import Modal from "@/components/Modal"
@@ -149,19 +150,6 @@ interface TimelineState {
 }
 
 const PAGE_SIZE = 50
-
-/** What identifies a timeline row across two reads of the same tab.
- *
- *  Matches the key `TimelineChart` lists its rows under, deliberately: the same tuple has
- *  to mean the same row in the chart, in the overdue count and in the open dialog, or a
- *  re-read reconnects the dialog to the wrong row. `row_number` is always present —
- *  api/timeline.py builds its rows with `data_start_row` precisely so a bar can address
- *  its own sheet row — so this is effectively the row number; the label is a fallback for
- *  a payload that somehow lacks one, and the ID alone is never enough, because 27 of 412
- *  rows on the reference tracker share one. */
-function itemKey(item: TimelineItem): string {
-  return `${item.id}-${item.row_number ?? item.label}`
-}
 
 export default function ProjectDashboard() {
   const { data: session, status: authStatus } = useSession()

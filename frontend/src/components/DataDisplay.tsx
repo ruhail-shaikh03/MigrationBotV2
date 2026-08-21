@@ -260,6 +260,23 @@ export interface TimelineItem {
   values: Record<string, string>
 }
 
+/** What identifies a timeline row across two reads of the same tab.
+ *
+ *  `TimelineChart` lists its rows under this key, and every consumer looks a row up by it
+ *  — the overdue count, and the dialog re-resolving the open row out of a fresh payload.
+ *  It lived in project/[id]/page.tsx and was spelled a second time inline here, the two
+ *  kept in step by a comment rather than by structure; one written form is what stops a
+ *  re-read reconnecting the dialog to the wrong row. It lives in this file rather than in
+ *  the page because a shared component must not import from a route.
+ *
+ *  `row_number` is always present — api/timeline.py builds its rows with `data_start_row`
+ *  precisely so a bar can address its own sheet row — so this is effectively the row
+ *  number. The label is a fallback for a payload that somehow lacks one, and the ID alone
+ *  is never enough, because 27 of 412 rows on the reference tracker share one. */
+export function itemKey(item: TimelineItem): string {
+  return `${item.id}-${item.row_number ?? item.label}`
+}
+
 export interface TimelineGroup {
   label: string
   count: number
@@ -461,7 +478,7 @@ export function TimelineChart({
                       const width = item.start && item.end ? Math.max(pct(item.end) - left, 0.4) : 0
                       return (
                         <button
-                          key={`${item.id}-${item.row_number ?? item.label}`}
+                          key={itemKey(item)}
                           onClick={() => onSelectItem?.(item)}
                           className="flex w-full items-center text-left hover:bg-ink-800/60"
                         >

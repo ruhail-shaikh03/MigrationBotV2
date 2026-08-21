@@ -1497,7 +1497,7 @@ An item is `overdue` only when a real deadline has passed and the status is not 
 (`core/overdue.py:is_finished_status`) — so a start-only milestone is never overdue however old it
 is, because nothing was promised for that date.
 
-The pipeline is `digest.py:preview_digest`'s with two deliberate differences: `_row_dicts` is called
+The pipeline is `api/digest.py:preview_digest`'s with two deliberate differences: `_row_dicts` is called
 **with** `data_start_row`, so every item carries `ROW_NUMBER_KEY` and a bar can open an editable row
 on a tracker with duplicated IDs (§16.7); and `_filter_rows` is reused, so the chart cannot drift
 from the grid — the reason that helper was extracted for the CSV export (§10.6). There is no
@@ -2048,10 +2048,12 @@ across the transition — which is the whole point, and the thing two toasts cou
 product had one surface for non-admins: a chat box. Chat could report that eleven items were
 overdue but could not show which, or who held them, and `/admin` (the only other page) is gated.
 
-One route, two panels behind a toggle. **Grid** is a filtered, sorted, paged table of real rows;
-**Workload** is per-person bars, a per-role assignment table, and a status breakdown. Filters
-(`q`, person, role, overdue-only) apply to both — a workload chart that ignored the filter beside
-the grid would contradict it.
+One route, four panels behind a toggle — **Grid** and **Workload** described here, plus **Health**
+(§14.8) and **Timeline** (§14.12), each added later and documented in its own section. Grid is a
+filtered, sorted, paged table of real rows; Workload is per-person bars, a per-role assignment
+table, and a status breakdown. Filters (`q`, person, role, overdue-only) apply to both — a workload
+chart that ignored the filter beside the grid would contradict it — and to the timeline; health is
+the one exception, for the reason §14.8 gives.
 
 Nothing in this file knows the words "technical" or "functional". Column identity, display labels
 and which headers name people all arrive from `dashboard.py:_column_descriptors` (§10.1), so a
@@ -2331,7 +2333,9 @@ by using the application.
 
 ### 14.12 The timeline panel
 
-A fourth view on `/project/[id]`, beside Grid, Workload and Health, backed by §10.9. **It inherits
+A fourth view on `/project/[id]`, beside Grid, Workload and Health, backed by §10.9. Unlike §14.5
+and §14.6, **nothing in this section has been seen rendering** — it describes the code as merged and
+as checked by `tsc` and `next build`, which is exactly the gap §15.4 exists to name. **It inherits
 the filter bar**; §14.8's health panel remains the only view that hides it, and that argument does
 not transfer — "362 rows have no deadline" is a fact about the tab, while a timeline narrowed to one
 person is exactly what a reader wants. Switching tabs clears the grouping column along with the
@@ -2346,8 +2350,11 @@ Recharts is already a dependency and has no Gantt primitive; the shapes usually 
 ~800, years beyond. The tick *format* boundary is deliberately not the same number as the step
 boundary — month-and-year labelling covers the 91-day step as well as the 30-day one, because
 sending quarterly ticks to a year-only format draws a one-year plan as `2025 / 2026 / 2026 / 2026 /
-2026`, five ticks four of them identical, on exactly the span quarterly ticks were chosen for. Ticks
-are returned as absolute timestamps and positioned with the same percentage helper the bars use;
+2026`, five ticks four of them identical, on exactly the span quarterly ticks were chosen for. The
+boundary does not eliminate duplicate labels, only the pathological case: the 30-day step still
+prints two identical adjacent labels whenever a tick lands on the 1st of a 31-day month, since
++30 days is the 31st and both format as `Jan 26`. That is cosmetic, affects at most one pair per
+month-stepped axis, and was left. Ticks are returned as absolute timestamps and positioned with the same percentage helper the bars use;
 computing them against their own span is how an axis drifts a few pixels off the rows it labels. The
 span is padded by at least a day so a single-day plan neither divides by zero nor renders as one
 pixel. The time region scrolls inside its own container, so the page body never scrolls sideways
@@ -2359,7 +2366,11 @@ the date axis has nothing to stick within — it scrolls away with the page on a
 panel passes `calc(100vh - 360px)`: the grid's `DataTable` figure for the shared header and filter
 bar, plus the two rows only this panel has.
 
-**One hue for every bar** — `SERIES_HUE`, already validated against this ground (§14.2). The source
+**One hue for every bar** — `SERIES_HUE`, the same blue §14.2 validated. Note what that validation
+actually covers: it was run against `#100d20`, and §14.0's `#0a0e0d` was judged equivalent by
+inspection rather than re-run. This chart's card is `bg-ink-850` (`#151d1c`), a third ground that
+has been through the validator no more than the second one has, so the contrast here is inherited by
+argument, not measured. Re-run the validator before treating it as a number. The source
 template colours each phase differently; grouping is already carried by the group header and
 indentation, so hue would be redundant, and §14.2 records that the four status colours fail
 all-pairs CVD separation as a set. Overdue is therefore a `failed`-token **outline plus a `title`**,
@@ -2383,12 +2394,17 @@ which invites reading 41 as everything on screen when the milestone rows are dra
 rather than *few dates*.
 
 **Three identities, one written form each.** `useRowEdits.ts:editKey` spells `${rowId}::${header}`
-for the pending-edit map, shared by the grid and the dialog; `page.tsx:itemKey` spells
-`${id}-${row_number ?? label}` for a timeline row, matching the key `TimelineChart` lists its rows
-under; and `page.tsx:timelineKey` spells the whole filter signature that a payload was fetched
-under. Each is written once and read by every consumer, because two spellings of one identity is how
-a queued badge lands on the wrong cell, how a re-read reconnects a dialog to the wrong row, and how a
-panel comes to believe stale data is current. The payload is rendered only when its `timelineKey`
+for the pending-edit map, shared by the grid and the dialog; `DataDisplay.tsx:itemKey` spells
+`${id}-${row_number ?? label}` for a timeline row, and is both the key `TimelineChart` lists its
+rows under and the key the page looks a row up by; and `page.tsx:timelineKey` spells the whole
+filter signature that a payload was fetched under. Each is written once and read by every consumer,
+because two spellings of one identity is how a queued badge lands on the wrong cell, how a re-read
+reconnects a dialog to the wrong row, and how a panel comes to believe stale data is current.
+`itemKey` earned that place in review: it had been defined in the page and spelled a second time
+inline in the chart's `key=`, the two held in step by a comment rather than by structure — the same
+defect the `editKey` extraction had already fixed once. It lives in `DataDisplay.tsx` and is
+imported by the page, that direction and not the reverse, because a shared component must not
+import from a route. The payload is rendered only when its `timelineKey`
 matches what is on screen; the Group-by control alone reads a coarser, tab-scoped test, so it
 survives its own re-read without offering another tab's columns.
 
@@ -2426,6 +2442,17 @@ is an `update_cell` — but drag UX is where the bugs live, and the drawing shou
 real tracker first), and WBS/hierarchy detection. Two accessibility gaps are known and unclosed: the
 group collapse control carries `aria-expanded` but its state is otherwise only the chevron swap, and
 a bar's date range is still available only through its `title`.
+
+**One defect ships knowingly: the `Other` label collides with a real group of that name.**
+`core/timeline.py` appends the folded bucket under the literal `"Other"` without checking whether a
+group already carries that label, and `TimelineChart` keys both its React list and its collapse map
+on `group.label`. So on a tab that exceeds `MAX_GROUPS` *and* has a grouping column whose values
+literally include `Other` — a plausible module name — the two fuse: one collapse toggle drives both
+rows, and React sees a duplicate key. A value landing in the tail is merely absorbed into the fold,
+which is invisible but harmless; only one surviving into the head collides. The fix is a label the
+data cannot produce, or a synthetic group id separate from the display label, and neither was
+attempted here. It is recorded rather than quietly carried because a reader of this document
+otherwise cannot learn about a defect we chose to ship.
 
 ---
 
@@ -2544,20 +2571,27 @@ touch ignored files — but any *other* untracked file in the repo directory is 
 
 ### 15.3 Tests
 
-348 test functions across 20 files. `pytest tests/test_core tests/test_sheets` — the two
+417 test functions across 23 files. `pytest tests/test_core tests/test_sheets` — the two
 directories that need neither Postgres nor Redis, and therefore the only ones runnable on a
-developer machine without Docker — collects 382 cases from 329 of those functions, the difference
+developer machine without Docker — collects 451 cases from 398 of those functions, the difference
 being parametrisation.
 
 Earlier revisions of this paragraph gave a total that summed only the four files they happened to
 name, omitting fourteen others; the count is stated in full here so it cannot drift that way again.
-The largest files are `test_core/test_aliases.py` (38), `test_core/test_health.py` (26),
-`test_core/test_column_profile.py` (26), `test_core/test_people_schema.py` (26),
-`test_sheets/test_sheets_logic.py` (30), `test_core/test_core_logic.py` (26) and — added with the
-durable row cache — `test_sheets/test_records_cache.py` (24), `tests/integration/test_records_cache_db.py`
-(10) and `test_core/test_webhooks.py` (8).
+It drifted anyway. The timeline branch (§10.9, §14.12) added 69 functions across three files, and
+the figures above went one commit — the commit whose whole job was to keep this document true —
+without being updated. Every number in this section is therefore restated from an actual
+`--collect-only` run rather than carried forward, which also corrected two per-file counts that had
+drifted on their own. The largest files are `test_core/test_timeline.py` (40),
+`test_core/test_aliases.py` (38), `test_sheets/test_sheets_logic.py` (33),
+`test_core/test_core_logic.py` (31), `test_core/test_health.py` (26),
+`test_core/test_column_profile.py` (26) and `test_core/test_people_schema.py` (26); then — added
+with the durable row cache — `test_sheets/test_records_cache.py` (24),
+`tests/integration/test_records_cache_db.py` (10) and `test_core/test_webhooks.py` (8), and — added
+with the timeline, alongside `test_timeline.py` above — `test_core/test_start_column.py` (18) and
+`test_core/test_timeline_api.py` (11).
 
-Four of those files need a real database and are excluded from the local command above:
+Three of those files need a real database and are excluded from the local command above:
 `tests/test_db.py` (4) and `tests/integration/` (15 across two files). They run in CI, which
 provides Postgres and Redis as service containers. `test_db.py` and each integration file define
 their own `setup_*` and `db_session` fixtures locally, both autouse.
@@ -2711,12 +2745,12 @@ What follows is what is still not generic:
   absent, the required-without-status check reports itself skipped rather than silently passing.
   Giving it a schema role is the tidier fix and was not attempted.
 - **`module_column` → `"Module"` still defaults inline** in `read.py`'s `summarize` and the
-  `data_quality` scope filter. Lower risk than the others — it only scopes an optional filter, and
+  `data_quality` scope filter, and in `write.py`'s `add_row` — three sites. Lower risk than the others — it only scopes an optional filter, and
   "Module" is not SAP vocabulary the way "RICEFW ID" is — but it is the same class of bug.
   `core/timeline.py` reads it the same way `schema.py:default_critical_headers` does —
   `tab_schema.get("module_column")` with no inline default, falling back to a single implicit
   group when the tab declares none — so the timeline (§10.9) did not add a fourth copy of the
-  literal alongside the three in `read.py` (twice) and `write.py`.
+  literal.
 - **`core/health.py` and `core/data_quality.py` still overlap.** Both now drive off
   `schema_config`, and both implement a duplicate-ID check. The reason for not reusing one from
   the other (§10.4) was that `DataQualityChecker` was SAP-shaped; that reason no longer holds, so
