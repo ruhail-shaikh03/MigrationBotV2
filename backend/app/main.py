@@ -14,6 +14,7 @@ from app.api.audit import router as audit_router
 from app.api.digest import router as digest_router
 from app.api.webhooks import router as webhooks_router
 from app.api.watch import router as watch_router
+from app.api.timeline import router as timeline_router
 
 # Configure logging format
 logging.basicConfig(
@@ -91,3 +92,4 @@ app.include_router(digest_router, prefix="/api")
 # cache. The third such route, after /api/health and /api/ready.
 app.include_router(webhooks_router, prefix="/api")
 app.include_router(watch_router, prefix="/api")
+app.include_router(timeline_router, prefix="/api")

@@ -7,12 +7,19 @@ import {
   Bar, BarChart, Cell, LabelList, ResponsiveContainer, Tooltip, XAxis, YAxis,
 } from "recharts"
 import {
-  AlertTriangle, ArrowLeft, Download, Grid3x3, Pencil, RefreshCw, Search, Stethoscope, Users,
+  AlertTriangle, ArrowLeft, ChartGantt, Download, Grid3x3, RefreshCw, Search, Stethoscope, Users,
 } from "lucide-react"
 
 import {
-  ChartFrame, DataTable, HoverTip, MAX_BARS, SERIES_HUE, StatTile,
+  ChartFrame, DataTable, EditableCell, HoverTip, itemKey, MAX_BARS, SERIES_HUE, StatTile,
+  TimelineChart,
 } from "@/components/DataDisplay"
+import type { TimelineGroup, TimelineItem } from "@/components/DataDisplay"
+import Modal from "@/components/Modal"
+// `editKey` rather than a second hand-built `${id}::${header}` here: the grid and the
+// timeline's row dialog both read the hook's pending map, and three spellings of one key
+// format is how a queued badge ends up on the wrong cell.
+import { editKey, useRowEdits } from "@/hooks/useRowEdits"
 
 /**
  * The project dashboard: the sheet itself, rather than answers about it.
@@ -62,16 +69,6 @@ interface RowsResponse {
   truncated: boolean
 }
 
-/** An edit that has been queued but not yet confirmed applied by the worker, keyed
- *  `${rowId}::${header}`. Writes are eventually consistent (the worker applies at
- *  1 req/sec), so the cell has to show its own pending state or the edit looks lost. */
-interface PendingEdit {
-  jobId: string
-  value: string
-  state: "queued" | "failed"
-  error?: string
-}
-
 interface WorkloadEntry {
   person: string
   total_items: number
@@ -115,6 +112,43 @@ interface HealthResponse {
   truncated: boolean
 }
 
+/** What the timeline panel reads, which is a subset of what the endpoint sends. It also
+ *  returns `tab`, `tabs`, `project_name`, `people_columns` and `primary_id_column`; the
+ *  panel takes its tab and its tab list from the rows request that already drives the
+ *  header, and addresses a row by the id the item itself carries. Declaring fields nothing
+ *  reads only invites a later reader to believe something depends on them. */
+interface TimelineResponse {
+  start_header: string | null
+  due_header: string | null
+  group_by: string | null
+  groupable: string[]
+  editable_headers: string[]
+  range_start: string | null
+  range_end: string | null
+  today: string
+  groups: TimelineGroup[]
+  counts: { total: number; charted: number; milestone_only: number; undated: number; unparsed: number }
+  /** Why there is nothing to draw. Present instead of an empty chart, because an empty
+   *  chart reads as "no work is late" rather than as "this sheet records no dates". */
+  reason: string | null
+  truncated: boolean
+}
+
+/** A timeline payload with the request that produced it.
+ *
+ *  `key` is the whole filter signature; `tab` is carried separately rather than parsed
+ *  back out of it, both because a tab name may legitimately contain the delimiter and
+ *  because the two are needed at different granularities — the chart must not show another
+ *  filter's answer, while the Group-by control only has to not show another *tab's*
+ *  columns. `error` is the server's own wording for a failed read, which for an RBAC
+ *  refusal names the fields the user lacks. */
+interface TimelineState {
+  key: string
+  tab: string
+  data: TimelineResponse | null
+  error?: string
+}
+
 const PAGE_SIZE = 50
 
 export default function ProjectDashboard() {
@@ -123,15 +157,22 @@ export default function ProjectDashboard() {
   const params = useParams()
   const projectId = params?.id as string
 
-  const [view, setView] = useState<"grid" | "workload" | "health">("grid")
+  const [view, setView] = useState<"grid" | "workload" | "health" | "timeline">("grid")
   const [rowsData, setRowsData] = useState<RowsResponse | null>(null)
   const [analytics, setAnalytics] = useState<AnalyticsResponse | null>(null)
   const [health, setHealth] = useState<{ key: string; data: HealthResponse | null } | null>(null)
+  // Carries the filter signature it was fetched under, so the panel can tell "this is the
+  // answer to what is on screen" from "this is the previous filter's answer".
+  const [timeline, setTimeline] = useState<TimelineState | null>(null)
+  const [groupBy, setGroupBy] = useState("")
+  const [selected, setSelected] = useState<TimelineItem | null>(null)
+  // Bumped when a queued write actually lands. Not part of `timelineKey`: a reload is the
+  // same question asked again, not a different one, so the panel keeps rendering the
+  // payload it has until the fresh one replaces it rather than flashing "Reading…".
+  const [reloadToken, setReloadToken] = useState(0)
   const [isLoading, setIsLoading] = useState(true)
   const [errorMsg, setErrorMsg] = useState("")
 
-  const [pending, setPending] = useState<Record<string, PendingEdit>>({})
-  const [editing, setEditing] = useState<string | null>(null)
   const [showEmptyColumns, setShowEmptyColumns] = useState(false)
   const [exporting, setExporting] = useState(false)
 
@@ -145,6 +186,16 @@ export default function ProjectDashboard() {
   const [roleKey, setRoleKey] = useState("")
   const [overdueOnly, setOverdueOnly] = useState(false)
   const [offset, setOffset] = useState(0)
+
+  // Trimmed once, here, and used for both the signature and the request — as `load` does
+  // for the grid. Sending the raw value would make a trailing space a different signature
+  // and fire a whole-tab scan for a search the server treats as identical.
+  const qTrimmed = q.trim()
+
+  // Everything the timeline request depends on, in one string. Written once and read by
+  // both the fetch and the render for the same reason `editKey` exists: two spellings of
+  // one signature is how a panel ends up believing stale data is current.
+  const timelineKey = `${tab}|${qTrimmed}|${person}|${roleKey}|${overdueOnly}|${groupBy}`
 
   const apiToken = session?.apiToken || ""
   const googleToken = session?.googleAccessToken || ""
@@ -197,6 +248,38 @@ export default function ProjectDashboard() {
       setIsLoading(false)
     }
   }, [apiToken, projectId, tab, offset, q, person, roleKey, overdueOnly, authHeaders])
+
+  /**
+   * A landed write refreshes every surface that shows the row, not just the grid.
+   *
+   * `load` re-reads rows and analytics; the timeline has its own fetch and nothing else
+   * would trigger it. Without the token the sequence a user sees is: edit a date in the
+   * dialog, watch the `queued` chip appear, watch it clear on success — and watch the old
+   * value come back, because the dialog was still rendering the payload from before the
+   * write. That is TDD §14.3's problem one degree worse: not "I cannot tell whether it
+   * landed" but the UI asserting a value the sheet no longer holds.
+   *
+   * Referentially stable, and that is load-bearing rather than tidiness. `useRowEdits`
+   * depends on this in both its `queue_update` listener effect and its 8-second job poll;
+   * an inline arrow would be a new function every render, detaching and re-attaching the
+   * listener and restarting the poll continuously. Its only dependency is `load`, itself a
+   * `useCallback` over primitives plus the memoised `authHeaders`, and `setReloadToken` is
+   * a `useState` setter, which React guarantees is stable for the component's lifetime. So
+   * this changes identity exactly as often as `load` did when it was passed directly —
+   * i.e. this adds no churn at all.
+   */
+  const onApplied = useCallback(() => {
+    load()
+    setReloadToken((n) => n + 1)
+  }, [load])
+
+  const { pending, editing, setEditing, saveCell } = useRowEdits({
+    projectId,
+    tab: rowsData?.tab,
+    authHeaders,
+    apiToken,
+    onApplied,
+  })
 
   /**
    * Download the filtered tab.
@@ -268,117 +351,75 @@ export default function ProjectDashboard() {
     return () => { cancelled = true }
   }, [view, tab, apiToken, projectId, authHeaders])
 
-  // Reassignments land through the queue, so the terminal frame is the cue to re-read.
-  // Reusing the existing queue_update -> CustomEvent bridge means the dashboard reflects
-  // an edit made from chat, too.
+  // Fetched only while the panel is open. Unlike health it narrows with the filters, so
+  // it must re-read when they change — debounced, because a timeline scans the whole tab
+  // and the 60s row cache only makes that cheap if it is not requested on every keystroke.
+  // `reloadToken` re-runs it for a landed write as well; the same debounce absorbs a burst
+  // of edits confirming together into one scan.
   useEffect(() => {
-    const onQueueUpdate = (event: Event) => {
-      const detail = (event as CustomEvent).detail as
-        | { job_id?: string; status?: string; error?: string }
-        | undefined
+    if (view !== "timeline" || !apiToken || !projectId) return
+    let cancelled = false
 
-      if (detail?.job_id) {
-        setPending((prev) => {
-          const key = Object.keys(prev).find((k) => prev[k].jobId === detail.job_id)
-          if (!key) return prev
-          const next = { ...prev }
-          if (detail.status === "completed") {
-            // Applied: drop the pending marker and let the reload below show the real
-            // cell. Keeping it would leave the UI asserting a value the sheet may have
-            // normalised differently.
-            delete next[key]
-          } else {
-            next[key] = { ...next[key], state: "failed", error: detail.error }
-          }
-          return next
-        })
-      }
-      if (detail?.status === "completed") load()
-    }
-    window.addEventListener("queue_update", onQueueUpdate)
-    return () => window.removeEventListener("queue_update", onQueueUpdate)
-  }, [load])
-
-  // A terminal frame can be missed — a reload, a reconnect, a worker restart — which
-  // would strand a cell on "queued" forever. GET /api/jobs/{id} is the authoritative
-  // fallback for exactly that, and until now nothing in the app called it.
-  useEffect(() => {
-    const stuck = Object.entries(pending).filter(([, p]) => p.state === "queued")
-    if (stuck.length === 0 || !apiToken) return
-
-    const timer = setTimeout(async () => {
-      for (const [key, entry] of stuck) {
-        try {
-          const res = await fetch(`/api/jobs/${entry.jobId}`, { headers: authHeaders })
-          if (!res.ok) continue
-          const job = await res.json()
-          if (job.status === "done") {
-            setPending((prev) => {
-              const next = { ...prev }
-              delete next[key]
-              return next
-            })
-            load()
-          } else if (job.status === "error" || job.status === "dead_letter") {
-            setPending((prev) => ({
-              ...prev,
-              [key]: { ...prev[key], state: "failed", error: job.error },
-            }))
-          }
-        } catch {
-          // Reconciliation is best-effort; the next poll or a manual refresh will catch it.
-        }
-      }
-    }, 8000)
-    return () => clearTimeout(timer)
-  }, [pending, apiToken, authHeaders, load])
-
-  const saveCell = useCallback(
-    async (rowId: string, header: string, value: string, rowNumber?: number) => {
-      const key = `${rowId}::${header}`
-      setEditing(null)
+    const run = async () => {
+      const params = new URLSearchParams()
+      if (tab) params.set("tab", tab)
+      if (qTrimmed) params.set("q", qTrimmed)
+      if (person) params.set("person", person)
+      if (roleKey) params.set("role_key", roleKey)
+      if (overdueOnly) params.set("overdue", "true")
+      if (groupBy) params.set("group_by", groupBy)
       try {
-        const res = await fetch(`/api/projects/${projectId}/rows/${encodeURIComponent(rowId)}`, {
-          method: "PATCH",
-          headers: { ...authHeaders, "Content-Type": "application/json" },
-          // `row_number` names the row actually on screen. IDs are not unique on every
-          // tracker — 27 of 412 rows on the reference sheet share one — so without it the
-          // server can only refuse the edit rather than guess which row was clicked.
-          body: JSON.stringify({
-            tab: rowsData?.tab,
-            updates: [{ field: header, value }],
-            row_number: rowNumber,
-          }),
+        const res = await fetch(`/api/projects/${projectId}/timeline?${params.toString()}`, {
+          headers: authHeaders,
         })
-        const body = await res.json().catch(() => ({}))
-        if (!res.ok) {
-          // A 403 here is the RBAC checker refusing the write; show its own wording
-          // rather than a generic failure, since it explains what to ask an admin for.
-          setPending((prev) => ({
-            ...prev,
-            [key]: { jobId: "", value, state: "failed", error: body.detail || `Refused (${res.status}).` },
-          }))
+        if (res.ok) {
+          const body = await res.json()
+          if (!cancelled) setTimeline({ key: timelineKey, tab, data: body })
           return
         }
-        setPending((prev) => ({ ...prev, [key]: { jobId: body.job_id, value, state: "queued" } }))
+        // The server's own wording, as `load` does for the grid. A 403 here is the RBAC
+        // checker refusing the read and names what the caller lacks; collapsing that into
+        // "could not be loaded" makes a permissions problem look like an outage, and the
+        // two want completely different actions from the user. `detail` is only trusted
+        // when it is a string — FastAPI answers 422 with a list of objects.
+        const err = await res.json().catch(() => ({}))
+        if (!cancelled) {
+          setTimeline({
+            key: timelineKey,
+            tab,
+            data: null,
+            error: typeof err.detail === "string" ? err.detail : `The server answered ${res.status}.`,
+          })
+        }
       } catch {
-        setPending((prev) => ({
-          ...prev,
-          [key]: { jobId: "", value, state: "failed", error: "Could not reach the server." },
-        }))
+        if (!cancelled) {
+          setTimeline({ key: timelineKey, tab, data: null, error: "Could not reach the server." })
+        }
       }
-    },
-    [projectId, authHeaders, rowsData]
-  )
+    }
+
+    // Cleanup runs before the next effect, so a filter change both cancels the in-flight
+    // response and cancels the timer that has not fired: an earlier request can never
+    // land on top of a later one, whichever order they resolve in.
+    const timer = setTimeout(run, 300)
+    return () => {
+      cancelled = true
+      clearTimeout(timer)
+    }
+  }, [view, tab, qTrimmed, person, roleKey, overdueOnly, groupBy, apiToken, projectId, authHeaders, timelineKey, reloadToken])
 
   // Switching tab invalidates the people- and role-filters with it: the names and role
   // keys on one tab generally do not exist on another, so carrying them across would
-  // land the user on an empty grid that looks like the tab has no rows.
+  // land the user on an empty grid that looks like the tab has no rows. The timeline's
+  // grouping column goes with them, and for the same reason: a group_by naming a column
+  // the next tab does not have resolves to nothing and quietly draws one ungrouped
+  // bucket, which is indistinguishable from a tab that has no grouping column at all.
   const changeTab = useCallback((next: string) => {
     setTab(next)
     setOffset(0)
     setPerson("")
     setRoleKey("")
+    setGroupBy("")
   }, [])
 
   const tabs = rowsData?.tabs || []
@@ -441,6 +482,76 @@ export default function ProjectDashboard() {
     [rowsData, gridColumns, columnLabels]
   )
 
+  // The timeline payload only when it answers the filters currently on screen. Anything
+  // else is the previous filter's answer, and printing its coverage under the new
+  // filter's name is the one thing the coverage line exists to prevent.
+  const timelineData = timeline && timeline.key === timelineKey ? timeline.data : null
+
+  // The same payload at a coarser grain, for the Group-by control alone. That control must
+  // not unmount for the length of its own re-read — changing the grouping invalidates the
+  // whole signature, and a control that vanishes each time it is used cannot be used twice
+  // — but it also must not offer another *tab's* columns, which the full-signature test
+  // would have allowed for a debounce plus a whole-tab scan after every tab switch.
+  // Picking one of those columns would send a `group_by` the new tab cannot resolve, which
+  // degrades silently to a single bucket: exactly what clearing `groupBy` in `changeTab`
+  // is there to prevent. Matching on the tab satisfies both.
+  const timelineForTab = timeline && timeline.tab === tab ? timeline.data : null
+
+  // Overdue, in words. The chart marks it with a `failed` outline and a `title`, and a
+  // title is invisible to keyboard and touch users — for whom overdue would otherwise be
+  // outline colour and nothing else. Stated here and repeated on the row dialog.
+  //
+  // Deduplicated on the identity the chart keys its rows by, because grouping on a people
+  // column puts one shared row in two buckets deliberately; counting the item once per
+  // bucket would report more overdue rows than the tab holds.
+  const overdueCount = useMemo(() => {
+    const seen = new Set<string>()
+    timelineData?.groups.forEach((g) =>
+      g.items.forEach((i) => {
+        if (i.overdue) seen.add(itemKey(i))
+      })
+    )
+    return seen.size
+  }, [timelineData])
+
+  // How much of the grouping the chart is not showing. Past its cap the API folds the
+  // tail into one bucket and records how many groups went in; the chart draws the bucket
+  // but never that number, so without this the count of hidden groups is lost.
+  //
+  // The bucket's label is read from the payload rather than spelled here, because the API
+  // moves it off "Other" when a real group on the tab already carries that name — naming
+  // it inline would point the reader at a group that is not the one that was folded.
+  const folded = useMemo(() => {
+    const bucket = (timelineData?.groups || []).find((g) => g.collapsed_groups)
+    return { count: bucket?.collapsed_groups ?? 0, label: bucket?.label ?? "" }
+  }, [timelineData])
+
+  /**
+   * The open row, re-read from the freshest payload rather than frozen at the click.
+   *
+   * `selected` holds the item the user clicked, and its `values` are a snapshot. Once a
+   * write lands the hook drops the pending marker, so a frozen snapshot would put the
+   * pre-edit value straight back on screen — which is the failure `onApplied` exists to
+   * prevent, and re-reading the timeline alone would not have fixed it. Looked up by
+   * `itemKey`, so it survives a tab whose IDs repeat.
+   */
+  const selectedFresh = useMemo(() => {
+    if (!selected || !timelineData) return null
+    const key = itemKey(selected)
+    for (const group of timelineData.groups) {
+      const found = group.items.find((i) => itemKey(i) === key)
+      if (found) return found
+    }
+    return null
+  }, [selected, timelineData])
+
+  // An edit can move a row out of the active filter — a reassignment under "Assigned to",
+  // a new deadline under "Overdue only" — and the re-read then legitimately does not list
+  // it. The dialog stays open on the last values rather than closing under the user, and
+  // says so, because silently showing a snapshot is the thing being fixed here.
+  const selectedRow = selectedFresh ?? selected
+  const selectedDropped = selected !== null && timelineData !== null && selectedFresh === null
+
   const total = rowsData?.total ?? 0
   const showingTo = Math.min(offset + PAGE_SIZE, total)
 
@@ -475,9 +586,13 @@ export default function ProjectDashboard() {
           </div>
 
           <div className="flex items-center gap-2">
+            {/* The brass fill is the only signal these four carry, and a screen reader
+                cannot see it, so each reports `aria-pressed`. All four as a set:
+                pressed-ness only reads as a state when every member of a group has it. */}
             <div className="flex rounded-lg border border-[var(--color-rule-strong)] p-0.5">
               <button
                 onClick={() => setView("grid")}
+                aria-pressed={view === "grid"}
                 className={`inline-flex items-center gap-1.5 rounded px-3 py-1.5 text-xs transition cursor-pointer ${
                   view === "grid" ? "bg-brass-400/15 text-brass-300" : "text-ink-400 hover:text-ink-200"
                 }`}
@@ -486,6 +601,7 @@ export default function ProjectDashboard() {
               </button>
               <button
                 onClick={() => setView("workload")}
+                aria-pressed={view === "workload"}
                 className={`inline-flex items-center gap-1.5 rounded px-3 py-1.5 text-xs transition cursor-pointer ${
                   view === "workload" ? "bg-brass-400/15 text-brass-300" : "text-ink-400 hover:text-ink-200"
                 }`}
@@ -494,11 +610,21 @@ export default function ProjectDashboard() {
               </button>
               <button
                 onClick={() => setView("health")}
+                aria-pressed={view === "health"}
                 className={`inline-flex items-center gap-1.5 rounded px-3 py-1.5 text-xs transition cursor-pointer ${
                   view === "health" ? "bg-brass-400/15 text-brass-300" : "text-ink-400 hover:text-ink-200"
                 }`}
               >
                 <Stethoscope className="h-3.5 w-3.5" /> Health
+              </button>
+              <button
+                onClick={() => setView("timeline")}
+                aria-pressed={view === "timeline"}
+                className={`inline-flex items-center gap-1.5 rounded px-3 py-1.5 text-xs transition cursor-pointer ${
+                  view === "timeline" ? "bg-brass-400/15 text-brass-300" : "text-ink-400 hover:text-ink-200"
+                }`}
+              >
+                <ChartGantt className="h-3.5 w-3.5" /> Timeline
               </button>
             </div>
             {/* Hidden on the health view, whose numbers are about the whole tab rather
@@ -656,51 +782,22 @@ export default function ProjectDashboard() {
                     // The sheet row this cell was rendered from, so an edit to a
                     // duplicated ID lands on the row the user is looking at.
                     const rowNumber = rowsData?.rows[rowIndex]?.__row_number__
+                    const cellId = `${editKey(rowId, header)}::cell`
 
-                    const key = `${rowId}::${header}`
-                    const edit = pending[key]
-                    const cellId = `${key}::cell`
-
-                    if (editing === cellId) {
-                      return (
-                        <input
-                          autoFocus
-                          defaultValue={value}
-                          aria-label={`${label} for ${rowId}`}
-                          onBlur={(e) => saveCell(rowId, header, e.target.value, rowNumber)}
-                          onKeyDown={(e) => {
-                            if (e.key === "Enter") (e.target as HTMLInputElement).blur()
-                            if (e.key === "Escape") setEditing(null)
-                          }}
-                          className="w-full rounded border border-brass-500 bg-ink-950 px-1.5 py-0.5 text-[12.5px] text-ink-100 focus:outline-none"
-                        />
-                      )
-                    }
-
-                    // The dotted underline is the affordance. Without it an editable cell
-                    // is visually identical to a read-only one, so the feature is
-                    // undiscoverable — nobody clicks a table cell on spec.
                     return (
-                      <button
-                        onClick={() => setEditing(cellId)}
-                        title={edit?.error || `Reassign ${label}`}
-                        className="group flex w-full cursor-pointer items-center gap-1 text-left"
-                      >
-                        <span
-                          className={`decoration-dotted underline-offset-4 group-hover:text-brass-300 group-hover:underline ${
-                            edit?.state === "failed" ? "text-failed" : "underline decoration-ink-600"
-                          }`}
-                        >
-                          {edit ? edit.value : value || <span className="text-ink-600">Unassigned</span>}
-                        </span>
-                        <Pencil className="h-3 w-3 shrink-0 text-ink-600 opacity-0 transition group-hover:opacity-100" />
-                        {edit?.state === "queued" && (
-                          <span className="status status-queued ml-1">queued</span>
-                        )}
-                        {edit?.state === "failed" && (
-                          <span className="status status-failed ml-1">failed</span>
-                        )}
-                      </button>
+                      <EditableCell
+                        label={`${label} for ${rowId}`}
+                        // The grid only makes people-columns editable, so "Reassign" is the
+                        // verb here — EditableCell's generic default is for surfaces that
+                        // also edit dates and status.
+                        title={`Reassign ${label}`}
+                        value={value}
+                        edit={pending[editKey(rowId, header)]}
+                        isEditing={editing === cellId}
+                        onBeginEdit={() => setEditing(cellId)}
+                        onCancel={() => setEditing(null)}
+                        onSave={(next) => saveCell(rowId, header, next, rowNumber)}
+                      />
                     )
                   }}
                 />
@@ -732,10 +829,221 @@ export default function ProjectDashboard() {
           </section>
         ) : view === "workload" ? (
           <WorkloadPanel analytics={analytics} isLoading={isLoading} />
+        ) : view === "timeline" ? (
+          <section className="space-y-3">
+            {/* The coverage line leads, and is not a footnote. A chart drawn over 41 of
+                412 rows reads as "little work" rather than "few dates", which is a false
+                statement rather than a missing one. Rendered from the fresh payload only,
+                so a re-read never prints one filter's counts under another's name. */}
+            {timelineData && (
+              <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-[11px] text-ink-500">
+                {/* Named by what the chart actually draws. "41 of 412 charted" invites
+                    reading 41 as everything on screen, when the milestone rows are drawn
+                    too — as diamonds — and are not in that 41. The four states below sum
+                    to the total, which is the whole point of the line. */}
+                <span className="tabular-nums">
+                  <span className="text-ink-300">{timelineData.counts.charted}</span> bars
+                </span>
+                <span className="tabular-nums">{timelineData.counts.milestone_only} milestones</span>
+                <span className="tabular-nums">{timelineData.counts.undated} undated</span>
+                {timelineData.counts.unparsed > 0 && (
+                  <button
+                    onClick={() => setView("health")}
+                    className="cursor-pointer text-failed underline decoration-dotted underline-offset-2 tabular-nums"
+                    title="These cells hold something that is not a readable date. Open the health panel to see which."
+                  >
+                    {timelineData.counts.unparsed} unreadable
+                  </button>
+                )}
+                {/* The denominator, and it is not optional. §14.5's correction was making
+                    it inescapable — "525 days across 41 of 412 rows", never a bare total —
+                    because four counts with nothing to divide into read as the whole tab.
+                    Naming the states for what the chart draws was the right rename; it was
+                    never an argument for dropping what they are counts OF. Closes the four
+                    states, before the derived figures that follow. */}
+                <span className="tabular-nums">
+                  of {timelineData.counts.total} {timelineData.counts.total === 1 ? "row" : "rows"}
+                </span>
+                {/* Overdue as text, not only as the bar outline the chart draws it with.
+                    An outline plus a hover title is colour-only for anyone not using a
+                    mouse, which is the dependence the palette rule exists to avoid. */}
+                {overdueCount > 0 && (
+                  <span className="tabular-nums text-failed">{overdueCount} overdue</span>
+                )}
+                {folded.count > 0 && (
+                  <span className="tabular-nums">
+                    {folded.count} smaller {folded.count === 1 ? "group" : "groups"} folded into{" "}
+                    {folded.label}
+                  </span>
+                )}
+                {/* Either column is enough to draw with, and either can be missing: a tab
+                    with only a deadline charts as milestone diamonds and resolves no start
+                    header at all. Gating on the start column alone dropped the stamp
+                    precisely there — the case where a reader most needs to tell "no bars"
+                    from "the wrong column was resolved". Each side names its own absence
+                    rather than rendering an arrow that points at nothing. */}
+                {(timelineData.start_header || timelineData.due_header) && (
+                  <span className="stamp stamp-muted">
+                    {timelineData.start_header ?? "no start column"} →{" "}
+                    {timelineData.due_header ?? "no deadline column"}
+                  </span>
+                )}
+                {timelineData.truncated && (
+                  <span className="text-failed">Partial scan — every count is a floor.</span>
+                )}
+              </div>
+            )}
+
+            {/* Tab-scoped, not signature-scoped — see `timelineForTab`. It survives its
+                own grouping re-read and disappears on a tab change, which is the pair of
+                behaviours wanted. */}
+            {timelineForTab && timelineForTab.groupable.length > 0 && (
+              <div className="flex items-center gap-2">
+                <label className="label-micro" htmlFor="tl-group">Group by</label>
+                <select
+                  id="tl-group"
+                  value={groupBy || timelineForTab.group_by || ""}
+                  onChange={(e) => setGroupBy(e.target.value)}
+                  className="cursor-pointer rounded-lg border border-[var(--color-rule-strong)] bg-ink-950 px-2.5 py-1.5 text-xs text-ink-100 focus:border-brass-500 focus:outline-none"
+                >
+                  {/* "" means "let the tab decide": the API reads an absent group_by as
+                      "use this tab's own grouping column", so this option cannot ungroup a
+                      tab that declares one — it returns to it. Labelled for what it does.
+                      Calling it "No grouping" unconditionally would name an outcome the
+                      request cannot ask for. */}
+                  <option value="">
+                    {timelineForTab.group_by ? `Sheet default · ${timelineForTab.group_by}` : "No grouping"}
+                  </option>
+                  {timelineForTab.groupable.map((h) => (
+                    <option key={h} value={h}>{h}</option>
+                  ))}
+                </select>
+              </div>
+            )}
+
+            {!timelineData ? (
+              // Either nothing has been fetched for these filters yet, or the fetch is
+              // still in flight behind the debounce. Both are "reading", and neither is
+              // the previous filter's chart.
+              timeline && timeline.key === timelineKey ? (
+                <div className="well rounded-xl p-8 text-center text-sm text-ink-500">
+                  The timeline could not be loaded.
+                  {/* The server's own sentence, not a paraphrase. An RBAC refusal names the
+                      fields the caller lacks, and that is the difference between "ask an
+                      admin" and "try again in a minute". */}
+                  {timeline.error && (
+                    <div className="mt-2 text-xs text-failed">{timeline.error}</div>
+                  )}
+                </div>
+              ) : (
+                <div className="well rounded-xl p-8 text-center text-sm text-ink-500">Reading the sheet…</div>
+              )
+            ) : timelineData.reason ? (
+              // Say why, rather than draw an empty axis. An empty chart reads as good news.
+              <div className="well rounded-xl p-8 text-center text-sm text-ink-400">
+                {timelineData.reason}
+                <div className="mt-2 text-xs text-ink-500">
+                  Map a start or deadline column in Admin → Projects to place these rows on a timeline.
+                </div>
+              </div>
+            ) : (
+              <TimelineChart
+                groups={timelineData.groups}
+                rangeStart={timelineData.range_start!}
+                rangeEnd={timelineData.range_end!}
+                today={timelineData.today}
+                onSelectItem={setSelected}
+                // Not optional in practice: the chart's axis is `sticky`, which resolves
+                // against the nearest scrollport, and without a height cap that scrollport
+                // is the content itself — the date header scrolls away on a long tracker.
+                //
+                // 360px is everything above and below the chart: the page header with its
+                // title, row count and view toggle, main's padding, the filter bar, the
+                // coverage line and the Group-by control. That is the grid's DataTable
+                // figure — same header, same filter bar — plus the two rows only this
+                // panel has.
+                maxHeight="calc(100vh - 360px)"
+              />
+            )}
+          </section>
         ) : (
           <HealthPanel health={health?.key === tab ? health.data : null} isLoading={health?.key !== tab} />
         )}
       </main>
+
+      {/* Clicking a bar opens the row rather than editing it in place: dragging a bar is
+          a genuine interaction design problem and the drawing should be proven first.
+          The cells are the grid's own, through the shared hook, so the two surfaces
+          cannot disagree about what "queued" means. */}
+      <Modal
+        open={selectedRow !== null}
+        onClose={() => setSelected(null)}
+        title={selectedRow?.id || "Row"}
+        description={selectedRow?.label}
+        size="lg"
+        // A cell commits on blur. A stray backdrop click unmounts the whole dialog, so the
+        // input never blurs, `onSave` never fires, and what the user typed is gone with no
+        // sign it was discarded — the case Modal's own prop exists for.
+        dismissOnBackdrop={false}
+      >
+        {selectedRow && (
+          <div className="space-y-3">
+            {/* Overdue in words. The bar says it with an outline and a hover title, and
+                neither reaches a keyboard or a touch user; this is the channel that does. */}
+            {selectedRow.overdue && (
+              <p className="flex items-center gap-2 text-[12.5px] text-ink-400">
+                <span className="status status-failed">Overdue</span>
+                <span>Its deadline has passed and its status is not a finished one.</span>
+              </p>
+            )}
+            {selectedDropped && (
+              <p className="text-[12px] leading-relaxed text-ink-500">
+                This row is no longer in the filtered set — an edit may have moved it out of
+                it. The values below are from the last read that still listed it.
+              </p>
+            )}
+            {timelineData?.editable_headers.map((header) => {
+              const cellId = `${editKey(selectedRow.id, header)}::modal`
+              return (
+                <div key={header} className="flex items-baseline gap-3">
+                  <div className="w-40 shrink-0">
+                    <span className="label-micro">{header}</span>
+                  </div>
+                  <div className="min-w-0 flex-1 text-[12.5px] text-ink-300">
+                    {/* Read-only without an ID, the same rule the grid's renderCell
+                        applies: a write addresses a row by its ID, so a blank one has no
+                        address and the PATCH could only fail. Offering the affordance
+                        anyway would put an edit box on a cell that cannot be saved. */}
+                    {selectedRow.id ? (
+                      <EditableCell
+                        label={`${header} for ${selectedRow.id}`}
+                        value={selectedRow.values[header] ?? ""}
+                        edit={pending[editKey(selectedRow.id, header)]}
+                        isEditing={editing === cellId}
+                        onBeginEdit={() => setEditing(cellId)}
+                        onCancel={() => setEditing(null)}
+                        // `row_number` is the sheet row this bar was drawn from, so an edit
+                        // to a duplicated ID lands on the row that was clicked.
+                        onSave={(next) => saveCell(selectedRow.id, header, next, selectedRow.row_number)}
+                        // "Unassigned" is the grid's default and is grid-shaped; this dialog
+                        // also edits dates and status, where it would be a false statement.
+                        placeholder="—"
+                      />
+                    ) : (
+                      selectedRow.values[header] || <span className="text-ink-600">—</span>
+                    )}
+                  </div>
+                </div>
+              )
+            })}
+            <p className="pt-2 text-[11px] leading-relaxed text-ink-500">
+              {selectedRow.id
+                ? "Edits are queued and applied to the spreadsheet a moment later. Dates are written exactly as typed, so keep the format this sheet already uses."
+                : "This row carries no ID, so a write has no way to address it and these cells are read-only. Map a primary ID column in Admin → Projects to edit from here."}
+            </p>
+          </div>
+        )}
+      </Modal>
     </div>
   )
 }

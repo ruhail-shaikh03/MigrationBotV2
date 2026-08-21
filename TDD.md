@@ -1406,6 +1406,167 @@ before calling Drive at all when `PUBLIC_BASE_URL` or `DRIVE_WEBHOOK_TOKEN` is u
 can tell "no channel because push isn't set up" apart from "no channel because nobody has registered
 one yet."
 
+### 10.9 Timeline
+
+`GET /api/projects/{id}/timeline?tab=&q=&status=&person=&role_key=&overdue=&group_by=`
+(`api/timeline.py:project_timeline`) places a tab's rows on a time axis. It is its own router,
+mounted in `main.py` under the same `/api` prefix as the rest, rather than a sixth endpoint in
+`api/dashboard.py` — that file is 680 lines, and `api/aliases.py` and `api/digest.py` already made
+the same split for the same reason. Access is gated exactly as the other project reads are:
+`_resolve_project` answers **404**, not 403, because telling an unauthorised caller that a project
+exists is itself a disclosure.
+
+All computation is in `core/timeline.py:build_timeline`, which is pure, does no I/O, and takes
+`today` as a parameter — matching `core/digest.py:build_digest`, on the same argument: a timeline
+that cannot be regenerated identically cannot be checked against what a reader saw. No header
+string is spelled anywhere in that module; every column arrives from a schema role.
+
+**Every row lands in exactly one of four buckets, and they sum to the row total.**
+`core/timeline.py:classify_row` returns `bar` (both dates readable), `milestone` (exactly one),
+`undated` (neither cell has content), or `unparsed` (a cell has content that will not parse), and
+`build_timeline` counts them into `counts` as `charted`, `milestone_only`, `undated` and
+`unparsed` against `total`. The last two are separate for the reason `core/health.py` separates
+`no_deadline` from `unreadable_date`: `17/0/2026` is real, present on the reference tracker, looks
+filled in, and evaluates to nothing. Two precedence rules in `classify_row` are deliberate:
+
+- **`unparsed` beats a readable partner.** A row with a good deadline and a junk start date is
+  reported as unreadable rather than drawn as a milestone. Drawing it would hide the unreadable
+  cell, which is the only thing that state exists to surface; the cost is one row missing from the
+  chart, and the alternative is a chart that launders bad data into clean-looking output.
+- **An end before its start is still a bar, returned unswapped.** Classification reports what the
+  sheet says. `build_timeline` normalises the pair for drawing and sets `reversed: true` on the
+  item, so the anomaly stays visible instead of being silently corrected into plausibility.
+
+The bar's right edge is `schema.py:get_due_column`, already shared with `summarize(overdue)` and the
+dashboard's overdue filter, so the three surfaces cannot disagree about a deadline. The left edge is
+`schema.py:get_start_column`, added here and mirroring it — including the truthiness test on
+`date_columns["start"]` rather than `dict.get(key, default)`, since detection writes that key
+holding a literal `null` on the LLM path and a stored `None` beats the default (§16.6). It repeats
+`get_due_column`'s shape rather than sharing an abstraction with it, because the two word lists
+encode opposite judgements about the same headers and a shared helper would invite someone to
+"unify" them.
+
+`get_start_column` takes the already-resolved due header as `exclude`. `_DUE_WORDS` and
+`_START_WORDS` both match `"Planned Start"`, and a single-date tab would otherwise resolve one
+header to both ends of every bar, drawing a zero-length span that reads as data rather than as a
+mapping gap. When it is the *explicit* schema mapping that collides, the function returns `None`
+outright instead of scanning on: a schema naming one column for both ends of the span is a mapping
+error, and substituting some other start-looking header for the one a human chose would hide it
+behind a bar drawn from the wrong column.
+
+**Exclusion alone was not enough, because the due column is resolved first.** On a tab whose only
+date column is `Planned Start Date` and whose `schema_config` maps nothing, the due scan claims that
+header on `"planned"`, `get_start_column` is handed it as an exclusion and finds nothing, and every
+row becomes a *deadline* milestone. Unfinished rows whose **start** has merely passed then come back
+`overdue: true` — red outline on the bar, an "Overdue" chip in the row dialog, a count on the
+coverage line. That is §16.6's inversion in mirror image: an obligation the sheet never recorded,
+invented by a substring match, on exactly the promise this panel exists to keep.
+
+So `build_timeline` overrules the *guess*. `schema.py:resolve_due_column` returns
+`(header, from_schema)` — the same answer `get_due_column` gives, plus whether it came from a
+`date_columns` mapping or from the header scan — and when a **scanned** due header also satisfies
+`schema.py:header_reads_as_a_start` (the start scan's own vocabulary and its `by` guard, written
+once and shared with `get_start_column`), the timeline takes it as the *start* and resolves due to
+`None`. A start-only milestone is never overdue, so the invented deadlines disappear.
+
+`get_due_column` itself is deliberately unchanged. It is shared with `summarize(overdue)`, the health
+panel and the dashboard's overdue filter; widening the fix to it would alter three surfaces the
+timeline branch does not touch, with no live verification available, and would newly reject
+genuinely ambiguous headers — `"Target Start Date"`, `"Kickoff Deadline"` — that a tracker may well
+mean as deadlines. That remains a pre-existing defect with its own tests to write. And a
+`date_columns` mapping outranks the vocabulary in either direction: a schema that really does name
+its deadline column `Planned Start Date` keeps it, because a human's decision about that sheet is
+not a substring match.
+
+**The `by`-token guard is the part worth remembering.** `_START_WORDS` is
+`("start", "begin", "kickoff", "kick-off", "created", "opened", "raised")`. Those words have to
+stay — "Raised On" and "Date Created" are genuine starts — but each is also a substring of
+`"Created By"`, `"Opened By"`, `"Raised By"`, which are people columns on most trackers. So the
+guard is on the word `by`, matched as a whole token (`\bby\b`, never as a substring, since
+"Standby Start Date" is a real start column): any header carrying a standalone `by` is refused even
+when it matches a start word. `"assigned"` — which `schema_detect`'s own structural start matcher
+includes — is left out of the vocabulary entirely, for the same reason, since it is a substring of
+`"Assigned To"`. One idea covers both: *a header that names who did something never says when it
+happened.* The consequence is worse than a merely missing bar. A person's name parses to no date,
+so every such row would land in the `unparsed` bucket reserved for malformed dates, quietly
+corrupting the coverage figure the panel exists to be honest about. The guard does cost one genuine
+case — `"Start By"`, plausibly a latest-acceptable start, now resolves to nothing — which is the
+safe direction, since a missing bar is visible and a bar drawn from a person's name is not, and an
+explicit `schema_config` mapping is trusted and skips the guard outright.
+
+Grouping is by any schema-declared column, defaulting to `module_column` when the tab has one and
+to a single implicit `"All rows"` group when it does not; no inline `"Module"` literal is
+introduced (§16.3). A people column splits and resolves through `aliases.py:PersonResolver`, so a
+shared cell (`Ahmed Qamar/Asif`) contributes to both people exactly as the Workload panel counts
+it, while every other column is taken verbatim — `Sales & Distribution` is one module. `groupable`
+offers only columns worth grouping by: `_groupable_headers` filters on cardinality, since a
+free-text description column technically groups and produces one group per row, but people columns
+are always offered because a 40-person roster is exactly the grouping someone wants even though it
+overflows the cap. The resolved start and due headers are skipped outright: grouping a timeline by
+the very column it is drawn from yields one single-day group per distinct date, which is never what
+anyone means.
+
+**`groupable` is measured over the tab's rows, not the filtered ones** — which is why
+`build_timeline` takes an `all_rows` keyword feeding that one field and nothing else, and why
+`api/timeline.py` passes the pre-`_filter_rows` set. Which columns can group a tab is a fact about
+the tab. Measured over a filter narrowed to one person whose rows all leave `Module` blank, `Module`
+drops out of the list while still being the *active* grouping; the client's `<select value>` then
+matches no `<option>` and the browser silently displays some other column as the one in force — the
+control misreporting what the server actually grouped by. Every other figure in the payload stays
+about the filtered set.
+
+Group header bars are a `min`/`max` rollup over the items' ISO strings —
+**derived per read and never written back**, the posture `days_source` takes toward effort — and
+groups with nothing dated sort to the bottom rather than as if they began at the dawn of the axis.
+Past `MAX_GROUPS` (12, matching §14.2's bar-chart-to-table threshold) the tail folds into one
+`Other` bucket carrying its summed count and a `collapsed_groups` field, which is set **only** on
+that folded group, so a client can report how many groups it is not showing.
+
+**The fold dedupes its items, and its label.** A people grouping puts a shared cell
+(`Ahmed Qamar/Asif`) in two buckets deliberately, and people columns are offered as groupings
+*because* a large roster overflows the cap — so both of one row's buckets landing in the tail is the
+expected shape of a people-grouped fold, not a corner of it. Concatenating drew that row twice under
+one collapsed group while `counts.charted` counted it once, and handed the client two children under
+one key. `core/timeline.py:_item_identity` collapses it, spelled to match `DataDisplay.tsx:itemKey`
+so the rows the server drops are exactly the rows the client would collide on. Per-*group*
+duplication is untouched — see the note on group counts in §14.12. The label is made free of the
+surviving groups the same way: `Other` is a plausible module name, every other label is a `buckets`
+key and therefore already distinct, and a second group under one label fuses with the first in any
+client keying its list and its collapse state on it.
+
+The response also carries `editable_headers` — the start, due and status columns plus every people
+column, in that order and deduplicated. The dedupe is not cosmetic: `people_columns` is free-form,
+nothing stops a schema declaring the status column as a people column too, and a header listed
+twice renders the same field twice in the row dialog. RBAC still gates every one of those fields
+field-by-field at dispatch (§6.2), so a wider affordance is not a wider permission. Each item's
+`values` carry the **raw cell text, never the parsed ISO date**, so a dialog that writes back what
+it was given cannot silently rewrite a tracker spelling dates `10.05.2026` into ISO.
+
+An item is `overdue` only when a real deadline has passed and the status is not finished
+(`core/overdue.py:is_finished_status`) — so a start-only milestone is never overdue however old it
+is, because nothing was promised for that date.
+
+The pipeline is `api/digest.py:preview_digest`'s with two deliberate differences: `_row_dicts` is called
+**with** `data_start_row`, so every item carries `ROW_NUMBER_KEY` and a bar can open an editable row
+on a tracker with duplicated IDs (§16.7); and `_filter_rows` is reused, so the chart cannot drift
+from the grid — the reason that helper was extracted for the CSV export (§10.6). There is no
+`limit`/`offset`, for the reason `rows.csv` has none. `truncated` is surfaced rather than swallowed:
+past `_MAX_SCAN_ROWS` every count in the payload is a floor.
+
+**That no-paging decision has a stated ceiling.** A chart that omits rows the count above it claims
+is the one thing a chart must not do, so paging stays out — but the consequence is that a tab at
+`_MAX_SCAN_ROWS` (20 000, `read.py`) serialises 20 000 items, each carrying a `people` array and a
+`values` dict, in one response built on the event loop. Nothing caps it today and no deployed
+tracker approaches it — the reference sheet is 412 rows. It is written down here rather than left
+to be discovered in production: if a tab ever does reach that size the answer is a narrower item
+shape or a server-side grouping, not a `limit` parameter.
+
+A tab with nothing to draw returns a `reason` and an empty `groups` list, not an empty chart dressed
+as a result — separately worded for "this tab declares no start or deadline column" and "no row on
+this tab records a readable date", because the fix for the first is a schema mapping and the fix for
+the second is a sheet edit. `ROW_NUMBER_KEY` moved from `api/dashboard.py` to `core/schema.py` in
+this change so `core/` and `api/` share one literal.
+
 ---
 
 ## 11. Google Sheets Integration
@@ -1944,10 +2105,12 @@ across the transition — which is the whole point, and the thing two toasts cou
 product had one surface for non-admins: a chat box. Chat could report that eleven items were
 overdue but could not show which, or who held them, and `/admin` (the only other page) is gated.
 
-One route, two panels behind a toggle. **Grid** is a filtered, sorted, paged table of real rows;
-**Workload** is per-person bars, a per-role assignment table, and a status breakdown. Filters
-(`q`, person, role, overdue-only) apply to both — a workload chart that ignored the filter beside
-the grid would contradict it.
+One route, four panels behind a toggle — **Grid** and **Workload** described here, plus **Health**
+(§14.8) and **Timeline** (§14.12), each added later and documented in its own section. Grid is a
+filtered, sorted, paged table of real rows; Workload is per-person bars, a per-role assignment
+table, and a status breakdown. Filters (`q`, person, role, overdue-only) apply to both — a workload
+chart that ignored the filter beside the grid would contradict it — and to the timeline; health is
+the one exception, for the reason §14.8 gives.
 
 Nothing in this file knows the words "technical" or "functional". Column identity, display labels
 and which headers name people all arrive from `dashboard.py:_column_descriptors` (§10.1), so a
@@ -2225,6 +2388,175 @@ Nothing here renews a channel. Renewal is automatic and happens on the read path
 shown for visibility only, and an admin who never opens this page still keeps their channels alive
 by using the application.
 
+### 14.12 The timeline panel
+
+A fourth view on `/project/[id]`, beside Grid, Workload and Health, backed by §10.9. Unlike §14.5
+and §14.6, **nothing in this section has been seen rendering** — it describes the code as merged and
+as checked by `tsc` and `next build`, which is exactly the gap §15.4 exists to name. **It inherits
+the filter bar**; §14.8's health panel remains the only view that hides it, and that argument does
+not transfer — "362 rows have no deadline" is a fact about the tab, while a timeline narrowed to one
+person is exactly what a reader wants. Switching tabs clears the grouping column along with the
+person and role filters (`changeTab`), for the same reason those are cleared: a `group_by` naming a
+column the next tab does not have resolves to nothing and quietly draws one ungrouped bucket, which
+is indistinguishable from a tab that has no grouping column at all.
+
+`components/DataDisplay.tsx:TimelineChart` is hand-rolled CSS positioning against a shared axis.
+Recharts is already a dependency and has no Gantt primitive; the shapes usually bolted onto its
+`BarChart` to imitate one break as soon as rows are grouped. Tick spacing derives from the data span
+(`axisTicks`) rather than exposing a zoom control: weeks up to ~45 days, months to ~200, quarters to
+~800, years beyond. The tick *format* boundary is deliberately not the same number as the step
+boundary — month-and-year labelling covers the 91-day step as well as the 30-day one, because
+sending quarterly ticks to a year-only format draws a one-year plan as `2025 / 2026 / 2026 / 2026 /
+2026`, five ticks four of them identical, on exactly the span quarterly ticks were chosen for. The
+boundary does not eliminate duplicate labels, only the pathological case: the 30-day step still
+prints two identical adjacent labels whenever a tick lands on the 1st of a 31-day month, since
++30 days is the 31st and both format as `Jan 26`. That is cosmetic, affects at most one pair per
+month-stepped axis, and was left. Ticks are returned as absolute timestamps and positioned with the same percentage helper the bars use;
+computing them against their own span is how an axis drifts a few pixels off the rows it labels. The
+span is padded by at least a day so a single-day plan neither divides by zero nor renders as one
+pixel. The time region scrolls inside its own container, so the page body never scrolls sideways
+(§14.1's rule for wide tables).
+
+`maxHeight` is optional on the component and effectively mandatory in use. `sticky` resolves against
+the nearest scrollport, so without a height cap the container's scrollport is its own content and
+the date axis has nothing to stick within — it scrolls away with the page on a long tracker. The
+panel passes `calc(100vh - 360px)`: the grid's `DataTable` figure for the shared header and filter
+bar, plus the two rows only this panel has.
+
+**One hue for every bar** — `SERIES_HUE`, the same blue §14.2 validated. Note what that validation
+actually covers: it was run against `#100d20`, and §14.0's `#0a0e0d` was judged equivalent by
+inspection rather than re-run. This chart's card is `bg-ink-850` (`#151d1c`), a third ground that
+has been through the validator no more than the second one has, so the contrast here is inherited by
+argument, not measured. Re-run the validator before treating it as a number. The source
+template colours each phase differently; grouping is already carried by the group header and
+indentation, so hue would be redundant, and §14.2 records that the four status colours fail
+all-pairs CVD separation as a set. Overdue is therefore a `failed`-token **outline plus a `title`**,
+never a fill.
+
+That `title` is a weak second channel: it is invisible to keyboard and touch users, for whom overdue
+would degrade to outline colour alone — precisely the dependence §14.2's palette rule exists to
+avoid. **So overdue is also stated in words**, on the coverage line and again at the top of the row
+dialog. The counted figure is deduplicated on the identity the chart keys its rows by, because
+grouping on a people column puts one shared row in two buckets deliberately and counting it per
+bucket would report more overdue rows than the tab holds.
+
+**Group counts are the deliberate exception to that, and a reader has to be told.** `counts` is
+about *rows* and every figure on the coverage line divides into `counts.total`; a group's `count` is
+about *memberships*, and a people grouping creates two of them from one shared cell on purpose —
+which is exactly how the Workload panel counts the same cell, and the parity is the point. So
+`sum(g.count)` can legitimately exceed `counts.total`, and the chart can draw more bars than
+`counts.charted` claims. Neither is a discrepancy to reconcile: they answer different questions.
+What must not diverge is any figure presented as a *row* count, which is why `overdueCount`
+deduplicates on `itemKey` and why the API deduplicates the folded bucket's items (§10.9). The
+distinction is otherwise invisible on screen, and a reader who adds the group counts up and gets
+more than the tab holds should be able to find out here why.
+
+**The coverage line leads**, and is not a footnote:
+`bars / milestones / undated / unreadable / of N rows`, with the unreadable count linking to the
+health panel, then the overdue count, the number of groups folded into the `Other` bucket, and the
+resolved column names stamped beside it — each side of that stamp naming its own absence, since a
+tab with only a deadline charts as milestones and resolves no start header at all, and that is
+exactly the case where a reader most needs to tell "no bars" from "the wrong column was resolved".
+The four states are named for what the chart actually draws rather than as "41 of 412 charted",
+which invites reading 41 as everything on screen when the milestone rows are drawn too.
+
+**`of N rows` closes the four states and is not optional.** They are named for what is drawn, but
+four counts with nothing to divide into read as the whole tab, and the rename was never an argument
+for dropping what they are counts *of*. This is §14.5's finding applied before it could recur: the
+correction there was making the denominator inescapable — "525 days across 41 of 412 rows", never a
+bare total — because a chart over 41 of 412 rows reads as *little work* rather than *few dates*. It
+shipped once without the denominator and was put back in review. The folded bucket's name is read
+from the payload rather than spelled in the page, because the API moves that label off `Other` when
+a real group already carries it (§10.9) and naming it inline would point at the wrong group.
+
+One mismatch is known and mitigated rather than closed: the page header's row count comes from the
+*grid's* request, and the coverage line's `counts.total` from the timeline's, both behind the same
+300 ms debounce but not the same response. During a filter change the two briefly describe different
+row sets. Both are labelled and neither is presented as the other's denominator, so the failure is a
+momentary inconsistency rather than a wrong number; one request serving both would close it.
+
+**Three identities, one written form each.** `useRowEdits.ts:editKey` spells `${rowId}::${header}`
+for the pending-edit map, shared by the grid and the dialog; `DataDisplay.tsx:itemKey` spells
+`${id}-${row_number ?? label}` for a timeline row, and is both the key `TimelineChart` lists its
+rows under and the key the page looks a row up by; and `page.tsx:timelineKey` spells the whole
+filter signature that a payload was fetched under. Each is written once and read by every consumer,
+because two spellings of one identity is how a queued badge lands on the wrong cell, how a re-read
+reconnects a dialog to the wrong row, and how a panel comes to believe stale data is current.
+`itemKey` earned that place in review: it had been defined in the page and spelled a second time
+inline in the chart's `key=`, the two held in step by a comment rather than by structure — the same
+defect the `editKey` extraction had already fixed once. It lives in `DataDisplay.tsx` and is
+imported by the page, that direction and not the reverse, because a shared component must not
+import from a route. The payload is rendered only when its `timelineKey`
+matches what is on screen; the Group-by control alone reads a coarser, tab-scoped test, so it
+survives its own re-read without offering another tab's columns.
+
+Clicking a bar opens the row in `components/Modal.tsx` with editable cells rather than supporting
+drag-to-reschedule. That required extracting the grid's edit machinery, which had been a closure
+inside `DataTable`'s `renderCell` prop entangled with `pending` state, `saveCell`, the
+`queue_update` bridge and the 8-second job poll: `hooks/useRowEdits.ts` now owns the state machine
+and `DataDisplay.tsx:EditableCell` owns the control, so the grid and the dialog cannot disagree
+about what "queued" means. The extraction is behaviour-preserving but for one reviewed divergence —
+the input seeds from the pending edit rather than from the sheet value, since the read state already
+renders the pending value and opening the box on the stale one would replace what the cell was
+displaying a moment earlier. The dialog offers `editable_headers`; RBAC still gates each field at
+dispatch (§6.2), so a wider affordance is not a wider permission. A row with no ID is read-only,
+the same rule the grid applies: a write addresses a row by its ID, so a blank one has no address.
+**Cells carry the sheet's raw text, never the parsed ISO date**, so editing a tracker that spells
+dates `10.05.2026` does not silently rewrite the column into ISO. The dialog does not dismiss on a
+backdrop click (`dismissOnBackdrop={false}`): a cell commits on blur, and unmounting the dialog
+means the input never blurs and what was typed is gone with no sign it was discarded.
+
+**Escape had the same hole on the other input path.** `Modal` registers its `keydown` on `document`
+in the **capture** phase and calls `stopPropagation`, so it runs before anything bound to the field —
+including a native capture listener, since capture descends from `document` to the target, which is
+why this could not be fixed inside `EditableCell`. `onCancel` never ran, `onClose` did, and Escape
+in a cell discarded the typed value *and* unmounted the dialog around it. `EditableCell`'s input now
+marks itself `data-escape-handled` and `Modal` leaves Escape alone for a field inside its panel
+carrying that attribute; Escape reverts the cell and the dialog stays open. Opt-in deliberately, not
+a blanket "focus is in an input" test: `Modal` autofocuses the first control in its body, so a
+blanket test would stop Escape closing the admin dialogs at the moment it is most likely to be
+pressed. No dialog that does not set the attribute changes behaviour.
+
+The panel re-reads on a landed edit, not only the grid — the write hook's `onApplied` bumps a
+reload token the timeline effect depends on. That token is deliberately *not* part of the filter
+signature: a reload is the same question asked again, so the panel keeps rendering the payload it
+has rather than flashing an empty state. And the open dialog re-resolves its row out of the fresh
+payload by `itemKey` rather than staying frozen at the click, because once a write lands the hook
+drops the pending marker and a frozen snapshot would put the pre-edit value straight back on
+screen. When the re-read legitimately no longer lists the row — an edit can move it out of the
+active filter — the dialog stays open on the last values it had and says so, rather than closing
+under the user. Fetches are debounced at 300 ms, since a timeline scans the whole tab and the 60 s
+row cache only makes that cheap if it is not requested on every keystroke; the cleanup cancels both
+the in-flight response and the timer that has not fired, so an earlier request can never land on
+top of a later one.
+
+Deferred deliberately: drag-to-reschedule (available through the existing write path — a bar drag
+is an `update_cell` — but drag UX is where the bugs live, and the drawing should be proven against a
+real tracker first), and WBS/hierarchy detection. Two accessibility gaps are known and unclosed: the
+group collapse control carries `aria-expanded` but its state is otherwise only the chevron swap, and
+a bar's date range is still available only through its `title`.
+
+**The `Other` label collision was carried knowingly for one revision and is now closed.**
+`core/timeline.py` appended the folded bucket under the literal `"Other"` without checking whether a
+group already carried that label, and `TimelineChart` keys both its React list and its collapse map
+on `group.label`. So on a tab that exceeds `MAX_GROUPS` *and* has a grouping column whose values
+literally include `Other` — a plausible module name — the two fused: one collapse toggle drove both
+rows, and React saw a duplicate key. (A value landing in the *tail* is merely absorbed into the
+fold, which is invisible but harmless; only one surviving into the head collided.) The fix is the
+first of the two this section previously named as unattempted — a label the surviving groups cannot
+already hold. Every other label is a `buckets` key and therefore distinct by construction, so
+walking the folded bucket's label clear of `head` is enough, and it stays inside the fold's own
+lines rather than requiring the synthetic group id the other option would have needed. It also fixes
+what the collision looked like on screen, which a synthetic id would not have: two group headers
+reading `Other`, with nothing to say which was the module and which the fold.
+
+**A related duplicate key is closed at both ends.** `TimelineChart` keys its item list on
+`` `${group.label}::${itemKey(item)}` `` rather than on `itemKey` alone, because a row belongs to two
+groups by design when the grouping column names two people and the bare key is therefore unique only
+*within* a group. The API separately dedupes the folded bucket, where the same row could otherwise
+arrive twice under one label (§10.9). Either alone would do; both, because a React list key should
+not depend on a server-side invariant to be unique.
+
 ---
 
 ## 15. Deployment, CI/CD & Tests
@@ -2342,20 +2674,29 @@ touch ignored files — but any *other* untracked file in the repo directory is 
 
 ### 15.3 Tests
 
-348 test functions across 20 files. `pytest tests/test_core tests/test_sheets` — the two
+424 test functions across 23 files. `pytest tests/test_core tests/test_sheets` — the two
 directories that need neither Postgres nor Redis, and therefore the only ones runnable on a
-developer machine without Docker — collects 382 cases from 329 of those functions, the difference
+developer machine without Docker — collects 458 cases from 405 of those functions, the difference
 being parametrisation.
 
 Earlier revisions of this paragraph gave a total that summed only the four files they happened to
 name, omitting fourteen others; the count is stated in full here so it cannot drift that way again.
-The largest files are `test_core/test_aliases.py` (38), `test_core/test_health.py` (26),
-`test_core/test_column_profile.py` (26), `test_core/test_people_schema.py` (26),
-`test_sheets/test_sheets_logic.py` (30), `test_core/test_core_logic.py` (26) and — added with the
-durable row cache — `test_sheets/test_records_cache.py` (24), `tests/integration/test_records_cache_db.py`
-(10) and `test_core/test_webhooks.py` (8).
+It has drifted twice since. The timeline branch (§10.9, §14.12) added 76 functions across three
+files, and the figures above went one commit — the commit whose whole job was to keep this document
+true — without being updated; the fix wave that followed it then added seven more and moved them a
+second time. That is the tell: a number restated by hand goes stale on the next commit that touches
+a test, and this one costs a `--collect-only` run to check. Every figure here is read from such a
+run rather than carried forward, which also corrected two per-file counts that had drifted on their
+own. The largest files are `test_core/test_timeline.py` (47),
+`test_core/test_aliases.py` (38), `test_sheets/test_sheets_logic.py` (33),
+`test_core/test_core_logic.py` (31), `test_core/test_health.py` (26),
+`test_core/test_column_profile.py` (26) and `test_core/test_people_schema.py` (26); then — added
+with the durable row cache — `test_sheets/test_records_cache.py` (24),
+`tests/integration/test_records_cache_db.py` (10) and `test_core/test_webhooks.py` (8), and — added
+with the timeline, alongside `test_timeline.py` above — `test_core/test_start_column.py` (18) and
+`test_core/test_timeline_api.py` (11).
 
-Four of those files need a real database and are excluded from the local command above:
+Three of those files need a real database and are excluded from the local command above:
 `tests/test_db.py` (4) and `tests/integration/` (15 across two files). They run in CI, which
 provides Postgres and Redis as service containers. `test_db.py` and each integration file define
 their own `setup_*` and `db_session` fixtures locally, both autouse.
@@ -2509,8 +2850,13 @@ What follows is what is still not generic:
   absent, the required-without-status check reports itself skipped rather than silently passing.
   Giving it a schema role is the tidier fix and was not attempted.
 - **`module_column` → `"Module"` still defaults inline** in `read.py`'s `summarize` and the
-  `data_quality` scope filter. Lower risk than the others — it only scopes an optional filter, and
-  "Module" is not SAP vocabulary the way "RICEFW ID" is — but it is the same class of bug.
+  `data_quality` scope filter, and in `write.py`'s `add_row` — three sites. Lower risk than the
+  others — it only scopes an optional filter, and "Module" is not SAP vocabulary the way
+  "RICEFW ID" is — but it is the same class of bug.
+  `core/timeline.py` reads it the same way `schema.py:default_critical_headers` does —
+  `tab_schema.get("module_column")` with no inline default, falling back to a single implicit
+  group when the tab declares none — so the timeline (§10.9) did not add a fourth copy of the
+  literal.
 - **`core/health.py` and `core/data_quality.py` still overlap.** Both now drive off
   `schema_config`, and both implement a duplicate-ID check. The reason for not reusing one from
   the other (§10.4) was that `DataQualityChecker` was SAP-shaped; that reason no longer holds, so
@@ -2666,8 +3012,10 @@ both tools now see the same set of candidate rows and apply the same rule to it.
 match the write tools return `ambiguous_id_result()` — classified as `ambiguous_id` (§8.2), naming
 the row numbers, telling the model explicitly not to guess. The dashboard has strictly more
 information: the user clicked a rendered grid row. `_row_dicts` now attaches that row under
-`_ROW_NUMBER_KEY`, `RowPatch.row_number` carries it, and `update_cell(row_number=…)` writes to
-exactly that row. **The pin is verified, not trusted** — the worker checks the row still holds
+`ROW_NUMBER_KEY` — defined in `core/schema.py`, not `api/dashboard.py`, because `core/timeline.py`
+reads the same key and two copies of that magic string are how the grid and the timeline end up
+disagreeing about which physical row a click meant. `RowPatch.row_number` carries it, and
+`update_cell(row_number=…)` writes to exactly that row. **The pin is verified, not trusted** — the worker checks the row still holds
 that ID against its own live scan, so a stale grid cannot redirect an edit onto whatever now
 occupies the position.
 

@@ -1,4 +1,5 @@
-from typing import Any, Dict, List, Optional
+import re
+from typing import Any, Dict, List, Optional, Tuple
 
 from app.core.people import slugify_role
 
@@ -86,6 +87,39 @@ def get_effort_columns(tab_schema: Dict[str, Any]) -> List[Dict[str, Any]]:
 _DUE_WORDS = ("due", "deadline", "target", "expected", "planned", "go-live", "go live", "golive", "eta")
 
 
+def resolve_due_column(
+    tab_schema: Dict[str, Any], headers: Optional[List[str]] = None
+) -> Tuple[Optional[str], bool]:
+    """`get_due_column`'s answer, plus **where it came from**.
+
+    Returns `(header, from_schema)`. `from_schema` is True only when a human mapped the
+    column in `date_columns`; a header the scan below guessed at reports False, and so
+    does the None result.
+
+    That distinction exists because the scan and `get_start_column`'s scan share
+    vocabulary — `"planned"` is a due word and `"start"` is a start word, so
+    `"Planned Start Date"` matches both — and a caller drawing a *span* has to be able to
+    tell a stated deadline from a guessed one before it treats such a header as the right
+    edge. `core/timeline.py:build_timeline` is that caller and the only one so far; see
+    §10.9 for why it prefers the start reading. A guess is worth overruling, and a human's
+    mapping is not.
+
+    `get_due_column` keeps its own signature and delegates here, because every consumer of
+    "overdue" resolves through it and none of them should have to grow a tuple.
+    """
+    dates = tab_schema.get("date_columns") or {}
+    for key in ("due", "go_live"):
+        value = dates.get(key)
+        if value and str(value).strip():
+            return value, True
+
+    for header in headers or []:
+        if header and any(word in str(header).casefold() for word in _DUE_WORDS):
+            return header, False
+
+    return None, False
+
+
 def get_due_column(tab_schema: Dict[str, Any], headers: Optional[List[str]] = None) -> Optional[str]:
     """The column holding each row's deadline, verbatim, or None if the sheet has none.
 
@@ -108,14 +142,100 @@ def get_due_column(tab_schema: Dict[str, Any], headers: Optional[List[str]] = No
     never consulted for a write, and it returns None rather than settling for a
     completion date — "no due-date column" is a true and useful answer.
     """
+    return resolve_due_column(tab_schema, headers)[0]
+
+
+# Words that mark a column as a *planned start*, and the guard that keeps them off people
+# columns. schema_detect's structural fallback matches start columns with
+# ["start", "created", "opened", "assigned"] — but "assigned" is a substring of "Assigned
+# To", and "created"/"opened"/"raised" are each a substring of "Created By"/"Opened
+# By"/"Raised By". Those are people columns on most trackers. One idea covers all of them:
+# a header that names *who* did something never says *when* it happened. So "assigned" is
+# left out of the word list, and any header carrying a standalone "by" token is rejected
+# even when it matches a start word. The words themselves have to stay — "Raised On" and
+# "Date Created" are genuine starts — so the guard is on "by", not on the vocabulary.
+#
+# This matters more than a merely-missing bar: a person's name parses to no date, so every
+# such row would land in the `unparsed` bucket that is reserved for malformed dates like
+# "17/0/2026", quietly corrupting the coverage figure the panel exists to be honest about.
+#
+# "by" is matched as a whole token, never as a substring — "Standby Start Date" is a real
+# start column and rejecting it would be the guard overreaching. The guard does cost one
+# genuine case: "Start By" (plausibly the latest acceptable start) now resolves to nothing,
+# which is the safe direction — a missing bar is visible, a bar drawn from a person's name
+# is not — and schema_config overrides it for any sheet that really uses that wording.
+_START_WORDS = ("start", "begin", "kickoff", "kick-off", "created", "opened", "raised")
+_BY_TOKEN = re.compile(r"\bby\b")
+
+
+def _same_header(a: Optional[str], b: Optional[str]) -> bool:
+    """Whitespace- and case-insensitive header comparison."""
+    if not a or not b:
+        return False
+    return str(a).strip().casefold() == str(b).strip().casefold()
+
+
+def header_reads_as_a_start(header: Optional[str]) -> bool:
+    """Whether this header *looks like* a planned start, under the scan's own rules.
+
+    `get_start_column`'s header scan is this predicate plus a loop, and it is written once
+    here so a caller asking "would the start scan have taken this header?" cannot answer
+    with a second, drifting copy of the vocabulary and the `by` guard. It says nothing
+    about what a schema declares — a `schema_config` mapping is a human decision and is
+    never subject to this test.
+    """
+    if not header:
+        return False
+    candidate = str(header).casefold()
+    if _BY_TOKEN.search(candidate):
+        return False
+    return any(word in candidate for word in _START_WORDS)
+
+
+def get_start_column(
+    tab_schema: Dict[str, Any],
+    headers: Optional[List[str]] = None,
+    exclude: Optional[str] = None,
+) -> Optional[str]:
+    """The column holding each row's planned start, verbatim, or None if there is none.
+
+    `get_due_column`'s mirror, and it repeats that function's shape deliberately rather
+    than sharing an abstraction: the two word lists encode opposite judgements about the
+    same headers, and a shared helper would invite someone to "unify" them.
+
+    Reads the schema key with a truthiness test rather than `dict.get(key, default)`.
+    Detection writes `date_columns` keys holding a literal `null` on the LLM path
+    (`schema_detect.detect_schema_config`; only `_structural_fallback` strips falsy keys),
+    and a key that exists holding None ignores the default — the exact defect that broke
+    `summarize(report_type="overdue")` on every registered project (§16.6).
+
+    `exclude` is the already-resolved due column. The two word lists overlap — "Planned
+    Start" contains "planned", which is in `_DUE_WORDS` — so without this a single-date
+    tab resolves the same header to both ends of the span and every row draws a
+    zero-length bar. A zero-length bar looks like data; no bar at all looks like the
+    mapping gap it actually is. When the *explicit* mapping is the one that collides, this
+    returns None outright rather than scanning on: a schema that names one column for both
+    ends of the span is a mapping error, and substituting some other start-looking header
+    for the one a human chose would hide it behind a bar drawn from the wrong column.
+
+    The header scan additionally refuses any header carrying a standalone "by" token, so
+    "Created By" and "Raised By" stay people columns — see the note above `_START_WORDS`.
+    A mapping the schema states explicitly is trusted and skips that guard: it is a human
+    decision, not a guess from a substring.
+    """
     dates = tab_schema.get("date_columns") or {}
-    for key in ("due", "go_live"):
-        value = dates.get(key)
-        if value and str(value).strip():
-            return value
+    value = dates.get("start")
+    if value and str(value).strip():
+        # A mapping that collides with the due column is a mapping error, and the honest
+        # answer is no start column at all. Scanning on from here would return some other
+        # start-looking header in place of the one the human actually chose — trading a
+        # stated decision for a guess, which is exactly what reading the schema first is for.
+        return None if _same_header(value, exclude) else value
 
     for header in headers or []:
-        if header and any(word in str(header).casefold() for word in _DUE_WORDS):
+        if not header or _same_header(header, exclude):
+            continue
+        if header_reads_as_a_start(header):
             return header
 
     return None
@@ -218,3 +338,12 @@ def default_critical_headers(
         if resolved and resolved not in out:
             out.append(resolved)
     return out
+
+
+# The sheet row a row dict came from, attached under a key no header can collide with
+# (`_row_dicts` skips empty headers, and a real header is never dunder-wrapped). It lives
+# here rather than in api/dashboard.py because core/timeline.py reads it too, and two
+# copies of a magic string are how the grid and the timeline end up disagreeing about
+# which row the user clicked — which for a duplicated ID is the difference between an
+# edit that lands and an edit that lands somewhere else (§16.7).
+ROW_NUMBER_KEY = "__row_number__"
