@@ -1,6 +1,6 @@
 """The timeline read endpoint.
 
-Separate from api/dashboard.py, which is already 687 lines — the same reason api/aliases.py
+Separate from api/dashboard.py, which is already 680 lines — the same reason api/aliases.py
 gives for not being a fourth resource inside api/admin.py, and the reason api/digest.py is
 its own file. Everything here is composition: the computation lives in core/timeline.py,
 which is pure and testable without a database, a Sheets client or a network.
@@ -81,6 +81,11 @@ async def project_timeline(
     result = build_timeline(
         headers, filtered, tab_schema,
         group_by=group_by, resolver=resolver, today=date.today(),
+        # Which columns can group this tab is a fact about the tab, not about the filter
+        # in force. Handed the filtered set, `groupable` would drop the very column the
+        # request grouped by whenever the surviving rows all leave it blank, and the
+        # client's Group-by control would then match no option and show something else.
+        all_rows=rows,
     )
     result["tab"] = active_tab
     result["tabs"] = get_available_tabs(project.schema_config or {})

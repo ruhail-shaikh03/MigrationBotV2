@@ -254,6 +254,58 @@ def test_groups_past_the_cap_fold_into_one_other_bucket():
     assert other["end"] == "2026-03-17"
 
 
+def test_a_shared_cell_folded_from_two_groups_is_listed_once():
+    """A people grouping puts a shared cell in two buckets deliberately — the Workload
+    panel counts it twice for the same reason. When *both* of those buckets fall past the
+    cap, concatenating the tail lists the one row twice under `Other`: drawn twice, keyed
+    twice in the client, and counted once by `counts.charted`.
+
+    People columns are offered as groupings precisely because a large roster overflows the
+    cap, so this is the expected shape of a people-grouped fold, not a corner of it."""
+    rows = [
+        _tracker_row(f"W-{i}", dev=f"P{i:02d}", start=f"{i + 1:02d}/02/2026",
+                     due=f"{i + 1:02d}/03/2026", row_number=i + 3)
+        for i in range(MAX_GROUPS + 3)
+    ]
+    # Two people, neither of whom appears anywhere else, so both of this row's buckets
+    # hold one row and both sort into the tail.
+    rows.append(_tracker_row("W-SHARED", dev="P90/P91", start="20/02/2026",
+                             due="20/03/2026", row_number=99))
+    result = _build(rows, group_by="Developer Name")
+
+    other = [g for g in result["groups"] if g.get("collapsed_groups")][0]
+    ids = [i["id"] for i in other["items"]]
+    # Groups sort earliest-start first, so the five folded away are P12, P13, P14 and the
+    # two the shared cell created. Spelled in full rather than as a count, because order
+    # is part of the contract: the dedupe keeps the first sighting, not the last.
+    assert ids == ["W-12", "W-13", "W-14", "W-SHARED"]
+    assert other["collapsed_groups"] == 5
+    # The count still sees both of the shared row's memberships. That per-group duplication
+    # is Workload parity and is deliberate; only the row's second *listing* was the defect.
+    assert other["count"] == 5
+
+
+def test_the_folded_bucket_never_collides_with_a_real_group_called_other():
+    """"Other" is a plausible module name. A second group under that label fuses with it in
+    any client keying its list and its collapse state on the label — one toggle driving two
+    rows, and a duplicate React key."""
+    rows = [
+        _tracker_row(f"W-{i}", module=f"M{i:02d}", start=f"{i + 1:02d}/02/2026",
+                     due=f"{i + 1:02d}/03/2026")
+        for i in range(MAX_GROUPS + 5)
+    ]
+    # Earliest start on the tab, so it sorts to the front of `head` and survives the fold
+    # rather than being absorbed into it.
+    rows.append(_tracker_row("W-OTHER", module=OTHER_GROUP_LABEL, start="01/01/2026",
+                             due="09/01/2026"))
+    labels = [g["label"] for g in _build(rows)["groups"]]
+    assert len(labels) == len(set(labels))
+    assert OTHER_GROUP_LABEL in labels
+    # The real group keeps the plain label; the fold is the one that moves.
+    real = [g for g in _build(rows)["groups"] if g["label"] == OTHER_GROUP_LABEL][0]
+    assert real.get("collapsed_groups") is None
+
+
 # --- rollup -------------------------------------------------------------------
 
 def test_a_group_header_spans_the_min_and_max_of_its_children():
@@ -432,3 +484,76 @@ def test_a_people_column_is_always_groupable_regardless_of_cardinality():
     rows = [_tracker_row(f"W-{i}", dev=f"Person {i}", start="01/02/2026", due="09/02/2026")
             for i in range(MAX_GROUPS + 5)]
     assert "Developer Name" in _build(rows)["groupable"]
+
+
+def test_the_date_columns_the_chart_is_drawn_from_are_never_offered_as_groupings():
+    """Grouping a timeline by its own start column yields one single-day group per distinct
+    date. It is never what anyone means, and low cardinality would otherwise offer it."""
+    rows = [_tracker_row("W-1", start="01/02/2026", due="09/02/2026")]
+    groupable = _build(rows)["groupable"]
+    assert "Start Date" not in groupable
+    assert "Expected Completetion Date" not in groupable
+
+
+def test_groupable_describes_the_tab_not_the_filter():
+    """Which columns can group a tab is a fact about the tab. Computed over a filtered set
+    — one person, all of whose rows leave `Module` blank — `Module` drops out of the list
+    while still being the active grouping, and the client's `<select value>` then matches
+    no option and silently displays some other column as the one in force."""
+    everything = [
+        _tracker_row("W-1", module="SD", dev="Sara Iqbal", start="01/02/2026", due="09/02/2026"),
+        _tracker_row("W-2", module="", dev="Asif", start="03/02/2026", due="11/02/2026"),
+    ]
+    filtered = [everything[1]]
+    result = build_timeline(HEADERS, filtered, SCHEMA, today=TODAY, all_rows=everything)
+    assert "Module" in result["groupable"]
+    # And the counts still describe the filtered set, which is the half that must not move.
+    assert result["counts"]["total"] == 1
+
+
+# --- the two scans competing for one header -----------------------------------
+
+def test_a_lone_planned_start_column_is_a_start_not_a_deadline():
+    """`_DUE_WORDS` has "planned" and `_START_WORDS` has "start", so "Planned Start Date"
+    matches both. Resolving due first and unguarded made every row a deadline milestone,
+    and every unfinished row whose start had merely passed came back overdue — an
+    obligation the sheet never recorded, which is §16.6's inversion in mirror image.
+
+    The one case with no explicit `exclude` to separate them, and the schema maps nothing:
+    exactly where the guessing has to be got right."""
+    headers = ["ID", "Planned Start Date", "Status"]
+    rows = [{"ID": "A", "Planned Start Date": "01/01/2026", "Status": "In Progress"}]
+    result = build_timeline(headers, rows, {"primary_id_column": "ID"}, today=TODAY)
+
+    assert result["start_header"] == "Planned Start Date"
+    assert result["due_header"] is None
+    item = result["groups"][0]["items"][0]
+    assert item["milestone_of"] == "start"
+    assert item["overdue"] is False
+
+
+def test_a_scanned_deadline_that_reads_as_no_kind_of_start_still_wins():
+    """The overrule is narrow. "Target Completion Date" carries a due word and no start
+    word, so it stays the deadline and a past one on unfinished work is still overdue."""
+    headers = ["ID", "Target Completion Date", "Status"]
+    rows = [{"ID": "A", "Target Completion Date": "01/01/2026", "Status": "In Progress"}]
+    result = build_timeline(headers, rows, {"primary_id_column": "ID"}, today=TODAY)
+
+    assert result["due_header"] == "Target Completion Date"
+    assert result["start_header"] is None
+    assert result["groups"][0]["items"][0]["overdue"] is True
+
+
+def test_an_explicit_schema_deadline_outranks_the_start_vocabulary():
+    """A `date_columns` mapping is a human decision about that sheet. Only the *scan* is
+    overruled — a schema that really does call its deadline column "Planned Start Date"
+    keeps it, and this is what stops the fix reaching `summarize(overdue)`'s behaviour."""
+    headers = ["ID", "Kickoff Date", "Planned Start Date", "Status"]
+    rows = [{"ID": "A", "Kickoff Date": "01/01/2026",
+             "Planned Start Date": "20/01/2026", "Status": "In Progress"}]
+    schema = {"primary_id_column": "ID", "date_columns": {"due": "Planned Start Date"}}
+    result = build_timeline(headers, rows, schema, today=TODAY)
+
+    assert result["due_header"] == "Planned Start Date"
+    assert result["start_header"] == "Kickoff Date"
+    assert result["groups"][0]["items"][0]["kind"] == "bar"

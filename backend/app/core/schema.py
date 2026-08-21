@@ -1,5 +1,5 @@
 import re
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from app.core.people import slugify_role
 
@@ -87,6 +87,39 @@ def get_effort_columns(tab_schema: Dict[str, Any]) -> List[Dict[str, Any]]:
 _DUE_WORDS = ("due", "deadline", "target", "expected", "planned", "go-live", "go live", "golive", "eta")
 
 
+def resolve_due_column(
+    tab_schema: Dict[str, Any], headers: Optional[List[str]] = None
+) -> Tuple[Optional[str], bool]:
+    """`get_due_column`'s answer, plus **where it came from**.
+
+    Returns `(header, from_schema)`. `from_schema` is True only when a human mapped the
+    column in `date_columns`; a header the scan below guessed at reports False, and so
+    does the None result.
+
+    That distinction exists because the scan and `get_start_column`'s scan share
+    vocabulary — `"planned"` is a due word and `"start"` is a start word, so
+    `"Planned Start Date"` matches both — and a caller drawing a *span* has to be able to
+    tell a stated deadline from a guessed one before it treats such a header as the right
+    edge. `core/timeline.py:build_timeline` is that caller and the only one so far; see
+    §10.9 for why it prefers the start reading. A guess is worth overruling, and a human's
+    mapping is not.
+
+    `get_due_column` keeps its own signature and delegates here, because every consumer of
+    "overdue" resolves through it and none of them should have to grow a tuple.
+    """
+    dates = tab_schema.get("date_columns") or {}
+    for key in ("due", "go_live"):
+        value = dates.get(key)
+        if value and str(value).strip():
+            return value, True
+
+    for header in headers or []:
+        if header and any(word in str(header).casefold() for word in _DUE_WORDS):
+            return header, False
+
+    return None, False
+
+
 def get_due_column(tab_schema: Dict[str, Any], headers: Optional[List[str]] = None) -> Optional[str]:
     """The column holding each row's deadline, verbatim, or None if the sheet has none.
 
@@ -109,17 +142,7 @@ def get_due_column(tab_schema: Dict[str, Any], headers: Optional[List[str]] = No
     never consulted for a write, and it returns None rather than settling for a
     completion date — "no due-date column" is a true and useful answer.
     """
-    dates = tab_schema.get("date_columns") or {}
-    for key in ("due", "go_live"):
-        value = dates.get(key)
-        if value and str(value).strip():
-            return value
-
-    for header in headers or []:
-        if header and any(word in str(header).casefold() for word in _DUE_WORDS):
-            return header
-
-    return None
+    return resolve_due_column(tab_schema, headers)[0]
 
 
 # Words that mark a column as a *planned start*, and the guard that keeps them off people
@@ -150,6 +173,23 @@ def _same_header(a: Optional[str], b: Optional[str]) -> bool:
     if not a or not b:
         return False
     return str(a).strip().casefold() == str(b).strip().casefold()
+
+
+def header_reads_as_a_start(header: Optional[str]) -> bool:
+    """Whether this header *looks like* a planned start, under the scan's own rules.
+
+    `get_start_column`'s header scan is this predicate plus a loop, and it is written once
+    here so a caller asking "would the start scan have taken this header?" cannot answer
+    with a second, drifting copy of the vocabulary and the `by` guard. It says nothing
+    about what a schema declares — a `schema_config` mapping is a human decision and is
+    never subject to this test.
+    """
+    if not header:
+        return False
+    candidate = str(header).casefold()
+    if _BY_TOKEN.search(candidate):
+        return False
+    return any(word in candidate for word in _START_WORDS)
 
 
 def get_start_column(
@@ -195,10 +235,7 @@ def get_start_column(
     for header in headers or []:
         if not header or _same_header(header, exclude):
             continue
-        candidate = str(header).casefold()
-        if _BY_TOKEN.search(candidate):
-            continue
-        if any(word in candidate for word in _START_WORDS):
+        if header_reads_as_a_start(header):
             return header
 
     return None
