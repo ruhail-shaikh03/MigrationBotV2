@@ -277,7 +277,10 @@ function toUTC(iso: string): number {
 }
 
 /** Ticks whose spacing suits the span, rather than a zoom control nobody asked for.
- *  A quarter-long plan wants weeks; a three-year one wants quarters.
+ *  The step is picked from the PADDED span, and the thresholds below read: up to ~45 days
+ *  weeks, to ~200 days months, to ~800 days quarters, beyond that years. So a quarter-long
+ *  plan gets weeks, a year-long one quarters, and a three-year one years — quarters serve
+ *  roughly seven months to 2.2 years, not three-year spans.
  *
  *  Returns absolute timestamps rather than percentages, so the caller positions them with
  *  the same `pct` the bars use. Computing tick positions against their own span is how an
@@ -315,8 +318,12 @@ function axisTicks(startMs: number, endMs: number): { ms: number; label: string 
  * One hue for every bar. The source template colours each phase differently; that is
  * rejected here because the group header and indentation already encode the grouping, and
  * because the four status colours fail all-pairs CVD separation as a set, which is why
- * they are reserved for icon-plus-label pairings. Overdue is therefore an outline plus a
- * glyph, never a fill: colour alone would reintroduce exactly that problem.
+ * they are reserved for icon-plus-label pairings. Overdue is therefore an outline plus the
+ * bar's `title`, never a fill: colour alone would reintroduce exactly that problem.
+ *
+ * That `title` is a weak second channel — invisible to keyboard and touch users, for whom
+ * overdue does degrade to outline colour alone. Carrying overdue as text belongs on the
+ * coverage line and the row dialog, which Task 7 owns; it is not solved here.
  */
 export function TimelineChart({
   groups,
@@ -324,12 +331,19 @@ export function TimelineChart({
   rangeEnd,
   today,
   onSelectItem,
+  maxHeight,
 }: {
   groups: TimelineGroup[]
   rangeStart: string
   rangeEnd: string
   today: string
   onSelectItem?: (item: TimelineItem) => void
+  /** Cap the chart's height and scroll inside it, keeping the axis pinned — the same prop
+   *  DataTable takes, for the same reason. `sticky` resolves against the nearest scrollport,
+   *  so without a height cap this container's scrollport equals its content and the axis has
+   *  nothing to stick within: it scrolls away with the page on a long tracker. Omitting it is
+   *  therefore legal but leaves the axis unpinned. */
+  maxHeight?: number | string
 }) {
   const [collapsed, setCollapsed] = useState<Record<string, boolean>>({})
 
@@ -350,8 +364,9 @@ export function TimelineChart({
   return (
     <div className="rounded-xl border border-[var(--color-rule-strong)] bg-ink-850">
       {/* The time region scrolls inside its own container; the page body never scrolls
-          sideways, the rule already applied to markdown tables. */}
-      <div className="overflow-x-auto">
+          sideways, the rule already applied to markdown tables. maxHeight makes this the
+          vertical scrollport too, which is what lets the axis above actually stick. */}
+      <div className="overflow-auto" style={maxHeight ? { maxHeight } : undefined}>
         <div className="min-w-[720px]">
           {/* Axis */}
           <div className="sticky top-0 z-20 flex border-b border-[var(--color-rule-strong)] bg-ink-850">
@@ -359,10 +374,21 @@ export function TimelineChart({
               <span className="label-micro">Task</span>
             </div>
             <div className="relative flex-1 py-2">
-              {ticks.map((t) => (
+              {ticks.map((t, i) => (
                 <span
                   key={t.ms}
-                  className="absolute -translate-x-1/2 whitespace-nowrap font-mono text-[10px] text-ink-500"
+                  // The end labels are anchored rather than centred. Tick 0 always sits at
+                  // exactly 0% (the loop seeds at startMs), so centring it would push half the
+                  // label back over the label column; and when the padded span is a whole
+                  // multiple of the step the last tick lands on exactly 100%, where its right
+                  // half is clipped by the scroll container. Only the interior ticks centre.
+                  className={`absolute whitespace-nowrap font-mono text-[10px] text-ink-500 ${
+                    i === 0
+                      ? "translate-x-0"
+                      : i === ticks.length - 1
+                        ? "-translate-x-full"
+                        : "-translate-x-1/2"
+                  }`}
                   style={{ left: `${pctFromMs(t.ms)}%` }}
                 >
                   {t.label}
@@ -372,7 +398,10 @@ export function TimelineChart({
           </div>
 
           <div className="relative">
-            {/* Today marker, drawn behind the bars and spanning every row. */}
+            {/* Today marker, spanning every row. z-10 paints it in FRONT of the bars, which
+                are z-index:auto in this stacking context — deliberate, and the comment used to
+                claim the opposite. A 1px 60%-alpha rule reads better crossing a bar than hidden
+                under one, and pointer-events-none keeps it from stealing a row click. */}
             {todayPct >= 0 && todayPct <= 100 && (
               // Two nested elements, not one calc(): the marker must be a percentage of the
               // TIME region, and `calc(260px + 40% * ...)` cannot express that — mixing % and
@@ -393,6 +422,8 @@ export function TimelineChart({
                   {/* Group header — the rollup, derived per read and never written back. */}
                   <button
                     onClick={() => setCollapsed((p) => ({ ...p, [group.label]: !p[group.label] }))}
+                    // The chevron swap is the only visual state; a screen reader cannot see it.
+                    aria-expanded={!isCollapsed}
                     className="flex w-full items-center hover:bg-ink-800/60"
                   >
                     <div
