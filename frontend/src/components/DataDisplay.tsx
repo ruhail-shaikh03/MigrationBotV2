@@ -288,7 +288,11 @@ function axisTicks(startMs: number, endMs: number): { ms: number; label: string 
   const fmt: Intl.DateTimeFormatOptions =
     step <= 7
       ? { day: "2-digit", month: "short" }
-      : step <= 30
+      // 91, not 30: this middle format serves BOTH the monthly and the quarterly step.
+      // Matching the boundary to the step thresholds above would send the 91-day step to
+      // year-only, drawing a one-year plan as 2025 / 2026 / 2026 / 2026 / 2026 -- five
+      // ticks, four of them identical, on exactly the span quarterly ticks were chosen for.
+      : step <= 91
         ? { month: "short", year: "2-digit" }
         : { year: "numeric" }
 
