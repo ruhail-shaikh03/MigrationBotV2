@@ -1,6 +1,8 @@
 "use client"
 
-import { Pencil } from "lucide-react"
+import { useState } from "react"
+
+import { ChevronDown, ChevronRight, Pencil } from "lucide-react"
 
 /**
  * Shared display primitives for anything that draws sheet data.
@@ -240,5 +242,238 @@ export function EditableCell({
       {edit?.state === "queued" && <span className="status status-queued ml-1">queued</span>}
       {edit?.state === "failed" && <span className="status status-failed ml-1">failed</span>}
     </button>
+  )
+}
+
+export interface TimelineItem {
+  id: string
+  label: string
+  row_number?: number
+  kind: "bar" | "milestone"
+  start: string | null
+  end: string | null
+  milestone_of: "start" | "due" | null
+  reversed: boolean
+  status: string
+  overdue: boolean
+  people: { key: string; label: string; header: string; value: string }[]
+  values: Record<string, string>
+}
+
+export interface TimelineGroup {
+  label: string
+  count: number
+  start: string | null
+  end: string | null
+  items: TimelineItem[]
+  collapsed_groups?: number
+}
+
+const DAY_MS = 86_400_000
+const LABEL_COL = 260
+
+function toUTC(iso: string): number {
+  return Date.parse(`${iso}T00:00:00Z`)
+}
+
+/** Ticks whose spacing suits the span, rather than a zoom control nobody asked for.
+ *  A quarter-long plan wants weeks; a three-year one wants quarters.
+ *
+ *  Returns absolute timestamps rather than percentages, so the caller positions them with
+ *  the same `pct` the bars use. Computing tick positions against their own span is how an
+ *  axis ends up drifting a few pixels off the bars it is supposed to label. */
+function axisTicks(startMs: number, endMs: number): { ms: number; label: string }[] {
+  const days = Math.max(1, Math.round((endMs - startMs) / DAY_MS))
+  const step = days <= 45 ? 7 : days <= 200 ? 30 : days <= 800 ? 91 : 365
+  const fmt: Intl.DateTimeFormatOptions =
+    step <= 7
+      ? { day: "2-digit", month: "short" }
+      : step <= 30
+        ? { month: "short", year: "2-digit" }
+        : { year: "numeric" }
+
+  const ticks: { ms: number; label: string }[] = []
+  for (let t = startMs; t <= endMs; t += step * DAY_MS) {
+    ticks.push({
+      ms: t,
+      label: new Date(t).toLocaleDateString(undefined, { ...fmt, timeZone: "UTC" }),
+    })
+  }
+  return ticks
+}
+
+/**
+ * A Gantt-style timeline.
+ *
+ * Hand-rolled rather than built on Recharts, which has no Gantt primitive — the shapes
+ * commonly bolted onto its BarChart to imitate one break as soon as rows are grouped.
+ *
+ * One hue for every bar. The source template colours each phase differently; that is
+ * rejected here because the group header and indentation already encode the grouping, and
+ * because the four status colours fail all-pairs CVD separation as a set, which is why
+ * they are reserved for icon-plus-label pairings. Overdue is therefore an outline plus a
+ * glyph, never a fill: colour alone would reintroduce exactly that problem.
+ */
+export function TimelineChart({
+  groups,
+  rangeStart,
+  rangeEnd,
+  today,
+  onSelectItem,
+}: {
+  groups: TimelineGroup[]
+  rangeStart: string
+  rangeEnd: string
+  today: string
+  onSelectItem?: (item: TimelineItem) => void
+}) {
+  const [collapsed, setCollapsed] = useState<Record<string, boolean>>({})
+
+  // A single-day span would divide by zero and a one-day plan would render as one pixel,
+  // so the axis is padded to a minimum width either way.
+  const rawStart = toUTC(rangeStart)
+  const rawEnd = toUTC(rangeEnd)
+  const pad = Math.max(DAY_MS, (rawEnd - rawStart) * 0.02)
+  const startMs = rawStart - pad
+  const endMs = rawEnd + pad
+  const span = Math.max(1, endMs - startMs)
+
+  const pctFromMs = (ms: number) => ((ms - startMs) / span) * 100
+  const pct = (iso: string) => pctFromMs(toUTC(iso))
+  const ticks = axisTicks(startMs, endMs)
+  const todayPct = pct(today)
+
+  return (
+    <div className="rounded-xl border border-[var(--color-rule-strong)] bg-ink-850">
+      {/* The time region scrolls inside its own container; the page body never scrolls
+          sideways, the rule already applied to markdown tables. */}
+      <div className="overflow-x-auto">
+        <div className="min-w-[720px]">
+          {/* Axis */}
+          <div className="sticky top-0 z-20 flex border-b border-[var(--color-rule-strong)] bg-ink-850">
+            <div className="shrink-0 px-3 py-2" style={{ width: LABEL_COL }}>
+              <span className="label-micro">Task</span>
+            </div>
+            <div className="relative flex-1 py-2">
+              {ticks.map((t) => (
+                <span
+                  key={t.ms}
+                  className="absolute -translate-x-1/2 whitespace-nowrap font-mono text-[10px] text-ink-500"
+                  style={{ left: `${pctFromMs(t.ms)}%` }}
+                >
+                  {t.label}
+                </span>
+              ))}
+            </div>
+          </div>
+
+          <div className="relative">
+            {/* Today marker, drawn behind the bars and spanning every row. */}
+            {todayPct >= 0 && todayPct <= 100 && (
+              // Two nested elements, not one calc(): the marker must be a percentage of the
+              // TIME region, and `calc(260px + 40% * ...)` cannot express that — mixing % and
+              // px that way is invalid CSS and silently drops the whole declaration.
+              <div
+                className="pointer-events-none absolute inset-y-0 z-10"
+                style={{ left: LABEL_COL, right: 0 }}
+                aria-hidden
+              >
+                <div className="absolute inset-y-0 w-px bg-brass-400/60" style={{ left: `${todayPct}%` }} />
+              </div>
+            )}
+
+            {groups.map((group) => {
+              const isCollapsed = collapsed[group.label]
+              return (
+                <div key={group.label} className="border-b border-[var(--color-rule)] last:border-b-0">
+                  {/* Group header — the rollup, derived per read and never written back. */}
+                  <button
+                    onClick={() => setCollapsed((p) => ({ ...p, [group.label]: !p[group.label] }))}
+                    className="flex w-full items-center hover:bg-ink-800/60"
+                  >
+                    <div
+                      className="flex shrink-0 items-center gap-1.5 px-3 py-2 text-left"
+                      style={{ width: LABEL_COL }}
+                    >
+                      {isCollapsed ? (
+                        <ChevronRight className="h-3.5 w-3.5 shrink-0 text-ink-500" />
+                      ) : (
+                        <ChevronDown className="h-3.5 w-3.5 shrink-0 text-ink-500" />
+                      )}
+                      <span className="truncate text-[12.5px] font-semibold text-ink-200" title={group.label}>
+                        {group.label}
+                      </span>
+                      <span className="shrink-0 font-mono text-[10px] text-ink-500">{group.count}</span>
+                    </div>
+                    <div className="relative h-8 flex-1">
+                      {group.start && group.end && (
+                        <div
+                          className="absolute top-1/2 h-2.5 -translate-y-1/2 rounded-sm"
+                          style={{
+                            left: `${pct(group.start)}%`,
+                            width: `${Math.max(pct(group.end) - pct(group.start), 0.4)}%`,
+                            backgroundColor: SERIES_HUE,
+                            opacity: 0.5,
+                          }}
+                        />
+                      )}
+                    </div>
+                  </button>
+
+                  {!isCollapsed &&
+                    group.items.map((item) => {
+                      const left = item.start ? pct(item.start) : 0
+                      const width = item.start && item.end ? Math.max(pct(item.end) - left, 0.4) : 0
+                      return (
+                        <button
+                          key={`${item.id}-${item.row_number ?? item.label}`}
+                          onClick={() => onSelectItem?.(item)}
+                          className="flex w-full items-center text-left hover:bg-ink-800/60"
+                        >
+                          <div className="shrink-0 truncate py-1.5 pl-8 pr-3" style={{ width: LABEL_COL }}>
+                            <span className="text-[12px] text-ink-300" title={item.label}>
+                              {item.label}
+                            </span>
+                          </div>
+                          <div className="relative h-7 flex-1">
+                            {item.kind === "bar" ? (
+                              <div
+                                className="absolute top-1/2 h-3.5 -translate-y-1/2 rounded-sm"
+                                style={{
+                                  left: `${left}%`,
+                                  width: `${width}%`,
+                                  backgroundColor: SERIES_HUE,
+                                  outline: item.overdue ? "1px solid var(--color-failed)" : undefined,
+                                  outlineOffset: item.overdue ? "1px" : undefined,
+                                }}
+                                title={`${item.id} · ${item.start} → ${item.end}${
+                                  item.overdue ? " · overdue" : ""
+                                }${item.reversed ? " · dates are reversed on the sheet" : ""}`}
+                              />
+                            ) : (
+                              <div
+                                className="absolute top-1/2 h-2.5 w-2.5 -translate-x-1/2 -translate-y-1/2 rotate-45"
+                                style={{
+                                  left: `${left}%`,
+                                  backgroundColor: SERIES_HUE,
+                                  outline: item.overdue ? "1px solid var(--color-failed)" : undefined,
+                                  outlineOffset: item.overdue ? "1px" : undefined,
+                                }}
+                                title={`${item.id} · ${
+                                  item.milestone_of === "start" ? "starts" : "due"
+                                } ${item.start}${item.overdue ? " · overdue" : ""}`}
+                              />
+                            )}
+                          </div>
+                        </button>
+                      )
+                    })}
+                </div>
+              )
+            })}
+          </div>
+        </div>
+      </div>
+    </div>
   )
 }
