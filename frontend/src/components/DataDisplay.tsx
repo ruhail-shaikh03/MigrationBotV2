@@ -405,7 +405,10 @@ export function itemTitle(item: TimelineItem): string {
     return paired ? `${name} ${body}` : body
   }
   return [
-    item.id || item.label,
+    // Both, when they differ. The label column truncates a long description and this is
+    // now the only tooltip on the row, so dropping the label would lose the full text that
+    // the `title` on that span used to carry.
+    [item.id, item.label !== item.id ? item.label : null].filter(Boolean).join(" — "),
     phrase(item.planned, "planned"),
     phrase(item.actual, "actual"),
     item.overdue ? "overdue" : null,
