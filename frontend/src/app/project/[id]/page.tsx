@@ -11,10 +11,10 @@ import {
 } from "lucide-react"
 
 import {
-  ChartFrame, DataTable, EditableCell, HoverTip, itemKey, MAX_BARS, SERIES_HUE, StatTile,
-  TimelineChart,
+  ChartFrame, DataTable, EditableCell, HoverTip, itemKey, MAX_BARS, prettyDate, SERIES_HUE,
+  slipLabel, StatTile, TimelineChart,
 } from "@/components/DataDisplay"
-import type { TimelineGroup, TimelineItem } from "@/components/DataDisplay"
+import type { TimelineGroup, TimelineItem, TimelineSegment } from "@/components/DataDisplay"
 import Modal from "@/components/Modal"
 // `editKey` rather than a second hand-built `${id}::${header}` here: the grid and the
 // timeline's row dialog both read the hook's pending map, and three spellings of one key
@@ -120,13 +120,24 @@ interface HealthResponse {
 interface TimelineResponse {
   start_header: string | null
   due_header: string | null
+  /** Null on a tab recording one pair of dates, which is most of them. Non-null means the
+   *  chart draws a plan and an outcome per row instead of a single bar. */
+  actual_start_header: string | null
+  actual_due_header: string | null
   group_by: string | null
   groupable: string[]
   editable_headers: string[]
   range_start: string | null
   range_end: string | null
+  /** The axis was bounded inside the data rather than around it, because one or more dates
+   *  were far enough out to flatten everything else. The panel has to say so: a reader who
+   *  can see 2206 in the sheet and not on the chart is owed the reason. */
+  range_clamped: boolean
   today: string
   groups: TimelineGroup[]
+  /** Rows with no date to draw at, in the same shape as a drawn one. Listing them is what
+   *  makes the panel able to *build* a timeline rather than only display one. */
+  unplaced: TimelineItem[]
   counts: { total: number; charted: number; milestone_only: number; undated: number; unparsed: number }
   /** Why there is nothing to draw. Present instead of an empty chart, because an empty
    *  chart reads as "no work is late" rather than as "this sheet records no dates". */
@@ -149,6 +160,15 @@ interface TimelineState {
   error?: string
 }
 
+/** One segment as a phrase. A milestone names which end it recorded, because "9 Feb" alone
+ *  does not say whether the work starts then or is due then. */
+function segmentLabel(seg: TimelineSegment): string {
+  if (seg.kind === "milestone") {
+    return `${seg.milestone_of === "start" ? "starts" : "due"} ${prettyDate(seg.start)}`
+  }
+  return `${prettyDate(seg.start)} → ${prettyDate(seg.end)}`
+}
+
 const PAGE_SIZE = 50
 
 export default function ProjectDashboard() {
@@ -166,6 +186,9 @@ export default function ProjectDashboard() {
   const [timeline, setTimeline] = useState<TimelineState | null>(null)
   const [groupBy, setGroupBy] = useState("")
   const [selected, setSelected] = useState<TimelineItem | null>(null)
+  // Collapsed by default. It is usually the longest list on the page and the chart is what
+  // the reader came for; it opens from the coverage line's own undated count.
+  const [showUnplaced, setShowUnplaced] = useState(false)
   // Bumped when a queued write actually lands. Not part of `timelineKey`: a reload is the
   // same question asked again, not a different one, so the panel keeps rendering the
   // payload it has until the fresh one replaces it rather than flashing "Reading…".
@@ -514,6 +537,23 @@ export default function ProjectDashboard() {
     return seen.size
   }, [timelineData])
 
+  // The rows holding a date the axis deliberately excludes. Deduplicated on the identity
+  // the chart keys its rows by, for the same reason `overdueCount` is: grouping on a people
+  // column puts one shared row in two buckets on purpose, and counting it twice would
+  // report more wild dates than the tab holds.
+  const outOfRange = useMemo(() => {
+    const seen = new Set<string>()
+    const found: TimelineItem[] = []
+    timelineData?.groups.forEach((g) =>
+      g.items.forEach((i) => {
+        if (!i.out_of_range || seen.has(itemKey(i))) return
+        seen.add(itemKey(i))
+        found.push(i)
+      })
+    )
+    return found
+  }, [timelineData])
+
   // How much of the grouping the chart is not showing. Past its cap the API folds the
   // tail into one bucket and records how many groups went in; the chart draws the bucket
   // but never that number, so without this the count of hidden groups is lost.
@@ -542,7 +582,12 @@ export default function ProjectDashboard() {
       const found = group.items.find((i) => itemKey(i) === key)
       if (found) return found
     }
-    return null
+    // And the unplaced list, which is the whole point of it: giving an undated row a date
+    // is the edit most likely to be made from here, and it is precisely the edit that moves
+    // the row from this list into a group. Searching only the groups would leave the dialog
+    // showing the pre-edit snapshot — the failure this lookup exists to prevent — for the
+    // one case where the value visibly changed.
+    return timelineData.unplaced.find((i) => itemKey(i) === key) ?? null
   }, [selected, timelineData])
 
   // An edit can move a row out of the active filter — a reassignment under "Assigned to",
@@ -845,7 +890,23 @@ export default function ProjectDashboard() {
                   <span className="text-ink-300">{timelineData.counts.charted}</span> bars
                 </span>
                 <span className="tabular-nums">{timelineData.counts.milestone_only} milestones</span>
-                <span className="tabular-nums">{timelineData.counts.undated} undated</span>
+                {/* A control, not a statistic. This is the largest number on the line
+                    -- 347 of 412 rows on the reference tracker -- and every one of those
+                    rows was unreachable from this panel: the only way into the row dialog
+                    was clicking a bar, which by definition an undated row has not got. The
+                    panel could count the unscheduled work and schedule none of it. */}
+                {timelineData.counts.undated > 0 ? (
+                  <button
+                    onClick={() => setShowUnplaced((v) => !v)}
+                    aria-expanded={showUnplaced}
+                    className="cursor-pointer underline decoration-dotted underline-offset-2 tabular-nums hover:text-ink-300"
+                    title="List these rows so you can give them dates"
+                  >
+                    {timelineData.counts.undated} undated
+                  </button>
+                ) : (
+                  <span className="tabular-nums">0 undated</span>
+                )}
                 {timelineData.counts.unparsed > 0 && (
                   <button
                     onClick={() => setView("health")}
@@ -870,6 +931,22 @@ export default function ProjectDashboard() {
                 {overdueCount > 0 && (
                   <span className="tabular-nums text-failed">{overdueCount} overdue</span>
                 )}
+                {/* Say it, and name the rows. One mistyped year -- "02.06.2206" for 2026 --
+                    ran the axis to 2209 and squeezed every real bar into its leftmost two
+                    percent. The axis is now bounded inside the data, which is only honest
+                    if the reader is told, and only useful if the row carrying the wild date
+                    is one click away from being fixed. */}
+                {timelineData.range_clamped && outOfRange.length > 0 && (
+                  <button
+                    onClick={() => setSelected(outOfRange[0])}
+                    className="cursor-pointer text-brass-300 underline decoration-dotted underline-offset-2 tabular-nums hover:text-brass-200"
+                    title={`Open ${outOfRange[0].id || outOfRange[0].label} — its date sits far outside the rest`}
+                  >
+                    {outOfRange.length === 1
+                      ? "1 date outside the range"
+                      : `${outOfRange.length} dates outside the range`}
+                  </button>
+                )}
                 {folded.count > 0 && (
                   <span className="tabular-nums">
                     {folded.count} smaller {folded.count === 1 ? "group" : "groups"} folded into{" "}
@@ -886,6 +963,15 @@ export default function ProjectDashboard() {
                   <span className="stamp stamp-muted">
                     {timelineData.start_header ?? "no start column"} →{" "}
                     {timelineData.due_header ?? "no deadline column"}
+                  </span>
+                )}
+                {/* The baseline pair, stamped separately so its absence is legible. A tab
+                    recording four dates and drawing two is the case where a reader most
+                    needs to check which two the panel picked. */}
+                {(timelineData.actual_start_header || timelineData.actual_due_header) && (
+                  <span className="stamp stamp-muted">
+                    actual: {timelineData.actual_start_header ?? "—"} →{" "}
+                    {timelineData.actual_due_header ?? "—"}
                   </span>
                 )}
                 {timelineData.truncated && (
@@ -962,8 +1048,54 @@ export default function ProjectDashboard() {
                 // coverage line and the Group-by control. That is the grid's DataTable
                 // figure — same header, same filter bar — plus the two rows only this
                 // panel has.
-                maxHeight="calc(100vh - 360px)"
+                // `max()`, and the floor is not cosmetic. Measured on the deploy at
+                // 137.5% Windows display scaling the viewport is 451 CSS px tall, so
+                // `calc(100vh - 360px)` resolved to a 91-pixel scrollport showing two rows
+                // of a 412-row tracker. Below the floor the page scrolls instead, which
+                // costs the sticky axis and keeps the chart.
+                maxHeight="max(320px, calc(100vh - 360px))"
               />
+            )}
+
+            {/* Everything the chart cannot draw, and the only route from this panel to
+                scheduling it. Collapsed by default: it is usually the longest list on the
+                page, and the chart is what the reader came for. */}
+            {showUnplaced && timelineData && timelineData.unplaced.length > 0 && (
+              <div className="rounded-xl border border-[var(--color-rule-strong)] bg-ink-850">
+                <div className="flex items-baseline justify-between gap-3 border-b border-[var(--color-rule)] px-3 py-2">
+                  <h2 className="text-[12.5px] font-semibold text-ink-200">
+                    Rows with no dates
+                    <span className="ml-2 font-mono text-[10px] font-normal text-ink-500">
+                      {timelineData.unplaced.length}
+                    </span>
+                  </h2>
+                  <p className="text-[11px] text-ink-500">
+                    Give a row a start or a deadline and it joins the chart above.
+                  </p>
+                </div>
+                <div className="max-h-[40vh] overflow-auto">
+                  {timelineData.unplaced.map((row) => (
+                    <button
+                      key={itemKey(row)}
+                      onClick={() => setSelected(row)}
+                      className="flex w-full cursor-pointer items-baseline gap-3 border-b border-[var(--color-rule)] px-3 py-1.5 text-left transition-colors last:border-b-0 hover:bg-ink-800/60 focus-visible:bg-ink-800/60 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-brass-500"
+                    >
+                      <span className="w-28 shrink-0 truncate font-mono text-[11px] text-ink-500">
+                        {row.id || "—"}
+                      </span>
+                      <span className="min-w-0 flex-1 truncate text-[12px] text-ink-300">
+                        {row.label}
+                      </span>
+                      {/* The one distinction worth carrying over from the coverage line: a
+                          blank cell needs a date typed into it, a cell holding "17/0/2026"
+                          needs one corrected. They are different jobs. */}
+                      {row.kind === "unparsed" && (
+                        <span className="shrink-0 text-[11px] text-failed">unreadable date</span>
+                      )}
+                    </button>
+                  ))}
+                </div>
+              </div>
             )}
           </section>
         ) : (
@@ -994,6 +1126,47 @@ export default function ProjectDashboard() {
               <p className="flex items-center gap-2 text-[12.5px] text-ink-400">
                 <span className="status status-failed">Overdue</span>
                 <span>Its deadline has passed and its status is not a finished one.</span>
+              </p>
+            )}
+            {/* What the chart drew, in words. The bar carries the dates by position, the
+                baseline offset carries the slip and an outline carries overdue -- none of
+                which reaches a keyboard or a touch user, and none of which survives being
+                read aloud. This is the channel that does. */}
+            {(selectedRow.planned || selectedRow.actual) && (
+              <dl className="flex flex-wrap gap-x-6 gap-y-1 text-[12px]">
+                {selectedRow.planned && (
+                  <div className="flex items-baseline gap-2">
+                    <dt className="label-micro">Planned</dt>
+                    <dd className="text-ink-300 tabular-nums">
+                      {segmentLabel(selectedRow.planned)}
+                    </dd>
+                  </div>
+                )}
+                {selectedRow.actual && (
+                  <div className="flex items-baseline gap-2">
+                    <dt className="label-micro">Actual</dt>
+                    <dd className="text-ink-300 tabular-nums">
+                      {segmentLabel(selectedRow.actual)}
+                    </dd>
+                  </div>
+                )}
+                {slipLabel(selectedRow.slip_days) && (
+                  <div className="flex items-baseline gap-2">
+                    <dt className="label-micro">Slip</dt>
+                    {/* Late is worth colouring; early and on-time are not news. The word is
+                        there either way, so the colour is never the only channel. */}
+                    <dd className={(selectedRow.slip_days ?? 0) > 0 ? "text-failed" : "text-ink-300"}>
+                      {slipLabel(selectedRow.slip_days)}
+                    </dd>
+                  </div>
+                )}
+              </dl>
+            )}
+            {selectedRow.out_of_range && (
+              <p className="text-[12px] leading-relaxed text-brass-300">
+                One of the dates on this row sits far outside every other date on the tab,
+                so the axis stops short of it and the bar is pinned to the edge. If that
+                date is a typo, correcting it below will redraw the whole chart.
               </p>
             )}
             {selectedDropped && (

@@ -122,3 +122,97 @@ def test_an_excluded_explicit_mapping_reports_nothing_rather_than_scanning_on():
     headers = ["ID", "Planned Start", "Kickoff Date"]
     schema = {"date_columns": {"start": "Planned Start"}}
     assert get_start_column(schema, headers, exclude="Planned Start") is None
+
+
+# --- the actual pair, on a tab that records four dates -------------------------
+
+from app.core.schema import resolve_actual_columns  # noqa: E402
+
+FOUR = ["ID", "Planned Start Date", "Planned Finish Date",
+        "Actual Start Date", "Actual Finish Date", "Owner"]
+
+
+def test_a_two_date_tab_has_no_actual_pair():
+    """The property that keeps every existing tracker drawing exactly as it did. Most
+    sheets record one pair, and on those this whole feature must be inert."""
+    assert resolve_actual_columns(
+        {}, ["ID", "Start Date", "Expected Completetion Date"],
+        exclude=("Start Date", "Expected Completetion Date"),
+    ) == (None, None)
+
+
+def test_the_qualifier_scan_finds_both_actual_columns():
+    assert resolve_actual_columns(
+        {}, FOUR, exclude=("Planned Start Date", "Planned Finish Date"),
+    ) == ("Actual Start Date", "Actual Finish Date")
+
+
+def test_the_actual_pair_never_reuses_a_column_the_planned_pair_took():
+    """One column cannot be both ends of both segments. Without the exclusion a tab whose
+    planned deadline is the only completion-ish header hands it to the baseline too, and
+    the row's plan and its outcome are drawn as the same bar."""
+    headers = ["ID", "Start Date", "Date Completion"]
+    assert resolve_actual_columns(
+        {}, headers, exclude=("Start Date", "Date Completion"),
+    ) == (None, None)
+
+
+def test_a_deadline_wearing_the_word_completion_is_not_an_actual_finish():
+    """"Expected Completion Date" is a promise, not a record. Reading it as the day the
+    work landed would mark unfinished rows delivered and cancel their overdue flag — the
+    §16.6 inversion in the other direction."""
+    headers = ["ID", "Start Date", "Expected Completetion Date", "Target Completion Date"]
+    _, actual_due = resolve_actual_columns(
+        {}, headers, exclude=("Start Date", "Expected Completetion Date"),
+    )
+    assert actual_due is None
+
+
+def test_a_genuine_completion_column_is_taken_even_without_the_word_actual():
+    """"Date Completion" on the reference tracker records when work finished and carries no
+    qualifier. Requiring the word "actual" would miss every sheet spelled that way."""
+    headers = ["ID", "Start Date", "Expected Completetion Date", "Date Completion"]
+    _, actual_due = resolve_actual_columns(
+        {}, headers, exclude=("Start Date", "Expected Completetion Date"),
+    )
+    assert actual_due == "Date Completion"
+
+
+def test_the_schema_completion_role_outranks_the_scan():
+    """Detection has been writing `completion` all along. Reading it is what lets a sheet
+    detected years ago grow a baseline without being re-detected."""
+    schema = {"date_columns": {"completion": "Sign-off Date"}}
+    headers = ["ID", "Start Date", "Date Completion", "Sign-off Date"]
+    _, actual_due = resolve_actual_columns(schema, headers, exclude=("Start Date",))
+    assert actual_due == "Sign-off Date"
+
+
+def test_a_null_completion_key_falls_through_to_the_scan():
+    """Detection writes `date_columns` keys holding a literal null on the LLM path. A
+    truthiness test is the difference between finding the column and finding nothing —
+    §16.6, which broke `summarize(overdue)` on every registered project."""
+    schema = {"date_columns": {"completion": None, "actual_due": None}}
+    headers = ["ID", "Start Date", "Date Completion"]
+    _, actual_due = resolve_actual_columns(schema, headers, exclude=("Start Date",))
+    assert actual_due == "Date Completion"
+
+
+def test_an_actual_start_must_wear_the_qualifier():
+    """Every unqualified start-looking header is a candidate for the *planned* start.
+    Claiming one here would move the baseline without saying so."""
+    headers = ["ID", "Planned Start Date", "Planned Finish Date", "Kickoff Date",
+               "Actual Finish Date"]
+    actual_start, _ = resolve_actual_columns(
+        {}, headers, exclude=("Planned Start Date", "Planned Finish Date"),
+    )
+    assert actual_start is None
+
+
+def test_created_by_is_not_an_actual_start():
+    """The `by` guard applies here too — it is `header_reads_as_a_start` doing the work, so
+    a people column cannot become half a baseline."""
+    headers = ["ID", "Planned Start Date", "Planned Finish Date", "Actual Created By"]
+    actual_start, _ = resolve_actual_columns(
+        {}, headers, exclude=("Planned Start Date", "Planned Finish Date"),
+    )
+    assert actual_start is None

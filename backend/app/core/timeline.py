@@ -21,7 +21,7 @@ folding it into "undated" hides precisely the defect worth surfacing.
 No header string is spelled in this module. Every column arrives from a schema role.
 """
 
-from datetime import date
+from datetime import date, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
 from app.core.overdue import is_finished_status
@@ -32,6 +32,7 @@ from app.core.schema import (
     get_people_columns,
     get_start_column,
     header_reads_as_a_start,
+    resolve_actual_columns,
     resolve_due_column,
     resolve_header,
 )
@@ -44,6 +45,31 @@ OTHER_GROUP_LABEL = "Other"
 UNGROUPED_LABEL = "All rows"
 BLANK_GROUP_LABEL = "(blank)"
 UNASSIGNED_GROUP_LABEL = "Unassigned"
+
+# A single mistyped year is enough to make the panel useless. On the reference tracker one
+# row carries "02.06.2206" where 2026 was meant; the axis therefore ran 2021 to 2209 and
+# the other sixty-one dated rows were squeezed into its leftmost two percent, behind an
+# unreadable smear of 189 year labels. Nothing about that chart was wrong — it was a
+# faithful drawing of a range nobody wanted to see.
+#
+# So the axis is bounded by the bulk of the dates rather than by their extremes, with a
+# Tukey fence: quartiles, three interquartile ranges either side. Rows outside it keep
+# their real dates and are still drawn, clamped to the edge and flagged — never dropped,
+# because a chart that quietly omits a row is the exact failure the coverage line exists
+# to prevent, and the row with the typo is the one the reader most needs to find.
+_FENCE_MULTIPLIER = 3
+
+# A floor under the fence. A tab whose dates all land in one week has an interquartile
+# range of zero, and three times zero would fence the axis to a point and declare every
+# row on either side of the median an outlier.
+_MIN_FENCE_DAYS = 30
+
+# And a reason to bother. Clamping buys legibility only when the outliers are what make
+# the span long; below this ratio it would mark rows out of range for no visible gain.
+_CLAMP_RATIO = 2
+
+# Too few dates to fence at all. See the note in `_drawn_range`.
+_MIN_POINTS = 8
 
 
 def classify_row(
@@ -91,6 +117,130 @@ def classify_row(
 
 def _iso(value: Optional[date]) -> Optional[str]:
     return value.isoformat() if value else None
+
+
+def _segment(
+    row: Dict[str, str],
+    start_header: Optional[str],
+    due_header: Optional[str],
+) -> Tuple[str, Optional[Dict[str, Any]]]:
+    """One pair of date columns, resolved into the shape a chart can draw.
+
+    Returns `(kind, segment)`. The segment is None for `undated` and `unparsed` — there is
+    nothing to draw at — and the kind is returned alongside so the caller can tell those
+    two apart, which is the distinction the coverage line is built on.
+
+    This is `classify_row` plus the normalisation the caller used to do inline: an end
+    before its start is swapped for drawing and flagged rather than silently corrected, and
+    a milestone records which column it came from so a reader can tell "starts on the 9th"
+    from "due on the 9th".
+    """
+    kind, start, end = classify_row(row, start_header, due_header)
+    if kind in ("undated", "unparsed"):
+        return kind, None
+
+    reversed_dates = bool(start and end and end < start)
+    if reversed_dates:
+        start, end = end, start
+
+    milestone_of = None
+    if kind == "milestone":
+        milestone_of = "start" if start_header and str(row.get(start_header, "")).strip() else "due"
+
+    return kind, {
+        "kind": kind,
+        "start": _iso(start),
+        "end": _iso(end),
+        "milestone_of": milestone_of,
+        "reversed": reversed_dates,
+    }
+
+
+def _finish(segment: Optional[Dict[str, Any]]) -> Optional[str]:
+    """The date a segment says the work ends, or None if it never says.
+
+    A milestone carries the same value at both ends, so `segment["end"]` alone cannot tell
+    a recorded finish from a recorded start — and the difference decides both whether a row
+    is overdue and whether it slipped. A start-only segment finishes nothing.
+    """
+    if not segment:
+        return None
+    if segment["kind"] == "bar" or segment["milestone_of"] == "due":
+        return segment["end"]
+    return None
+
+
+def _drawn_range(dates: List[date]) -> Tuple[Optional[date], Optional[date], bool]:
+    """The span the axis should cover, which is not always the span the dates cover.
+
+    Returns `(start, end, clamped)`. `clamped` is True only when outliers were actually
+    excluded, so the caller can say so rather than leaving the reader to wonder why a date
+    they can see in the sheet sits on the edge of the chart.
+
+    Order statistics, not interpolated quartiles: with a handful of dates the difference is
+    a day or two on a fence measured in months, and `pts[n // 4]` cannot be got wrong.
+    """
+    if not dates:
+        return None, None, False
+
+    pts = sorted(dates)
+    lo_all, hi_all = pts[0], pts[-1]
+
+    # Below this the quartiles are two or three points and the fence they draw is noise. It
+    # is also the size of tab a reader takes in whole, where a stretched axis is survivable
+    # in a way it is not across four hundred rows. Eight rather than four because the
+    # indices below put q3 on the maximum for any n up to four — a fence that can never
+    # exclude a high outlier, and a guard that reads as if it does something it does not.
+    if len(pts) < _MIN_POINTS:
+        return lo_all, hi_all, False
+
+    q1, q3 = pts[len(pts) // 4], pts[(len(pts) * 3) // 4]
+    pad = max((q3 - q1).days * _FENCE_MULTIPLIER, _MIN_FENCE_DAYS)
+    lo_fence, hi_fence = q1 - timedelta(days=pad), q3 + timedelta(days=pad)
+
+    inliers = [d for d in pts if lo_fence <= d <= hi_fence]
+    if not inliers:
+        return lo_all, hi_all, False
+
+    lo, hi = inliers[0], inliers[-1]
+    # `max(1, ...)` keeps a tab whose inliers share one date — span zero — from dividing the
+    # comparison away; there the outliers are the entire span and clamping plainly applies.
+    if (hi_all - lo_all).days < max(1, (hi - lo).days) * _CLAMP_RATIO:
+        return lo_all, hi_all, False
+
+    return lo, hi, True
+
+
+def _row_identity(
+    row: Dict[str, str],
+    id_header: Optional[str],
+    desc_header: Optional[str],
+    people: List[Dict[str, str]],
+    editable: List[str],
+) -> Dict[str, Any]:
+    """The fields a row carries whether or not it can be drawn.
+
+    Shared by the bars and by the rows that have no date to be drawn at. The row dialog
+    addresses a row through exactly these — an ID to write against, a row number so a
+    duplicated ID still lands on the row that was clicked, and the editable cells — which
+    is what lets an undated row open the very same dialog a bar does. Without that the
+    panel can count 347 unscheduled rows and offer no way to schedule any of them.
+    """
+    ident = str(row.get(id_header, "")) if id_header else ""
+    return {
+        "id": ident,
+        "label": (str(row.get(desc_header, "")).strip() if desc_header else "") or ident,
+        "row_number": row.get(ROW_NUMBER_KEY),
+        "people": [
+            {"key": p["key"], "label": p["label"], "header": p["header"],
+             "value": str(row.get(p["header"], ""))}
+            for p in people
+        ],
+        # Raw cell text, not the parsed ISO value. The dialog writes back exactly what it
+        # was given unless the user edits it, so a sheet spelling dates "10.05.2026" is not
+        # silently rewritten into ISO on every save.
+        "values": {h: str(row.get(h, "")) for h in editable},
+    }
 
 
 def _item_identity(item: Dict[str, Any]) -> Tuple[str, Any]:
@@ -222,6 +372,16 @@ def build_timeline(
     due_header = resolve_header(headers, due_name)
     start_header = resolve_header(headers, start_name)
 
+    # The other half of a four-column tab: when the work actually started and finished, as
+    # against when it was meant to. `(None, None)` on a tab that records only one pair, and
+    # every branch below is written so that case draws exactly what it drew before.
+    actual_start_name, actual_due_name = resolve_actual_columns(
+        tab_schema, headers, exclude=(start_name, due_name)
+    )
+    actual_start_header = resolve_header(headers, actual_start_name)
+    actual_due_header = resolve_header(headers, actual_due_name)
+    has_actual = bool(actual_start_header or actual_due_header)
+
     id_header = resolve_header(headers, tab_schema.get("primary_id_column"))
     desc_header = resolve_header(headers, tab_schema.get("description_column"))
     status_header = resolve_header(headers, tab_schema.get("status_column"))
@@ -236,7 +396,10 @@ def build_timeline(
     # the status column as a people column too, and a header listed twice renders the same
     # field twice in the row dialog.
     editable = list(dict.fromkeys(
-        h for h in ([start_header, due_header, status_header] + people_headers) if h
+        h for h in (
+            [start_header, due_header, actual_start_header, actual_due_header, status_header]
+            + people_headers
+        ) if h
     ))
 
     group_header = resolve_header(
@@ -247,9 +410,34 @@ def build_timeline(
     counts = {"total": len(rows), "charted": 0, "milestone_only": 0, "undated": 0, "unparsed": 0}
     buckets: Dict[str, List[Dict[str, Any]]] = {}
     bucket_counts: Dict[str, int] = {}
+    # Every drawable item exactly once, whatever number of groups it ends up in. A people
+    # grouping puts one shared row in two buckets deliberately, so the buckets are the
+    # wrong place to compute a range or to stamp a flag from — and because the entries are
+    # the same dict object, stamping it here is visible through every bucket holding it.
+    placed: List[Dict[str, Any]] = []
+    unplaced: List[Dict[str, Any]] = []
+
+    today_iso = today.isoformat()
 
     for row in rows:
-        kind, start, end = classify_row(row, start_header, due_header)
+        plan_kind, planned = _segment(row, start_header, due_header)
+        actual_kind, actual = (
+            _segment(row, actual_start_header, actual_due_header)
+            if has_actual else ("undated", None)
+        )
+
+        # One bucket for the row, decided across both segments. `unparsed` still beats
+        # everything for the reason classify_row gives — a chart that draws the readable
+        # half of a row hides the half that is wrong — and a row is a "bar" when either
+        # segment spans time, because that is what the coverage line means by the word.
+        if "unparsed" in (plan_kind, actual_kind):
+            kind = "unparsed"
+        elif planned is None and actual is None:
+            kind = "undated"
+        elif "bar" in (plan_kind, actual_kind):
+            kind = "bar"
+        else:
+            kind = "milestone"
 
         if kind == "undated":
             counts["undated"] += 1
@@ -266,46 +454,68 @@ def build_timeline(
             buckets.setdefault(label, [])
 
         if kind in ("undated", "unparsed"):
+            # Listed rather than merely counted. These are the rows a reader opens the
+            # panel to schedule, and every one of them was previously unreachable from it:
+            # the only way into the row dialog was clicking a bar, which by definition
+            # these have not got. They are kept out of `groups` — 347 empty tracks would
+            # bury the 62 real ones — and carried in their own array for the panel below
+            # the chart.
+            unplaced.append({
+                **_row_identity(row, id_header, desc_header, people, editable),
+                "kind": kind,
+            })
             continue
 
-        reversed_dates = bool(start and end and end < start)
-        if reversed_dates:
-            start, end = end, start
-
         status = str(row.get(status_header, "")) if status_header else ""
-        milestone_of = None
-        if kind == "milestone":
-            milestone_of = "start" if start_header and str(row.get(start_header, "")).strip() else "due"
+        primary = planned or actual or {}
 
+        # The row's envelope: earliest date it records to latest, across both segments.
+        # The axis range, the group rollups and the row ordering all read these, and all
+        # three want "how far does this row reach", not "which of its two bars is real".
+        # The chart draws from the segments themselves.
+        span = [
+            iso for segment in (planned, actual) if segment
+            for iso in (segment["start"], segment["end"]) if iso
+        ]
+
+        planned_finish, actual_finish = _finish(planned), _finish(actual)
         item = {
-            "id": str(row.get(id_header, "")) if id_header else "",
-            "label": (str(row.get(desc_header, "")).strip() if desc_header else "")
-            or (str(row.get(id_header, "")) if id_header else ""),
-            "row_number": row.get(ROW_NUMBER_KEY),
+            **_row_identity(row, id_header, desc_header, people, editable),
             "kind": kind,
-            "start": _iso(start),
-            "end": _iso(end),
-            "milestone_of": milestone_of,
-            "reversed": reversed_dates,
+            "start": min(span) if span else None,
+            "end": max(span) if span else None,
+            # Named, never aliased. A tab recording one pair of dates gets `actual: null`
+            # and draws exactly what it drew before any of this existed.
+            "planned": planned,
+            "actual": actual,
+            # How late the work landed, in days, and only when both ends of the comparison
+            # are recorded. Negative means early. This is a fact about a finished row and
+            # is the reason `overdue` below refuses to describe one.
+            "slip_days": (
+                (date.fromisoformat(actual_finish) - date.fromisoformat(planned_finish)).days
+                if planned_finish and actual_finish else None
+            ),
+            "milestone_of": primary.get("milestone_of"),
+            "reversed": bool(
+                (planned or {}).get("reversed") or (actual or {}).get("reversed")
+            ),
             "status": status,
             # Overdue only ever describes a real deadline, so a start-only milestone is
-            # never overdue however old it is — nothing was promised for that date.
+            # never overdue however old it is — nothing was promised for that date. And a
+            # recorded actual finish discharges the promise however late it was: that row
+            # slipped, which `slip_days` says precisely. Reporting delivered work as
+            # overdue is §16.6's inversion in a third costume.
             "overdue": bool(
-                end
-                and (kind == "bar" or milestone_of == "due")
-                and end < today
+                planned_finish
+                and not actual_finish
+                and planned_finish < today_iso
                 and not is_finished_status(status)
             ),
-            "people": [
-                {"key": p["key"], "label": p["label"], "header": p["header"],
-                 "value": str(row.get(p["header"], ""))}
-                for p in people
-            ],
-            # Raw cell text, not the parsed ISO value. The dialog writes back exactly what
-            # it was given unless the user edits it, so a sheet spelling dates "10.05.2026"
-            # is not silently rewritten into ISO on every save.
-            "values": {h: str(row.get(h, "")) for h in editable},
+            # Set below, once every date is in and the fence can be drawn. Present here so
+            # the key exists on every item regardless of which branch computes it.
+            "out_of_range": False,
         }
+        placed.append(item)
         for label in labels:
             buckets[label].append(item)
 
@@ -371,8 +581,23 @@ def build_timeline(
         })
         groups = head
 
-    all_starts = [i["start"] for g in groups for i in g["items"] if i["start"]]
-    all_ends = [i["end"] for g in groups for i in g["items"] if i["end"]]
+    # Read off `placed`, not off `groups`: the same item appears under two labels when the
+    # grouping column names two people, and a duplicated date would shift the quartiles
+    # towards whichever rows happen to be shared.
+    all_dates: List[date] = []
+    for item in placed:
+        for iso in (item["start"], item["end"]):
+            if iso:
+                all_dates.append(date.fromisoformat(iso))
+
+    range_start, range_end, range_clamped = _drawn_range(all_dates)
+    lo_iso, hi_iso = _iso(range_start), _iso(range_end)
+    if range_clamped:
+        for item in placed:
+            item["out_of_range"] = bool(
+                (item["start"] and lo_iso and item["start"] < lo_iso)
+                or (item["end"] and hi_iso and item["end"] > hi_iso)
+            )
 
     reason = None
     if not start_header and not due_header:
@@ -385,6 +610,12 @@ def build_timeline(
     return {
         "start_header": start_header,
         "due_header": due_header,
+        # Null on a tab that records one pair of dates, which is most of them. The panel
+        # reads these to decide whether to draw one bar per row or a plan and an outcome,
+        # and stamps all four names beside the coverage line so "no baseline" is
+        # distinguishable from "the baseline resolved to the wrong column".
+        "actual_start_header": actual_start_header,
+        "actual_due_header": actual_due_header,
         "group_by": group_header,
         "groupable": _groupable_headers(
             headers,
@@ -394,10 +625,17 @@ def build_timeline(
         ),
         "editable_headers": editable,
         "people_columns": people,
-        "range_start": min(all_starts) if all_starts else None,
-        "range_end": max(all_ends) if all_ends else None,
+        "range_start": lo_iso,
+        "range_end": hi_iso,
+        # Whether the two above are the extremes of the data or a fence drawn inside them.
+        # The panel says so out loud: a reader who can see 2206 in the sheet and not on the
+        # chart is owed the reason, and the row carrying it is the one worth fixing.
+        "range_clamped": range_clamped,
         "today": today.isoformat(),
         "groups": groups,
+        # Rows with no date to draw at, in the same shape as a drawn one so the row dialog
+        # opens on either without knowing which it got.
+        "unplaced": unplaced,
         "counts": counts,
         "reason": reason,
     }

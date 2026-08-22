@@ -1542,9 +1542,66 @@ field-by-field at dispatch (§6.2), so a wider affordance is not a wider permiss
 `values` carry the **raw cell text, never the parsed ISO date**, so a dialog that writes back what
 it was given cannot silently rewrite a tracker spelling dates `10.05.2026` into ISO.
 
-An item is `overdue` only when a real deadline has passed and the status is not finished
-(`core/overdue.py:is_finished_status`) — so a start-only milestone is never overdue however old it
-is, because nothing was promised for that date.
+**A row carries up to two segments, `planned` and `actual`, and neither aliases the other.**
+A tracker recording four date columns — Planned Start, Planned Finish, Actual Start, Actual Finish —
+previously had two of them drawn and two ignored without a word, because resolution can only pick
+one pair. `schema.py:resolve_actual_columns` finds the second pair; on the overwhelming majority of
+sheets, which record one pair, it returns `(None, None)` and every branch downstream is inert. That
+inertness is the property the tests assert first.
+
+It reads `date_columns.actual_start` / `actual_due` / **`completion`** before scanning — `completion`
+is a role detection has been writing all along for `Date Completion` on the reference tracker, so a
+sheet detected years ago can grow a baseline without being re-detected. Each key is read with a
+truthiness test, never `dict.get(key, default)`, for §16.6's reason. The scan refuses any header
+matching `_DUE_WORDS`: `Expected Completion Date` is a promise, not a record, and reading it as the
+day work landed would mark unfinished rows delivered — §16.6's inversion in the other direction. An
+actual *start* must additionally wear the `actual` qualifier, because every unqualified start-looking
+header is a candidate for the planned start and claiming one would move the baseline silently.
+
+Item `start`/`end` are therefore the row's **envelope** across both segments — earliest recorded date
+to latest. The axis range, the group rollups and the row ordering read those; the chart draws from
+the segments themselves, plan above and outcome below, so the vertical offset between the two *is*
+the slip.
+
+An item is `overdue` only when a **planned** deadline has passed, the status is not finished
+(`core/overdue.py:is_finished_status`), **and no actual finish is recorded** — so a start-only
+milestone is never overdue however old it is, because nothing was promised for that date, and
+delivered work is never overdue however late it landed. That last clause is what `slip_days` is for:
+actual finish minus planned finish, negative for early, `null` when either is missing, because half a
+comparison is not a number. `_finish()` is the seam that makes both correct — a milestone carries its
+one date at *both* ends, so `segment["end"]` alone cannot tell a recorded finish from a recorded
+start, and reading it as a finish would cancel the overdue flag on every row anybody had merely begun.
+
+**The axis is bounded by the bulk of the dates, not by their extremes.** Found on the deploy: one row
+of the reference tracker holds `02.06.2206` where 2026 was meant, so the axis ran 2021 to 2209, the
+other sixty-one dated rows were squeezed into its leftmost 2.5%, and the 365-day tick step drew 189
+overlapping year labels. Nothing about that chart was wrong; it was a faithful drawing of a range
+nobody wanted. `_drawn_range` applies a Tukey fence — quartiles, three interquartile ranges either
+side — and returns `range_clamped` so the panel can say it did. Three guards keep it from firing when
+it should not, and each has a test that fails without it:
+
+- `_MIN_FENCE_DAYS` floors the fence, so a cluster of dates sharing one day does not fence its own
+  legitimate stragglers out. Three times a zero interquartile range is zero.
+- `_MIN_POINTS` (8) skips the fence entirely below a handful of dates. Eight rather than four
+  because `pts[(n * 3) // 4]` lands on the maximum for any n up to four — a fence that can never
+  exclude a high outlier, and a guard that reads as if it does something it does not.
+- `_CLAMP_RATIO` requires the outliers to at least double the span. Below that, clamping marks rows
+  out of range for no legibility gained.
+
+Rows outside the fence are **flagged, never dropped**: `out_of_range` on the item, the bar clamped to
+the edge with an arrow, and the row one click from the dialog that fixes it. A chart that quietly
+omits a row is the exact failure the coverage line exists to prevent, and the row carrying the wild
+date is the one worth finding. The quartiles are computed off `placed` rather than off `groups`,
+because a people grouping puts one shared row in two buckets on purpose and weighting those rows
+twice would make the axis depend on which column the reader grouped by.
+
+**`unplaced` carries every row the chart cannot draw.** Undated and unparsed rows are counted in
+`counts` and listed here in the same item shape, so the row dialog opens on one without knowing which
+list it came from. Before this they were counted and nothing else: the only route into the dialog was
+clicking a bar, which by definition an undated row has not got, so the panel could report 347
+unscheduled rows on the reference tracker and offer no way to schedule any of them. They stay out of
+`groups` — 347 empty tracks would bury the 62 real ones — and they survive the `reason` path, since a
+tab where nothing parses is exactly the tab whose rows most need reaching.
 
 The pipeline is `api/digest.py:preview_digest`'s with two deliberate differences: `_row_dicts` is called
 **with** `data_start_row`, so every item carries `ROW_NUMBER_KEY` and a bar can open an editable row
@@ -2390,9 +2447,10 @@ by using the application.
 
 ### 14.12 The timeline panel
 
-A fourth view on `/project/[id]`, beside Grid, Workload and Health, backed by §10.9. Unlike §14.5
-and §14.6, **nothing in this section has been seen rendering** — it describes the code as merged and
-as checked by `tsc` and `next build`, which is exactly the gap §15.4 exists to name. **It inherits
+A fourth view on `/project/[id]`, beside Grid, Workload and Health, backed by §10.9. **This section
+was rewritten after the panel was first seen rendering on the deploy**, and what that pass found is
+recorded in §16.8 — the short version being that a green `tsc` and a green `next build` had proved
+nothing about whether the chart was usable, which is §15.4's point made a second time. **It inherits
 the filter bar**; §14.8's health panel remains the only view that hides it, and that argument does
 not transfer — "362 rows have no deadline" is a fact about the tab, while a timeline narrowed to one
 person is exactly what a reader wants. Switching tabs clears the grouping column along with the
@@ -2403,11 +2461,15 @@ is indistinguishable from a tab that has no grouping column at all.
 `components/DataDisplay.tsx:TimelineChart` is hand-rolled CSS positioning against a shared axis.
 Recharts is already a dependency and has no Gantt primitive; the shapes usually bolted onto its
 `BarChart` to imitate one break as soon as rows are grouped. Tick spacing derives from the data span
-(`axisTicks`) rather than exposing a zoom control: weeks up to ~45 days, months to ~200, quarters to
-~800, years beyond. The tick *format* boundary is deliberately not the same number as the step
-boundary — month-and-year labelling covers the 91-day step as well as the 30-day one, because
-sending quarterly ticks to a year-only format draws a one-year plan as `2025 / 2026 / 2026 / 2026 /
-2026`, five ticks four of them identical, on exactly the span quarterly ticks were chosen for. The
+(`axisTicks`) rather than exposing a zoom control. The step is the first rung of `STEP_LADDER` —
+week, fortnight, month, quarter, half-year, year, two years, five, ten — that fits the padded span
+inside `MAX_TICKS` (14), and past the top rung it is computed rather than chosen, because an ugly
+interval beats an unreadable axis. **The cap is not theoretical.** The original ladder stopped at a
+365-day step with no limit on tick count, so the 188-year span one mistyped year produced (§16.8)
+drew 189 labels into a grey smear. The tick *format* boundary is deliberately not the same number as
+any step boundary — month-and-year labelling covers every rung from a fortnight to a half-year,
+because sending those to a year-only format draws a one-year plan as `2025 / 2026 / 2026 / 2026 /
+2026`, five ticks four of them identical, on exactly the span they were chosen for. The
 boundary does not eliminate duplicate labels, only the pathological case: the 30-day step still
 prints two identical adjacent labels whenever a tick lands on the 1st of a 31-day month, since
 +30 days is the 31st and both format as `Jan 26`. That is cosmetic, affects at most one pair per
@@ -2420,7 +2482,11 @@ pixel. The time region scrolls inside its own container, so the page body never 
 `maxHeight` is optional on the component and effectively mandatory in use. `sticky` resolves against
 the nearest scrollport, so without a height cap the container's scrollport is its own content and
 the date axis has nothing to stick within — it scrolls away with the page on a long tracker. The
-panel passes `calc(100vh - 360px)`: the grid's `DataTable` figure for the shared header and filter
+panel passes `max(320px, calc(100vh - 360px))`. **The floor is load-bearing, not defensive.**
+Measured on the deploy at 137.5% Windows display scaling the viewport is 451 CSS px tall, so the bare
+`calc()` resolved to a **91-pixel** scrollport — two rows of a 412-row tracker. Below the floor the
+page scrolls instead, which costs the sticky axis and keeps the chart. The subtrahend is the grid's
+`DataTable` figure for the shared header and filter
 bar, plus the two rows only this panel has.
 
 **One hue for every bar** — `SERIES_HUE`, the same blue §14.2 validated. Note what that validation
@@ -3056,6 +3122,42 @@ underlying condition easier to see; the write path had to be changed separately,
 index non-unique remains correct after that fix, and more clearly so: the write path now needs to
 *count* a duplicated ID's rows in order to refuse or pin them, which a cache that had silently
 discarded one of them could not support.
+
+---
+
+### 16.8 The timeline panel shipped unusable, and a build could not have said so — RESOLVED
+
+Merged green: 458 backend tests, `ruff` clean, `tsc` clean, `next build` 10/10. First contact with
+the deploy found six defects, three of them fatal to the panel's purpose. All are fixed; they are
+recorded because of what they have in common, which is that **not one of them was reachable by any
+check the branch ran.**
+
+1. **One mistyped year flattened the chart.** `SLCM-0796` on the reference tracker holds
+   `02.06.2206` where 2026 was meant. The axis therefore ran 2021 to 2209 and all sixty-one other
+   dated rows drew inside its leftmost 2.5%. Fixed by the Tukey fence in §10.9.
+2. **189 overlapping tick labels.** `axisTicks` topped out at a 365-day step with no cap on tick
+   count. Fixed by `STEP_LADDER` + `MAX_TICKS` (§14.12).
+3. **A 91-pixel chart.** `calc(100vh - 360px)` had no floor, and at the 137.5% display scaling the
+   reporting machine actually runs, the viewport is 451 CSS px tall. Fixed by `max(320px, …)`.
+4. **Nothing looked clickable.** The bars and group headers are `<button>`s, which keep the arrow
+   cursor; the codebase knew this — `EditableCell`, the Group-by select and the unreadable link all
+   set `cursor-pointer` explicitly — and these two were missed. Reported by the user as *"I cannot
+   edit timelines"*, which was an exactly accurate description of the affordance.
+5. **347 of 412 rows were unreachable.** Undated rows are not drawn, and clicking a bar was the only
+   route into the row dialog. Fixed by `unplaced` (§10.9).
+6. **No legend.** A diamond and a translucent bar were unexplained.
+
+The pattern worth keeping: (1), (2) and (3) are all *data-dependent or environment-dependent*. Each
+needs real sheet values or a real viewport to appear, and each is invisible to a unit test written
+against a fixture the author chose. (4), (5) and (6) are affordance defects, which no automated check
+of any kind detects. §15.4 already said a green build proves the code compiles rather than that it
+works; this is the second entry proving it, and the first where the feature was *fully functional*
+and still unusable.
+
+Two things did survive contact unchanged, and both were worth the effort they cost: the today
+marker's nested-overlay positioning measured 2.56% against a predicted 2.62%, and the sticky axis
+held under scroll. Both had been flagged during review as unverifiable by compilation, and both were
+right.
 
 ---
 

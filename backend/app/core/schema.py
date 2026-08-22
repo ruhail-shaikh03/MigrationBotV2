@@ -192,6 +192,94 @@ def header_reads_as_a_start(header: Optional[str]) -> bool:
     return any(word in candidate for word in _START_WORDS)
 
 
+# Words that mark a column as recording when something *actually* happened rather than
+# when it was meant to. This is very nearly the list `_DUE_WORDS` was written to exclude,
+# and for the same reason read from the other side: a completion date is not a deadline,
+# so treating it as one reports finished work as overdue — and treating a deadline as a
+# completion would report unfinished work as delivered. The two vocabularies are disjoint
+# on purpose and the scan below enforces it, refusing any header that also reads as a
+# deadline. "Expected Completion Date" is a stated deadline that happens to contain
+# "completion", and it must not be read as the day the work landed.
+_ACTUAL_TOKEN = "actual"
+_ACTUAL_WORDS = (
+    "actual", "completion", "completed", "finished", "closed",
+    "sign-off", "signoff", "signed off", "delivered", "delivery date",
+)
+
+
+def _header_is_free(header: Optional[str], taken: set) -> bool:
+    return bool(header) and str(header).strip().casefold() not in taken
+
+
+def resolve_actual_columns(
+    tab_schema: Dict[str, Any],
+    headers: Optional[List[str]] = None,
+    *,
+    exclude: Tuple[Optional[str], ...] = (),
+) -> Tuple[Optional[str], Optional[str]]:
+    """The pair recording when work actually started and actually finished, if any.
+
+    Returns `(actual_start, actual_due)`, either or both None. A tracker with two date
+    columns has no such pair and gets `(None, None)`, which is what keeps a plain sheet
+    drawing exactly as it did before this existed.
+
+    `exclude` is the already-resolved planned pair. A header can only serve one end of one
+    segment, and without this a four-column tab whose planned deadline is "Expected
+    Completion Date" would hand the same column to both segments and draw a row's plan and
+    its outcome as the same bar — the zero-length-bar failure `get_start_column`'s
+    `exclude` exists to prevent, one level up.
+
+    Schema first, in the order detection actually writes: `actual_start` and `actual_due`
+    are roles a human can map, and `completion` is the role detection has been writing all
+    along for "Date Completion" on the reference tracker. Reading it here is what lets a
+    sheet that was detected years ago grow a baseline without being re-detected. Every key
+    is read with a truthiness test, never `dict.get(key, default)` — detection writes these
+    keys holding a literal `null` and a default would never apply (§16.6).
+    """
+    dates = tab_schema.get("date_columns") or {}
+    taken = {str(h).strip().casefold() for h in exclude if h}
+
+    def _mapped(*keys: str) -> Optional[str]:
+        for key in keys:
+            value = dates.get(key)
+            if value and str(value).strip():
+                return value
+        return None
+
+    actual_start = _mapped("actual_start", "started")
+    actual_due = _mapped("actual_due", "actual_end", "completion")
+
+    if actual_start is None:
+        # An actual start is a start column wearing the qualifier. Nothing weaker will do:
+        # every start-looking header that is *not* qualified is a candidate for the planned
+        # start, and claiming one here would silently move the baseline.
+        for header in headers or []:
+            if not _header_is_free(header, taken):
+                continue
+            if header_reads_as_a_start(header) and _ACTUAL_TOKEN in str(header).casefold():
+                actual_start = header
+                break
+
+    if actual_due is None:
+        for header in headers or []:
+            if not _header_is_free(header, taken) or header_reads_as_a_start(header):
+                continue
+            low = str(header).casefold()
+            # A deadline word disqualifies the header outright, however many completion
+            # words it also carries. "Expected Completion Date" is a promise, not a record.
+            if any(word in low for word in _DUE_WORDS):
+                continue
+            if any(word in low for word in _ACTUAL_WORDS):
+                actual_due = header
+                break
+
+    # One column cannot be both ends of the same segment.
+    if _same_header(actual_start, actual_due):
+        actual_due = None
+
+    return actual_start, actual_due
+
+
 def get_start_column(
     tab_schema: Dict[str, Any],
     headers: Optional[List[str]] = None,

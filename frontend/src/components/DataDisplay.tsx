@@ -249,13 +249,37 @@ export function EditableCell({
   )
 }
 
+/** One pair of date columns, resolved. A row has up to two: what was planned and what
+ *  actually happened. A tracker recording a single pair gets `actual: null` and draws
+ *  exactly one shape, which is the case almost every sheet is in. */
+export interface TimelineSegment {
+  kind: "bar" | "milestone"
+  start: string | null
+  end: string | null
+  milestone_of: "start" | "due" | null
+  reversed: boolean
+}
+
 export interface TimelineItem {
   id: string
   label: string
   row_number?: number
-  kind: "bar" | "milestone"
+  /** `undated` and `unparsed` reach the client only in `unplaced` — never inside a group,
+   *  because there is no date to draw them at. They share this type so the row dialog can
+   *  open on either without asking which list it came from. */
+  kind: "bar" | "milestone" | "undated" | "unparsed"
+  /** The row's envelope across both segments, which is what the axis and the group
+   *  rollups are computed from. The shapes below are drawn from the segments themselves. */
   start: string | null
   end: string | null
+  planned: TimelineSegment | null
+  actual: TimelineSegment | null
+  /** Actual finish minus planned finish, in days. Negative is early, null means one of the
+   *  two was never recorded — half a comparison is not a number. */
+  slip_days: number | null
+  /** This row holds a date the axis deliberately excludes. It is still drawn, pinned to the
+   *  edge, because the row carrying the wild date is the one worth finding. */
+  out_of_range: boolean
   milestone_of: "start" | "due" | null
   reversed: boolean
   status: string
@@ -297,27 +321,40 @@ function toUTC(iso: string): number {
   return Date.parse(`${iso}T00:00:00Z`)
 }
 
+/** No axis may print more labels than this. The ladder below runs out at a decade, and a
+ *  span wider than ten decades would still overflow it, so the cap is enforced separately
+ *  and last. Observed live before it existed: one row with a mistyped year gave the axis a
+ *  188-year span, and the 365-day step drew 189 labels into a grey smear. */
+const MAX_TICKS = 14
+
+/** Human step sizes, smallest first: a week, a fortnight, a month, a quarter, a half-year,
+ *  a year, two years, five, ten. Anything not on this list reads as an arbitrary interval —
+ *  "every 47 days" is a number, not a scale. */
+const STEP_LADDER = [7, 14, 30, 91, 182, 365, 730, 1825, 3650]
+
 /** Ticks whose spacing suits the span, rather than a zoom control nobody asked for.
- *  The step is picked from the PADDED span, and the thresholds below read: up to ~45 days
- *  weeks, to ~200 days months, to ~800 days quarters, beyond that years. So a six-week plan
- *  gets weeks, a quarter-long one months (91 days is inside the ~200-day bracket), a
- *  year-long one quarters, and a three-year one years — quarters serve roughly seven months
- *  to 2.2 years, not three-year spans.
+ *
+ *  The step is the first rung of the ladder that fits the PADDED span inside `MAX_TICKS`,
+ *  so a six-week plan gets weeks, a year gets quarters and a decade gets years. Past the
+ *  top rung the step is computed rather than chosen — an ugly interval beats an unreadable
+ *  axis, and by then the reader is looking at a span nobody planned.
  *
  *  Returns absolute timestamps rather than percentages, so the caller positions them with
  *  the same `pct` the bars use. Computing tick positions against their own span is how an
  *  axis ends up drifting a few pixels off the bars it is supposed to label. */
 function axisTicks(startMs: number, endMs: number): { ms: number; label: string }[] {
   const days = Math.max(1, Math.round((endMs - startMs) / DAY_MS))
-  const step = days <= 45 ? 7 : days <= 200 ? 30 : days <= 800 ? 91 : 365
+  let step = STEP_LADDER.find((s) => days / s <= MAX_TICKS) ?? STEP_LADDER[STEP_LADDER.length - 1]
+  if (days / step > MAX_TICKS) step = Math.ceil(days / MAX_TICKS)
+
   const fmt: Intl.DateTimeFormatOptions =
     step <= 7
       ? { day: "2-digit", month: "short" }
-      // 91, not 30: this middle format serves BOTH the monthly and the quarterly step.
-      // Matching the boundary to the step thresholds above would send the 91-day step to
-      // year-only, drawing a one-year plan as 2025 / 2026 / 2026 / 2026 / 2026 -- five
-      // ticks, four of them identical, on exactly the span quarterly ticks were chosen for.
-      : step <= 91
+      // 300, not 30: this middle format serves every step from a fortnight to a half-year.
+      // Matching the boundary to a single rung would send the others to year-only, drawing
+      // a one-year plan as 2025 / 2026 / 2026 / 2026 / 2026 -- five ticks, four of them
+      // identical, on exactly the span those rungs were chosen for.
+      : step <= 300
         ? { month: "short", year: "2-digit" }
         : { year: "numeric" }
 
@@ -329,6 +366,55 @@ function axisTicks(startMs: number, endMs: number): { ms: number; label: string 
     })
   }
   return ticks
+}
+
+const clampPct = (n: number) => Math.min(100, Math.max(0, n))
+
+/** How a date reads to a person, for the tooltips and the dialog. ISO is unambiguous and
+ *  is what the payload carries; it is not what anyone says out loud. */
+export function prettyDate(iso: string | null): string {
+  if (!iso) return "—"
+  return new Date(`${iso}T00:00:00Z`).toLocaleDateString(undefined, {
+    day: "2-digit", month: "short", year: "numeric", timeZone: "UTC",
+  })
+}
+
+/** "6 days late" / "4 days early" / "on time". Slip is a number in the payload and a
+ *  sentence everywhere a person reads it. */
+export function slipLabel(days: number | null): string | null {
+  if (days === null || days === undefined) return null
+  if (days === 0) return "finished on time"
+  const n = Math.abs(days)
+  return `finished ${n} ${n === 1 ? "day" : "days"} ${days > 0 ? "late" : "early"}`
+}
+
+/** Everything a bar knows, in one sentence, for the hover.
+ *
+ *  The shapes carry position and very little else: overdue is an outline, slip is a
+ *  vertical offset between two bars, and out-of-range is an arrow. None of those survives
+ *  being described rather than seen. This is the quick channel and the row dialog repeats
+ *  all of it in text, because a `title` reaches neither keyboard nor touch. */
+export function itemTitle(item: TimelineItem): string {
+  const paired = Boolean(item.planned && item.actual)
+  const phrase = (seg: TimelineSegment | null, name: string): string | null => {
+    if (!seg) return null
+    const body =
+      seg.kind === "milestone"
+        ? `${seg.milestone_of === "start" ? "starts" : "due"} ${prettyDate(seg.start)}`
+        : `${prettyDate(seg.start)} – ${prettyDate(seg.end)}`
+    return paired ? `${name} ${body}` : body
+  }
+  return [
+    item.id || item.label,
+    phrase(item.planned, "planned"),
+    phrase(item.actual, "actual"),
+    item.overdue ? "overdue" : null,
+    slipLabel(item.slip_days),
+    item.reversed ? "dates are reversed on the sheet" : null,
+    item.out_of_range ? "runs past the shown range" : null,
+  ]
+    .filter((part): part is string => Boolean(part))
+    .join(" · ")
 }
 
 /**
@@ -382,6 +468,10 @@ export function TimelineChart({
   const pct = (iso: string) => pctFromMs(toUTC(iso))
   const ticks = axisTicks(startMs, endMs)
   const todayPct = pct(today)
+  // Read off what is drawn rather than off the resolved headers: a tab can declare a
+  // baseline that no visible row fills in, and a legend naming a shape absent from the
+  // chart sends the reader looking for something that is not there.
+  const hasBaseline = groups.some((g) => g.items.some((i) => i.planned && i.actual))
 
   return (
     <div className="rounded-xl border border-[var(--color-rule-strong)] bg-ink-850">
@@ -446,7 +536,7 @@ export function TimelineChart({
                     onClick={() => setCollapsed((p) => ({ ...p, [group.label]: !p[group.label] }))}
                     // The chevron swap is the only visual state; a screen reader cannot see it.
                     aria-expanded={!isCollapsed}
-                    className="flex w-full items-center hover:bg-ink-800/60"
+                    className="flex w-full cursor-pointer items-center transition-colors hover:bg-ink-800/60 focus-visible:bg-ink-800/60 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-brass-500"
                   >
                     <div
                       className="flex shrink-0 items-center gap-1.5 px-3 py-2 text-left"
@@ -467,8 +557,14 @@ export function TimelineChart({
                         <div
                           className="absolute top-1/2 h-2.5 -translate-y-1/2 rounded-sm"
                           style={{
-                            left: `${pct(group.start)}%`,
-                            width: `${Math.max(pct(group.end) - pct(group.start), 0.4)}%`,
+                            // Clamped for the same reason the rows are: a group holding a
+                            // row that runs past the fence would otherwise draw a rollup
+                            // hundreds of percent wide and overflow the scrollport.
+                            left: `${clampPct(pct(group.start))}%`,
+                            width: `${Math.max(
+                              clampPct(pct(group.end)) - clampPct(pct(group.start)),
+                              0.4
+                            )}%`,
                             backgroundColor: SERIES_HUE,
                             opacity: 0.5,
                           }}
@@ -479,8 +575,14 @@ export function TimelineChart({
 
                   {!isCollapsed &&
                     group.items.map((item) => {
-                      const left = item.start ? pct(item.start) : 0
-                      const width = item.start && item.end ? Math.max(pct(item.end) - left, 0.4) : 0
+                      // A tab recording one pair of dates has no baseline to compare
+                      // against, so its single segment keeps the full-height centred bar it
+                      // has always had. Only a four-column tab splits the lane.
+                      const segments = [
+                        item.planned ? { seg: item.planned, role: "planned" as const } : null,
+                        item.actual ? { seg: item.actual, role: "actual" as const } : null,
+                      ].filter((s) => s !== null)
+                      const paired = segments.length > 1
                       return (
                         <button
                           // Group-qualified. One row belongs to two groups by design when
@@ -492,41 +594,80 @@ export function TimelineChart({
                           // makes the two independent.
                           key={`${group.label}::${itemKey(item)}`}
                           onClick={() => onSelectItem?.(item)}
-                          className="flex w-full items-center text-left hover:bg-ink-800/60"
+                          // `cursor-pointer` is not decoration here. A <button> keeps the
+                          // default arrow cursor, so without it the whole chart reads as a
+                          // picture -- which is exactly how it was reported: "I cannot edit
+                          // timelines". The focus ring is the same affordance for anyone
+                          // arriving by keyboard, who had none at all.
+                          className="flex w-full cursor-pointer items-center text-left transition-colors hover:bg-ink-800/60 focus-visible:bg-ink-800/60 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-brass-500"
+                          title={itemTitle(item)}
                         >
                           <div className="shrink-0 truncate py-1.5 pl-8 pr-3" style={{ width: LABEL_COL }}>
-                            <span className="text-[12px] text-ink-300" title={item.label}>
-                              {item.label}
-                            </span>
+                            <span className="text-[12px] text-ink-300">{item.label}</span>
                           </div>
                           <div className="relative h-7 flex-1">
-                            {item.kind === "bar" ? (
-                              <div
-                                className="absolute top-1/2 h-3.5 -translate-y-1/2 rounded-sm"
-                                style={{
-                                  left: `${left}%`,
-                                  width: `${width}%`,
-                                  backgroundColor: SERIES_HUE,
-                                  outline: item.overdue ? "1px solid var(--color-failed)" : undefined,
-                                  outlineOffset: item.overdue ? "1px" : undefined,
-                                }}
-                                title={`${item.id} · ${item.start} → ${item.end}${
-                                  item.overdue ? " · overdue" : ""
-                                }${item.reversed ? " · dates are reversed on the sheet" : ""}`}
-                              />
-                            ) : (
-                              <div
-                                className="absolute top-1/2 h-2.5 w-2.5 -translate-x-1/2 -translate-y-1/2 rotate-45"
-                                style={{
-                                  left: `${left}%`,
-                                  backgroundColor: SERIES_HUE,
-                                  outline: item.overdue ? "1px solid var(--color-failed)" : undefined,
-                                  outlineOffset: item.overdue ? "1px" : undefined,
-                                }}
-                                title={`${item.id} · ${
-                                  item.milestone_of === "start" ? "starts" : "due"
-                                } ${item.start}${item.overdue ? " · overdue" : ""}`}
-                              />
+                            {segments.map(({ seg, role }) => {
+                              // Clamped, not dropped. A row reaching past the fence keeps a
+                              // visible bar running to the edge; `out_of_range` below is
+                              // what says the edge is not where its date actually is.
+                              const left = clampPct(seg.start ? pct(seg.start) : 0)
+                              const right = seg.end ? clampPct(pct(seg.end)) : left
+                              const width = Math.max(right - left, 0.4)
+
+                              // Plan above, outcome below -- the standard baseline read, so
+                              // the vertical offset between the two IS the slip. A row with
+                              // one segment keeps the centred bar it has always had.
+                              const lane = !paired
+                                ? "top-1/2 h-3.5 -translate-y-1/2"
+                                : role === "planned"
+                                  ? "top-1 h-1.5"
+                                  : "bottom-1 h-2.5"
+                              // The baseline is the quieter of the two: it records an
+                              // intention, and the solid bar records what happened.
+                              const opacity = paired && role === "planned" ? 0.42 : 1
+                              const outline = item.overdue
+                                ? { outline: "1px solid var(--color-failed)", outlineOffset: "1px" }
+                                : {}
+
+                              if (seg.kind === "milestone") {
+                                return (
+                                  <div
+                                    key={role}
+                                    className={`absolute h-2.5 w-2.5 -translate-x-1/2 rotate-45 ${
+                                      !paired
+                                        ? "top-1/2 -translate-y-1/2"
+                                        : role === "planned"
+                                          ? "top-0.5"
+                                          : "bottom-0.5"
+                                    }`}
+                                    style={{ left: `${left}%`, backgroundColor: SERIES_HUE, opacity, ...outline }}
+                                  />
+                                )
+                              }
+                              return (
+                                <div
+                                  key={role}
+                                  className={`absolute rounded-sm ${lane}`}
+                                  style={{
+                                    left: `${left}%`,
+                                    width: `${width}%`,
+                                    backgroundColor: SERIES_HUE,
+                                    opacity,
+                                    ...outline,
+                                  }}
+                                />
+                              )
+                            })}
+                            {/* The row holds a date the axis excludes. An arrow at the edge
+                                it ran off, so a bar stopping dead at the boundary is not
+                                read as one that genuinely ends there. */}
+                            {item.out_of_range && (
+                              <span
+                                className="absolute right-0.5 top-1/2 -translate-y-1/2 text-[10px] leading-none text-brass-300"
+                                aria-hidden
+                              >
+                                ▸
+                              </span>
                             )}
                           </div>
                         </button>
@@ -538,6 +679,56 @@ export function TimelineChart({
           </div>
         </div>
       </div>
+
+      {/* Outside the scrollport, so it stays put while the rows move under it. A diamond
+          and a translucent bar are not self-explanatory, and until this existed nothing on
+          the page said what either meant. Only the shapes actually drawn are named — a
+          legend listing a baseline on a tab that has no baseline column teaches the reader
+          something false about their own sheet. */}
+      <div className="flex flex-wrap items-center gap-x-4 gap-y-1 border-t border-[var(--color-rule)] px-3 py-2 text-[11px] text-ink-500">
+        {hasBaseline ? (
+          <>
+            <LegendKey swatch={<span className="h-1.5 w-5 rounded-sm" style={{ backgroundColor: SERIES_HUE, opacity: 0.42 }} />}>
+              planned
+            </LegendKey>
+            <LegendKey swatch={<span className="h-2.5 w-5 rounded-sm" style={{ backgroundColor: SERIES_HUE }} />}>
+              actual
+            </LegendKey>
+          </>
+        ) : (
+          <LegendKey swatch={<span className="h-2.5 w-5 rounded-sm" style={{ backgroundColor: SERIES_HUE }} />}>
+            start to finish
+          </LegendKey>
+        )}
+        <LegendKey
+          swatch={
+            <span className="h-2 w-2 rotate-45" style={{ backgroundColor: SERIES_HUE }} />
+          }
+        >
+          one date only
+        </LegendKey>
+        <LegendKey
+          swatch={
+            <span
+              className="h-2.5 w-4 rounded-sm"
+              style={{ backgroundColor: SERIES_HUE, outline: "1px solid var(--color-failed)", outlineOffset: "1px" }}
+            />
+          }
+        >
+          overdue
+        </LegendKey>
+        <LegendKey swatch={<span className="h-3 w-px bg-brass-400/60" />}>today</LegendKey>
+        <span className="ml-auto text-ink-600">Select a row to open and edit it</span>
+      </div>
     </div>
+  )
+}
+
+function LegendKey({ swatch, children }: { swatch: React.ReactNode; children: React.ReactNode }) {
+  return (
+    <span className="flex items-center gap-1.5">
+      <span className="flex h-3 w-5 items-center justify-center">{swatch}</span>
+      {children}
+    </span>
   )
 }

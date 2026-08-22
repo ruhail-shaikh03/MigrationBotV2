@@ -11,7 +11,7 @@ missing without a count moving.
 scanning the sheet and evaluates to nothing in every calculation.
 """
 
-from datetime import date
+from datetime import date, timedelta
 
 from app.core.aliases import PersonResolver
 from app.core.timeline import (
@@ -557,3 +557,316 @@ def test_an_explicit_schema_deadline_outranks_the_start_vocabulary():
     assert result["due_header"] == "Planned Start Date"
     assert result["start_header"] == "Kickoff Date"
     assert result["groups"][0]["items"][0]["kind"] == "bar"
+
+
+# --- the axis is bounded by the data, not by its typos -------------------------
+
+def _spread(n, first=date(2026, 1, 1), step=7):
+    """`n` bar rows a week apart — enough points for the fence to have quartiles."""
+    return [
+        _tracker_row(
+            f"W-{i}",
+            start=(first + timedelta(days=i * step)).strftime("%d/%m/%Y"),
+            due=(first + timedelta(days=i * step + 3)).strftime("%d/%m/%Y"),
+        )
+        for i in range(n)
+    ]
+
+
+def test_one_mistyped_year_does_not_stretch_the_axis_over_two_centuries():
+    """Observed live: "02.06.2206" for 2026 on one row of the reference tracker ran the
+    axis from 2021 to 2209 and squeezed the other sixty-one dated rows into its leftmost
+    two percent, behind 189 overlapping year labels."""
+    rows = _spread(12) + [_tracker_row("W-BAD", start="01/01/2026", due="02/06/2206")]
+    result = _build(rows)
+
+    assert result["range_clamped"] is True
+    # The fence lands inside the typo, not on it. The bulk of the work ends in March 2026.
+    assert result["range_end"] < "2027-01-01"
+    assert result["range_start"] == "2026-01-01"
+
+
+def test_the_row_carrying_the_typo_is_flagged_rather_than_dropped():
+    """A chart that silently omits a row is the failure the coverage line exists to
+    prevent — and this is the one row the reader most needs to find and fix."""
+    rows = _spread(12) + [_tracker_row("W-BAD", start="01/01/2026", due="02/06/2206")]
+    result = _build(rows)
+
+    items = [i for g in result["groups"] for i in g["items"]]
+    assert len(items) == 13
+    flagged = [i for i in items if i["out_of_range"]]
+    assert [i["id"] for i in flagged] == ["W-BAD"]
+    # Its real date survives intact; only the axis was bounded.
+    assert flagged[0]["end"] == "2206-06-02"
+
+
+def test_a_genuinely_long_plan_is_not_clamped():
+    """The fence must not fire on a tab that really does span years evenly. Clamping here
+    would mark honest rows out of range and shorten an axis nobody complained about."""
+    rows = _spread(24, first=date(2021, 1, 1), step=90)
+    result = _build(rows)
+
+    assert result["range_clamped"] is False
+    assert result["range_start"] == "2021-01-01"
+    assert not any(i["out_of_range"] for g in result["groups"] for i in g["items"])
+
+
+def test_a_handful_of_dates_is_never_clamped():
+    """Below `_MIN_POINTS` the quartiles are two or three points and the fence they draw is
+    noise. A small tab is also one a reader takes in whole, so a stretched axis there is
+    survivable in a way it is not across four hundred rows.
+
+    Six dates, one of them wild: enough that the fence *would* fire without the guard —
+    q1 and q3 both land in January and push the outlier outside — and few enough that it
+    must not."""
+    rows = [
+        _tracker_row("W-1", start="01/01/2026", due="09/01/2026"),
+        _tracker_row("W-2", start="03/01/2026", due="11/01/2026"),
+        _tracker_row("W-3", start="01/01/2026", due="02/06/2206"),
+    ]
+    result = _build(rows)
+
+    assert result["range_clamped"] is False
+    assert result["range_end"] == "2206-06-02"
+
+
+def test_a_cluster_on_one_date_does_not_fence_its_own_stragglers_out():
+    """Zero interquartile range times three is zero: the fence collapses onto the median
+    and every row either side of it becomes an outlier. `_MIN_FENCE_DAYS` is the floor.
+
+    The shape that exposes it: a dense cluster all on one date, a few legitimate rows three
+    weeks later, and one real typo. Without the floor the fence is the cluster's single
+    date, so the three-week rows are flagged and the axis stops short of them — the guard
+    firing on exactly the honest rows it exists to protect."""
+    rows = (
+        [_tracker_row(f"W-{i}", start="02/02/2026", due="02/02/2026") for i in range(20)]
+        + [_tracker_row(f"S-{i}", start="22/02/2026", due="22/02/2026") for i in range(2)]
+        + [_tracker_row("W-BAD", start="02/02/2026", due="02/06/2206")]
+    )
+    result = _build(rows)
+
+    assert result["range_clamped"] is True
+    # The stragglers are inside the fence; only the typo is out.
+    assert result["range_end"] == "2026-02-22"
+    flagged = {i["id"] for g in result["groups"] for i in g["items"] if i["out_of_range"]}
+    assert flagged == {"W-BAD"}
+
+
+def test_the_axis_does_not_move_when_the_grouping_changes():
+    """Grouping by a people column puts a shared row in two buckets on purpose. Read the
+    quartiles off `groups` and those rows count twice, so the fence — and with it the axis
+    and every out-of-range flag — depends on which column the reader grouped by. Changing
+    Group by must never move the dates.
+
+    Weighted deliberately: ten single-owner rows in February against six shared rows whose
+    deadlines are years out. Counted once the far dates are a minority and the fence
+    excludes them; counted twice they are the majority and it does not."""
+    schema = {**SCHEMA, "people_columns": [
+        {"key": "dev", "label": "Developer", "header": "Developer Name"}]}
+    rows = (
+        [_tracker_row(f"W-{i}", start="01/02/2026", due="09/02/2026", dev="Sara Iqbal")
+         for i in range(10)]
+        + [_tracker_row(f"F-{i}", start="01/02/2026", due="02/06/2206", dev="Sara/Omar")
+           for i in range(6)]
+    )
+
+    grouped = build_timeline(HEADERS, rows, schema, group_by="Developer Name", today=TODAY)
+    ungrouped = build_timeline(HEADERS, rows, schema, today=TODAY)
+
+    assert grouped["range_end"] == ungrouped["range_end"] == "2026-02-09"
+    assert grouped["range_clamped"] is ungrouped["range_clamped"] is True
+
+
+# --- rows with nothing to draw are reachable, not merely counted ---------------
+
+def test_undated_and_unparsed_rows_are_listed_so_they_can_be_scheduled():
+    """347 of 412 rows on the reference tracker are undated. Clicking a bar was the only
+    way into the row dialog, so those rows could be counted from this panel and edited from
+    nowhere in it — the panel could not do the one thing its name promises."""
+    rows = [
+        _tracker_row("W-1", start="01/02/2026", due="09/02/2026"),
+        _tracker_row("W-2"),
+        _tracker_row("W-3", due="17/0/2026"),
+    ]
+    result = _build(rows)
+
+    assert [(u["id"], u["kind"]) for u in result["unplaced"]] == [
+        ("W-2", "undated"), ("W-3", "unparsed"),
+    ]
+    # And they stay out of the chart: 347 empty tracks would bury the 62 real ones.
+    assert sum(len(g["items"]) for g in result["groups"]) == 1
+
+
+def test_an_unplaced_row_carries_everything_the_dialog_needs_to_write():
+    """It opens the same dialog a bar does, and a write addresses a row by ID plus row
+    number. A listing that could not be edited would just be a longer count."""
+    result = _build([_tracker_row("W-2", row_number=42, desc="Payroll extract")])
+
+    row = result["unplaced"][0]
+    assert row["id"] == "W-2"
+    assert row["label"] == "Payroll extract"
+    assert row["row_number"] == 42
+    assert set(result["editable_headers"]) <= set(row["values"])
+
+
+def test_a_tab_where_nothing_parses_still_lists_its_rows():
+    """`reason` empties `groups`, and emptying the listing with it would leave a reader
+    told there is nothing to draw and given no way to change that."""
+    result = _build([_tracker_row("W-1"), _tracker_row("W-2")])
+
+    assert result["reason"]
+    assert result["groups"] == []
+    assert len(result["unplaced"]) == 2
+
+
+# --- planned against actual, on a tab that records four dates ------------------
+
+HEADERS4 = ["ID", "Description", "Module", "Status", "Planned Start Date",
+            "Planned Finish Date", "Actual Start Date", "Actual Finish Date", "Owner"]
+
+SCHEMA4 = {
+    "primary_id_column": "ID",
+    "description_column": "Description",
+    "module_column": "Module",
+    "status_column": "Status",
+    # What detection writes: the planned pair. The actual pair is found by the qualifier
+    # scan, which is the case a sheet detected before baselines existed will be in.
+    "date_columns": {"start": "Planned Start Date", "due": "Planned Finish Date"},
+    "people_columns": [{"key": "own", "label": "Owner", "header": "Owner"}],
+}
+
+
+def _row4(rid="R-1", ps="", pf="", as_="", af="", status="In Progress", module="SD"):
+    return {
+        "ID": rid, "Description": "Migrate BOM report", "Module": module, "Status": status,
+        "Planned Start Date": ps, "Planned Finish Date": pf,
+        "Actual Start Date": as_, "Actual Finish Date": af, "Owner": "Sara Iqbal",
+    }
+
+
+def _build4(rows, **kwargs):
+    kwargs.setdefault("today", TODAY)
+    return build_timeline(HEADERS4, rows, SCHEMA4, **kwargs)
+
+
+def _only_item(result):
+    items = [i for g in result["groups"] for i in g["items"]]
+    assert len(items) == 1
+    return items[0]
+
+
+def test_a_two_date_tab_reports_no_actual_pair_and_no_actual_segment():
+    """The no-regression property, asserted rather than assumed: every tracker recording
+    one pair of dates must come through this feature unchanged."""
+    result = _build([_tracker_row("W-1", start="01/02/2026", due="09/02/2026")])
+
+    assert result["actual_start_header"] is None
+    assert result["actual_due_header"] is None
+    item = _only_item(result)
+    assert item["actual"] is None
+    assert item["planned"] == {
+        "kind": "bar", "start": "2026-02-01", "end": "2026-02-09",
+        "milestone_of": None, "reversed": False,
+    }
+
+
+def test_a_four_date_tab_resolves_both_pairs_and_draws_both():
+    result = _build4([_row4(ps="01/02/2026", pf="09/02/2026",
+                            as_="03/02/2026", af="15/02/2026")])
+
+    assert result["start_header"] == "Planned Start Date"
+    assert result["due_header"] == "Planned Finish Date"
+    assert result["actual_start_header"] == "Actual Start Date"
+    assert result["actual_due_header"] == "Actual Finish Date"
+
+    item = _only_item(result)
+    assert item["planned"]["start"] == "2026-02-01"
+    assert item["planned"]["end"] == "2026-02-09"
+    assert item["actual"]["start"] == "2026-02-03"
+    assert item["actual"]["end"] == "2026-02-15"
+
+
+def test_the_envelope_spans_both_segments():
+    """`start`/`end` are what the axis, the group rollups and the row ordering read. A row
+    whose actual work ran past its plan reaches further than its plan says."""
+    item = _only_item(_build4([_row4(ps="01/02/2026", pf="09/02/2026",
+                                     as_="03/02/2026", af="15/02/2026")]))
+    assert (item["start"], item["end"]) == ("2026-02-01", "2026-02-15")
+
+
+def test_slip_is_the_gap_between_the_two_finishes():
+    item = _only_item(_build4([_row4(ps="01/02/2026", pf="09/02/2026",
+                                     as_="03/02/2026", af="15/02/2026")]))
+    assert item["slip_days"] == 6
+
+
+def test_finishing_early_slips_negative():
+    item = _only_item(_build4([_row4(ps="01/02/2026", pf="09/02/2026",
+                                     as_="01/02/2026", af="05/02/2026")]))
+    assert item["slip_days"] == -4
+
+
+def test_slip_is_none_when_only_one_finish_is_recorded():
+    """Half a comparison is not a number. A row still running has not slipped by any
+    amount — it is simply unfinished, which `overdue` is the word for."""
+    item = _only_item(_build4([_row4(ps="01/02/2026", pf="09/02/2026", as_="03/02/2026")]))
+    assert item["slip_days"] is None
+
+
+def test_a_passed_deadline_with_no_actual_finish_is_overdue():
+    item = _only_item(_build4([_row4(ps="01/01/2026", pf="09/01/2026", as_="03/01/2026")]))
+    assert item["overdue"] is True
+
+
+def test_a_recorded_actual_finish_discharges_the_deadline_however_late():
+    """Delivered work is never overdue. It slipped, and `slip_days` says by how much —
+    reporting it as overdue would be §16.6's inversion in a third costume."""
+    item = _only_item(_build4([_row4(ps="01/01/2026", pf="09/01/2026",
+                                     as_="03/01/2026", af="20/01/2026")]))
+    assert item["overdue"] is False
+    assert item["slip_days"] == 11
+
+
+def test_an_actual_start_alone_does_not_discharge_the_deadline():
+    """A milestone carries its one date at both ends, so `actual["end"]` is set even when
+    only a start was recorded. Reading it as a finish would cancel the overdue flag on
+    every row anybody had merely begun."""
+    item = _only_item(_build4([_row4(ps="01/01/2026", pf="09/01/2026", as_="03/01/2026")]))
+    assert item["actual"]["milestone_of"] == "start"
+    assert item["actual"]["end"] == "2026-01-03"
+    assert item["overdue"] is True
+
+
+def test_a_row_recording_only_actuals_is_drawn_rather_than_counted_undated():
+    """Work that happened without ever being planned is still work that happened."""
+    result = _build4([_row4(as_="03/02/2026", af="15/02/2026")])
+
+    assert result["counts"]["charted"] == 1
+    assert result["counts"]["undated"] == 0
+    item = _only_item(result)
+    assert item["planned"] is None
+    assert item["actual"]["kind"] == "bar"
+
+
+def test_a_row_with_neither_pair_is_still_undated():
+    result = _build4([_row4()])
+    assert result["counts"] == {"total": 1, "charted": 0, "milestone_only": 0,
+                                "undated": 1, "unparsed": 0}
+
+
+def test_an_unreadable_actual_date_makes_the_whole_row_unparsed():
+    """`unparsed` beats a readable partner across segments too, for the reason it beats one
+    within a segment: drawing the good half hides the cell that is wrong."""
+    result = _build4([_row4(ps="01/02/2026", pf="09/02/2026", af="17/0/2026")])
+    assert result["counts"]["unparsed"] == 1
+    assert result["counts"]["charted"] == 0
+
+
+def test_all_four_date_columns_are_editable_from_the_row_dialog():
+    """Rescheduling means writing to whichever of the four is wrong, so all four have to be
+    reachable. Two of them being uneditable is the complaint that started this."""
+    result = _build4([_row4(ps="01/02/2026", pf="09/02/2026")])
+    assert set(result["editable_headers"]) >= {
+        "Planned Start Date", "Planned Finish Date",
+        "Actual Start Date", "Actual Finish Date",
+    }
